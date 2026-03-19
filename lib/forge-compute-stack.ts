@@ -128,7 +128,6 @@ export class ForgeComputeStack extends cdk.Stack {
     const asgA = new autoscaling.AutoScalingGroup(this, 'AsgA', {
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-      securityGroup: props.ecsSecurityGroup,
       mixedInstancesPolicy: {
         instancesDistribution: {
           onDemandBaseCapacity: 0,
@@ -138,6 +137,7 @@ export class ForgeComputeStack extends cdk.Stack {
         launchTemplate: new ec2.LaunchTemplate(this, 'LtA', {
           machineImage: ecs.EcsOptimizedImage.amazonLinux2(ecs.AmiHardwareType.ARM),
           instanceType: new ec2.InstanceType(PROVIDER_A.instanceTypes[0]),
+          securityGroup: props.ecsSecurityGroup,
           role: new iam.Role(this, 'InstanceRoleA', {
             assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
             managedPolicies: [
@@ -189,7 +189,6 @@ export class ForgeComputeStack extends cdk.Stack {
     const asgB = new autoscaling.AutoScalingGroup(this, 'AsgB', {
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-      securityGroup: props.ecsSecurityGroup,
       mixedInstancesPolicy: {
         instancesDistribution: {
           onDemandBaseCapacity: 0,
@@ -199,6 +198,7 @@ export class ForgeComputeStack extends cdk.Stack {
         launchTemplate: new ec2.LaunchTemplate(this, 'LtB', {
           machineImage: ecs.EcsOptimizedImage.amazonLinux2(),
           instanceType: new ec2.InstanceType(PROVIDER_B.instanceTypes[0]),
+          securityGroup: props.ecsSecurityGroup,
           role: new iam.Role(this, 'InstanceRoleB', {
             assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
             managedPolicies: [
@@ -248,7 +248,6 @@ export class ForgeComputeStack extends cdk.Stack {
     const asgC = new autoscaling.AutoScalingGroup(this, 'AsgC', {
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-      securityGroup: props.ecsSecurityGroup,
       mixedInstancesPolicy: {
         instancesDistribution: {
           onDemandBaseCapacity: 0,
@@ -256,6 +255,7 @@ export class ForgeComputeStack extends cdk.Stack {
           spotAllocationStrategy: autoscaling.SpotAllocationStrategy.LOWEST_PRICE,
         },
         launchTemplate: new ec2.LaunchTemplate(this, 'LtC', {
+          securityGroup: props.ecsSecurityGroup,
           // GPU instances require Amazon Linux 2 with GPU AMI
           machineImage: ec2.MachineImage.lookup({
             name: 'amzn2-ami-ecs-gpu-hvm-*-x86_64-ebs',
