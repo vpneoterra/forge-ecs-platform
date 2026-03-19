@@ -169,7 +169,7 @@ export class ForgeAppStack extends cdk.Stack {
       defaultAction: elbv2.ListenerAction.redirect({
         protocol: 'HTTPS',
         port: '443',
-        statusCode: 'HTTP_301',
+        permanent: true,
       }),
     });
 
