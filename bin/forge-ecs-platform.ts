@@ -45,7 +45,7 @@ const deployApp =
 const deploySolvers =
   (app.node.tryGetContext('deploySolvers') as string | undefined) === 'true';
 const appDomain =
-  (app.node.tryGetContext('appDomain') as string | undefined) ?? 'forgetest.qrucible.ai';
+  (app.node.tryGetContext('appDomain') as string | undefined) ?? 'forge.qrucible.ai';
 
 const awsEnv: cdk.Environment = {
   account: process.env.CDK_DEFAULT_ACCOUNT ?? process.env.AWS_ACCOUNT_ID,

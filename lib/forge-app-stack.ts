@@ -20,6 +20,7 @@ import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import { Construct } from 'constructs';
 
 export interface ForgeAppStackProps extends cdk.StackProps {
@@ -189,10 +190,27 @@ export class ForgeAppStack extends cdk.Stack {
       vpcSubnets: { subnets: albSubnets },
     });
 
-    // HTTP listener (no HTTPS -- DNS is on Hetzner, not Route53, so no auto ACM validation)
-    // Will serve on port 80 initially; HTTPS can be added after DNS is pointed
-    const httpListener = this.alb.addListener('Http', {
+    // -- ACM Certificate (DNS validation -- add CNAME in Hetzner manually) ----
+    const certificate = new acm.Certificate(this, 'ForgeAppCert', {
+      domainName: props.domainName,
+      validation: acm.CertificateValidation.fromDns(), // No hosted zone -- manual DNS validation
+    });
+
+    // HTTPS listener (primary)
+    const httpsListener = this.alb.addListener('Https', {
+      port: 443,
+      certificates: [certificate],
+      sslPolicy: elbv2.SslPolicy.TLS13_RES,
+    });
+
+    // HTTP listener -- redirect to HTTPS
+    this.alb.addListener('Http', {
       port: 80,
+      defaultAction: elbv2.ListenerAction.redirect({
+        protocol: 'HTTPS',
+        port: '443',
+        permanent: true,
+      }),
     });
 
     // -- Fargate Service -------------------------------------------------------
@@ -214,7 +232,7 @@ export class ForgeAppStack extends cdk.Stack {
     this.serviceName = 'forge-app-test';
 
     // Register with ALB target group
-    httpListener.addTargets('ForgeAppTarget', {
+    httpsListener.addTargets('ForgeAppTarget', {
       targets: [service],
       port: 3000,
       protocol: elbv2.ApplicationProtocol.HTTP,
@@ -232,7 +250,7 @@ export class ForgeAppStack extends cdk.Stack {
     // -- Outputs ---------------------------------------------------------------
     this.albDnsName = new cdk.CfnOutput(this, 'AlbDnsName', {
       value: this.alb.loadBalancerDnsName,
-      description: 'ALB DNS name -- point forgetest.qrucible.ai CNAME here',
+      description: 'ALB DNS name -- point forge domain CNAME here',
       exportName: `ForgeTestAlbDns-${props.forgeEnv}`,
     });
 
