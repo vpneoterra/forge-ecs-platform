@@ -194,27 +194,49 @@ export class ForgeAppStack extends cdk.Stack {
     this.alb.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
 
     // -- ACM Certificate (DNS validation -- add CNAME in Hetzner manually) ----
-    const certificate = new acm.Certificate(this, 'ForgeAppCert', {
-      domainName: props.domainName,
-      validation: acm.CertificateValidation.fromDns(), // No hosted zone -- manual DNS validation
-    });
+    // Using fromCertificateArn if a pre-validated cert ARN is provided,
+    // otherwise skip HTTPS and serve on HTTP only.
+    // To enable HTTPS later: pre-create an ACM cert, validate DNS, then pass the ARN.
+    const certArn = this.node.tryGetContext('acmCertArn') as string | undefined;
 
-    // HTTPS listener (primary)
-    const httpsListener = this.alb.addListener('Https', {
-      port: 443,
-      certificates: [certificate],
-      sslPolicy: elbv2.SslPolicy.TLS13_RES,
-    });
+    let primaryListener: elbv2.ApplicationListener;
 
-    // HTTP listener -- redirect to HTTPS
-    this.alb.addListener('Http', {
-      port: 80,
-      defaultAction: elbv2.ListenerAction.redirect({
-        protocol: 'HTTPS',
-        port: '443',
-        permanent: true,
-      }),
-    });
+    if (certArn) {
+      // Use pre-validated certificate -- HTTPS mode
+      const certificate = acm.Certificate.fromCertificateArn(
+        this, 'ForgeAppCert', certArn,
+      );
+
+      primaryListener = this.alb.addListener('Https', {
+        port: 443,
+        certificates: [certificate],
+        sslPolicy: elbv2.SslPolicy.TLS13_RES,
+      });
+
+      // HTTP listener -- redirect to HTTPS
+      this.alb.addListener('Http', {
+        port: 80,
+        defaultAction: elbv2.ListenerAction.redirect({
+          protocol: 'HTTPS',
+          port: '443',
+          permanent: true,
+        }),
+      });
+    } else {
+      // No cert yet -- serve on HTTP only (port 80 forwards to app)
+      primaryListener = this.alb.addListener('Http', {
+        port: 80,
+        open: true,
+      });
+      // Also listen on 443 with a fixed response so browsers don't hang
+      this.alb.addListener('HttpsPlaceholder', {
+        port: 443,
+        defaultAction: elbv2.ListenerAction.fixedResponse(503, {
+          contentType: 'text/plain',
+          messageBody: 'HTTPS not yet configured -- waiting for ACM certificate validation',
+        }),
+      });
+    }
 
     // -- Fargate Service -------------------------------------------------------
     const service = new ecs.FargateService(this, 'ForgeAppService', {
@@ -235,7 +257,7 @@ export class ForgeAppStack extends cdk.Stack {
     this.serviceName = 'forge-app-test';
 
     // Register with ALB target group
-    httpsListener.addTargets('ForgeAppTarget', {
+    primaryListener.addTargets('ForgeAppTarget', {
       targets: [service],
       port: 3000,
       protocol: elbv2.ApplicationProtocol.HTTP,
@@ -282,6 +304,11 @@ export class ForgeAppStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'DomainSetup', {
       value: `MANUAL: Create CNAME ${props.domainName} -> ${this.alb.loadBalancerDnsName}`,
       description: 'DNS configuration -- add this CNAME in Hetzner DNS',
+    });
+
+    new cdk.CfnOutput(this, 'HttpsStatus', {
+      value: certArn ? `HTTPS enabled with cert ${certArn}` : 'HTTP-only mode. To enable HTTPS: create ACM cert, validate DNS, then pass -c acmCertArn=<arn>',
+      description: 'Current HTTPS/TLS status',
     });
   }
 }
