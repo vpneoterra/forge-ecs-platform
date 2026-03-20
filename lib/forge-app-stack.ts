@@ -224,17 +224,11 @@ export class ForgeAppStack extends cdk.Stack {
       });
     } else {
       // No cert yet -- serve on HTTP only (port 80 forwards to app)
+      // Port 443 is NOT served -- browsers hitting https:// will get connection refused.
+      // Once ACM cert is validated, redeploy with -c acmCertArn=<arn> to enable HTTPS.
       primaryListener = this.alb.addListener('Http', {
         port: 80,
         open: true,
-      });
-      // Also listen on 443 with a fixed response so browsers don't hang
-      this.alb.addListener('HttpsPlaceholder', {
-        port: 443,
-        defaultAction: elbv2.ListenerAction.fixedResponse(503, {
-          contentType: 'text/plain',
-          messageBody: 'HTTPS not yet configured -- waiting for ACM certificate validation',
-        }),
       });
     }
 
