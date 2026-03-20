@@ -150,13 +150,34 @@ export class ForgeAppStack extends cdk.Stack {
 
     container.addPortMappings({ containerPort: 3000 });
 
+    // -- ALB requires 2 AZs -- ensure we have enough public subnets -----------
+    // Dev VPC may have only 1 AZ; create a second public subnet if needed.
+    let albSubnets: ec2.ISubnet[] = [...props.publicSubnets];
+    if (albSubnets.length < 2) {
+      // Pick an AZ different from the first subnet
+      const usedAz = albSubnets[0].availabilityZone;
+      const allAzs = cdk.Stack.of(this).availabilityZones;
+      const secondAz = allAzs.find(az => az !== usedAz) ?? allAzs[1] ?? `${this.region}b`;
+
+      const albSubnet2 = new ec2.PublicSubnet(this, 'AlbSubnet2', {
+        vpcId: props.vpc.vpcId,
+        cidrBlock: '10.0.128.0/24',  // High range to avoid existing subnets
+        availabilityZone: secondAz,
+        mapPublicIpOnLaunch: true,
+      });
+      // Route internet traffic through the VPC's internet gateway
+      const igwId = props.vpc.internetGatewayId!;
+      albSubnet2.addDefaultInternetRoute(igwId, props.vpc.internetConnectivityEstablished);
+      albSubnets.push(albSubnet2);
+    }
+
     // -- Application Load Balancer --------------------------------------------
     this.alb = new elbv2.ApplicationLoadBalancer(this, 'ForgeTestAlb', {
       loadBalancerName: 'forge-test-alb',
       vpc: props.vpc,
       internetFacing: true,
       securityGroup: props.albSecurityGroup,
-      vpcSubnets: { subnets: props.publicSubnets },
+      vpcSubnets: { subnets: albSubnets },
     });
 
     // HTTP listener (no HTTPS -- DNS is on Hetzner, not Route53, so no auto ACM validation)
