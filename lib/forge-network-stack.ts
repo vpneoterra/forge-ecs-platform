@@ -91,11 +91,8 @@ export class ForgeNetworkStack extends cdk.Stack {
       role: natRole,
       // securityGroup and associatePublicIpAddress are set via CfnInstance networkInterfaces
       // to avoid the "Network interfaces and an instance-level subnet ID" conflict
-      spotOptions: {
-        requestType: ec2.SpotRequestType.ONE_TIME,
-        interruptionBehavior: ec2.SpotInstanceInterruption.STOP,
-        maxPrice: 0.005, // $0.005/hr max (~$3.60/month) -- on-demand is $0.0042/hr
-      },
+      // No spot options -- t4g.nano on-demand is only $0.0042/hr (~$3/month)
+      // Spot saves <$1/month but adds complexity and interruption risk for NAT
       userData: ec2.UserData.forLinux(),
     });
 
