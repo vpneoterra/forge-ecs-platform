@@ -30,7 +30,8 @@ export class ForgeNetworkStack extends cdk.Stack {
     super(scope, id, props);
 
     const isProd = props.forgeEnv === 'prod';
-    const maxAzs = isProd ? 2 : 1;
+    // ALB requires at least 2 AZs -- use 2 even for dev
+    const maxAzs = 2;
 
     // ── VPC ─────────────────────────────────────────────────────────────────
     // NAT is handled by a NAT instance below, so we disable CDK's managed NAT.
