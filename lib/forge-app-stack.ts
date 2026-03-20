@@ -23,20 +23,19 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import { Construct } from 'constructs';
 
+
 export interface ForgeAppStackProps extends cdk.StackProps {
   forgeEnv: string;
   vpc: ec2.Vpc;
   ecsSecurityGroup: ec2.SecurityGroup;
-  albSecurityGroup: ec2.SecurityGroup;
+  alb: elbv2.ApplicationLoadBalancer;  // ALB from Network stack (stable DNS)
   privateSubnets: ec2.ISubnet[];
   publicSubnets: ec2.ISubnet[];
-  domainName: string;       // e.g., 'forgetest.qrucible.ai'
+  domainName: string;       // e.g., 'forge.qrucible.ai'
   tags?: Record<string, string>;
 }
 
 export class ForgeAppStack extends cdk.Stack {
-  public readonly alb: elbv2.ApplicationLoadBalancer;
-  public readonly albDnsName: cdk.CfnOutput;
   public readonly ecsCluster: ecs.Cluster;
   public readonly serviceName: string;
 
@@ -160,43 +159,15 @@ export class ForgeAppStack extends cdk.Stack {
 
     container.addPortMappings({ containerPort: 3000 });
 
-    // -- ALB requires 2 AZs -- ensure we have enough public subnets -----------
-    // Dev VPC may have only 1 AZ; create a second public subnet if needed.
-    let albSubnets: ec2.ISubnet[] = [...props.publicSubnets];
-    if (albSubnets.length < 2) {
-      // Pick an AZ different from the first subnet
-      const usedAz = albSubnets[0].availabilityZone;
-      const allAzs = cdk.Stack.of(this).availabilityZones;
-      const secondAz = allAzs.find(az => az !== usedAz) ?? allAzs[1] ?? `${this.region}b`;
+    // -- ALB is provided by the Network stack (stable DNS -- never changes) ----
+    const alb = props.alb;
 
-      const albSubnet2 = new ec2.PublicSubnet(this, 'AlbSubnet2', {
-        vpcId: props.vpc.vpcId,
-        cidrBlock: '10.0.128.0/24',  // High range to avoid existing subnets
-        availabilityZone: secondAz,
-        mapPublicIpOnLaunch: true,
-      });
-      // Route internet traffic through the VPC's internet gateway
-      const igwId = props.vpc.internetGatewayId!;
-      albSubnet2.addDefaultInternetRoute(igwId, props.vpc.internetConnectivityEstablished);
-      albSubnets.push(albSubnet2);
-    }
-
-    // -- Application Load Balancer --------------------------------------------
-    // RETAIN policy ensures the ALB survives stack deletion/recreation,
-    // so the DNS CNAME never needs to change.
-    this.alb = new elbv2.ApplicationLoadBalancer(this, 'ForgeTestAlb', {
-      loadBalancerName: 'forge-test-alb',
-      vpc: props.vpc,
-      internetFacing: true,
-      securityGroup: props.albSecurityGroup,
-      vpcSubnets: { subnets: albSubnets },
-    });
-    this.alb.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
-
-    // -- ACM Certificate (DNS validation -- add CNAME in Hetzner manually) ----
-    // Using fromCertificateArn if a pre-validated cert ARN is provided,
-    // otherwise skip HTTPS and serve on HTTP only.
-    // To enable HTTPS later: pre-create an ACM cert, validate DNS, then pass the ARN.
+    // -- ACM Certificate -------------------------------------------------------
+    // If a pre-validated cert ARN is provided via CDK context, enable HTTPS.
+    // Otherwise, serve on HTTP only. To enable HTTPS:
+    //   1. Create ACM cert in AWS console for forge.qrucible.ai
+    //   2. Add the DNS validation CNAME to Hetzner
+    //   3. Once validated, redeploy with: -c acmCertArn=<arn>
     const certArn = this.node.tryGetContext('acmCertArn') as string | undefined;
 
     let primaryListener: elbv2.ApplicationListener;
@@ -207,14 +178,14 @@ export class ForgeAppStack extends cdk.Stack {
         this, 'ForgeAppCert', certArn,
       );
 
-      primaryListener = this.alb.addListener('Https', {
+      primaryListener = alb.addListener('Https', {
         port: 443,
         certificates: [certificate],
         sslPolicy: elbv2.SslPolicy.TLS13_RES,
       });
 
       // HTTP listener -- redirect to HTTPS
-      this.alb.addListener('Http', {
+      alb.addListener('Http', {
         port: 80,
         defaultAction: elbv2.ListenerAction.redirect({
           protocol: 'HTTPS',
@@ -224,9 +195,7 @@ export class ForgeAppStack extends cdk.Stack {
       });
     } else {
       // No cert yet -- serve on HTTP only (port 80 forwards to app)
-      // Port 443 is NOT served -- browsers hitting https:// will get connection refused.
-      // Once ACM cert is validated, redeploy with -c acmCertArn=<arn> to enable HTTPS.
-      primaryListener = this.alb.addListener('Http', {
+      primaryListener = alb.addListener('Http', {
         port: 80,
         open: true,
       });
@@ -267,17 +236,7 @@ export class ForgeAppStack extends cdk.Stack {
     });
 
     // -- Outputs ---------------------------------------------------------------
-    this.albDnsName = new cdk.CfnOutput(this, 'AlbDnsName', {
-      value: this.alb.loadBalancerDnsName,
-      description: 'ALB DNS name -- point forge domain CNAME here',
-      exportName: `ForgeTestAlbDns-${props.forgeEnv}`,
-    });
-
-    new cdk.CfnOutput(this, 'AlbArn', {
-      value: this.alb.loadBalancerArn,
-      description: 'ALB ARN',
-    });
-
+    // ALB DNS is output by ForgeNetworkStack (stable, never changes).
     new cdk.CfnOutput(this, 'EcrRepoUri', {
       value: ecrRepo.repositoryUri,
       description: 'ECR repository URI for forge-app-test images',
@@ -296,7 +255,7 @@ export class ForgeAppStack extends cdk.Stack {
     });
 
     new cdk.CfnOutput(this, 'DomainSetup', {
-      value: `MANUAL: Create CNAME ${props.domainName} -> ${this.alb.loadBalancerDnsName}`,
+      value: `MANUAL: Create CNAME ${props.domainName} -> ${alb.loadBalancerDnsName}`,
       description: 'DNS configuration -- add this CNAME in Hetzner DNS',
     });
 
