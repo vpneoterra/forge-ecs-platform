@@ -182,6 +182,8 @@ export class ForgeAppStack extends cdk.Stack {
     }
 
     // -- Application Load Balancer --------------------------------------------
+    // RETAIN policy ensures the ALB survives stack deletion/recreation,
+    // so the DNS CNAME never needs to change.
     this.alb = new elbv2.ApplicationLoadBalancer(this, 'ForgeTestAlb', {
       loadBalancerName: 'forge-test-alb',
       vpc: props.vpc,
@@ -189,6 +191,7 @@ export class ForgeAppStack extends cdk.Stack {
       securityGroup: props.albSecurityGroup,
       vpcSubnets: { subnets: albSubnets },
     });
+    this.alb.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
 
     // -- ACM Certificate (DNS validation -- add CNAME in Hetzner manually) ----
     const certificate = new acm.Certificate(this, 'ForgeAppCert', {
