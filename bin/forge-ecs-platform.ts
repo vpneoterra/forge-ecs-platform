@@ -86,19 +86,20 @@ if (deployApp) {
   appStack.addDependency(networkStack);
 }
 
-// -- Preserve cross-stack exports if legacy stacks (Data/Compute) still exist in AWS.
-// When those stacks import Network exports, CDK must not remove them even if we
-// are not synthesising those stacks in this run.  We create lightweight CfnOutputs
-// that keep the auto-generated export names alive.
+// -- Preserve cross-stack exports if legacy stacks (Data/Compute) still exist.
+// ForgeData-dev imports these auto-generated exports from ForgeNetwork-dev.
+// If we don't synthesize ForgeData-dev, CDK removes the exports and CloudFormation
+// blocks the update.  We preserve the exact export names with explicit CfnOutputs.
 if (!deploySolvers) {
-  // These read the property which forces CDK to keep the cross-stack export
-  new cdk.CfnOutput(networkStack, 'KeepEfsSgExport', {
+  // The auto-generated export for EfsSg GroupId -- exact logical ID from CDK
+  new cdk.CfnOutput(networkStack, 'ExportsOutputFnGetAttEfsSgCAB16DA1GroupId4DE98B00', {
     value: networkStack.efsSecurityGroup.securityGroupId,
-    description: 'Preserved for legacy ForgeData stack import',
+    exportName: `ForgeNetwork-${env}:ExportsOutputFnGetAttEfsSgCAB16DA1GroupId4DE98B00`,
   });
-  new cdk.CfnOutput(networkStack, 'KeepRdsSgExport', {
+  // The auto-generated export for RdsSg GroupId
+  new cdk.CfnOutput(networkStack, 'ExportsOutputFnGetAttRdsSg4BD60B44GroupIdBF9D78FB', {
     value: networkStack.rdsSecurityGroup.securityGroupId,
-    description: 'Preserved for legacy ForgeData stack import',
+    exportName: `ForgeNetwork-${env}:ExportsOutputFnGetAttRdsSg4BD60B44GroupIdBF9D78FB`,
   });
 }
 
