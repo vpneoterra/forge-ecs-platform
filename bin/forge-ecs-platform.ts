@@ -73,14 +73,15 @@ const networkStack = new ForgeNetworkStack(app, `ForgeNetwork-${env}`, {
 if (deployApp) {
   const appStack = new ForgeAppStack(app, `ForgeApp-${env}`, {
     env: awsEnv,
-    description: 'FORGE Web App -- Fargate, ECS Service, Secrets',
+    description: 'FORGE Web App -- Fargate, ALB, Route 53, ACM, Secrets',
     forgeEnv: env,
     vpc: networkStack.vpc,
     ecsSecurityGroup: networkStack.ecsSecurityGroup,
-    alb: networkStack.alb,                   // ALB lives in Network stack (stable DNS)
+    albSecurityGroup: networkStack.albSecurityGroup,
     privateSubnets: networkStack.privateSubnets,
     publicSubnets: networkStack.publicSubnets,
     domainName: appDomain,
+    hostedZoneDomain: appDomain.split('.').slice(-2).join('.'), // e.g., 'qrucible.ai'
     tags: sharedTags,
   });
   appStack.addDependency(networkStack);

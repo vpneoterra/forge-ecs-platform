@@ -8,7 +8,6 @@
 
 import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
-import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
 
@@ -25,7 +24,6 @@ export class ForgeNetworkStack extends cdk.Stack {
   public readonly albSecurityGroup: ec2.SecurityGroup;
   public readonly rdsSecurityGroup: ec2.SecurityGroup;
   public readonly efsSecurityGroup: ec2.SecurityGroup;
-  public readonly alb: elbv2.ApplicationLoadBalancer;
   public readonly natInstanceId: cdk.CfnOutput;
 
   constructor(scope: Construct, id: string, props: ForgeNetworkStackProps) {
@@ -229,49 +227,7 @@ export class ForgeNetworkStack extends cdk.Stack {
       'NFS from ECS',
     );
 
-    // ── ALB (lives in Network stack so its DNS never changes) ────────────────
-    // The ALB must be in the stable Network stack. If it lived in the App stack,
-    // every stack deletion/recreation would produce a new ALB DNS name,
-    // requiring a DNS update in Hetzner each time.
-    let albSubnets: ec2.ISubnet[] = [...this.publicSubnets];
-    if (albSubnets.length < 2) {
-      const usedAz = albSubnets[0].availabilityZone;
-      const allAzs = cdk.Stack.of(this).availabilityZones;
-      const secondAz = allAzs.find(az => az !== usedAz) ?? allAzs[1] ?? `${this.region}b`;
-      const albSubnet2 = new ec2.PublicSubnet(this, 'AlbSubnet2', {
-        vpcId: this.vpc.vpcId,
-        cidrBlock: '10.0.128.0/24',
-        availabilityZone: secondAz,
-        mapPublicIpOnLaunch: true,
-      });
-      const igwId = this.vpc.internetGatewayId!;
-      albSubnet2.addDefaultInternetRoute(igwId, this.vpc.internetConnectivityEstablished);
-      albSubnets.push(albSubnet2);
-    }
-
-    this.alb = new elbv2.ApplicationLoadBalancer(this, 'ForgeAlb', {
-      loadBalancerName: `forge-alb-${props.forgeEnv}`,
-      vpc: this.vpc,
-      internetFacing: true,
-      securityGroup: this.albSecurityGroup,
-      vpcSubnets: { subnets: albSubnets },
-    });
-    // RETAIN: ALB survives even if this stack is accidentally deleted
-    this.alb.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
-
     // ── Outputs ──────────────────────────────────────────────────────────────
-    new cdk.CfnOutput(this, 'AlbDnsName', {
-      value: this.alb.loadBalancerDnsName,
-      description: 'ALB DNS name -- point forge domain CNAME here (STABLE -- never changes)',
-      exportName: `ForgeAlbDns-${props.forgeEnv}`,
-    });
-
-    new cdk.CfnOutput(this, 'AlbArn', {
-      value: this.alb.loadBalancerArn,
-      description: 'ALB ARN',
-      exportName: `ForgeAlbArn-${props.forgeEnv}`,
-    });
-
     this.natInstanceId = new cdk.CfnOutput(this, 'NatInstanceId', {
       value: natInstance.ref,
       description: 'NAT Instance ID -- use this to hibernate (stop) the instance',

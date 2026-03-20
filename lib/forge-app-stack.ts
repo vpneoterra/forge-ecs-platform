@@ -4,12 +4,19 @@
  * Self-contained Fargate deployment: creates its own ECS cluster, ALB,
  * and Fargate service. Does NOT depend on ForgeComputeStack.
  *
+ * Route 53 integration:
+ *   - ACM certificate with automated DNS validation via Route 53
+ *   - A/AAAA Alias records pointing to the ALB (auto-follow ALB IP changes)
+ *   - No manual DNS updates ever needed -- Route 53 handles everything
+ *
  * Cost breakdown:
  *   - ALB: ~$16/month (fixed) + $0.008/LCU-hour
  *   - Fargate (256 CPU / 512 MB): ~$9/month (on-demand), ~$6/month (Spot)
  *   - Secrets Manager: $0.40/secret/month x 5 = $2/month
  *   - CloudWatch Logs: ~$0.50/month (7-day retention)
- *   Total: ~$25/month
+ *   - Route 53 hosted zone: $0.50/month + $0.40/million queries
+ *   - ACM certificate: free
+ *   Total: ~$26/month
  */
 
 import * as cdk from 'aws-cdk-lib';
@@ -21,26 +28,37 @@ import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
+import * as route53 from 'aws-cdk-lib/aws-route53';
+import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import { Construct } from 'constructs';
-
 
 export interface ForgeAppStackProps extends cdk.StackProps {
   forgeEnv: string;
   vpc: ec2.Vpc;
   ecsSecurityGroup: ec2.SecurityGroup;
-  alb: elbv2.ApplicationLoadBalancer;  // ALB from Network stack (stable DNS)
+  albSecurityGroup: ec2.SecurityGroup;
   privateSubnets: ec2.ISubnet[];
   publicSubnets: ec2.ISubnet[];
   domainName: string;       // e.g., 'forge.qrucible.ai'
+  hostedZoneDomain: string; // e.g., 'qrucible.ai'
   tags?: Record<string, string>;
 }
 
 export class ForgeAppStack extends cdk.Stack {
+  public readonly alb: elbv2.ApplicationLoadBalancer;
+  public readonly albDnsName: cdk.CfnOutput;
   public readonly ecsCluster: ecs.Cluster;
   public readonly serviceName: string;
 
   constructor(scope: Construct, id: string, props: ForgeAppStackProps) {
     super(scope, id, props);
+
+    // -- Route 53 Hosted Zone (lookup existing) --------------------------------
+    // The user has already moved qrucible.ai nameservers to Route 53.
+    // We look up the existing hosted zone rather than creating a new one.
+    const hostedZone = route53.HostedZone.fromLookup(this, 'HostedZone', {
+      domainName: props.hostedZoneDomain,
+    });
 
     // -- ECS Cluster (Fargate only -- no EC2 instances needed) ---------------
     this.ecsCluster = new ecs.Cluster(this, 'ForgeAppCluster', {
@@ -159,47 +177,72 @@ export class ForgeAppStack extends cdk.Stack {
 
     container.addPortMappings({ containerPort: 3000 });
 
-    // -- ALB is provided by the Network stack (stable DNS -- never changes) ----
-    const alb = props.alb;
+    // -- ALB requires 2 AZs -- ensure we have enough public subnets -----------
+    // Dev VPC may have only 1 AZ; create a second public subnet if needed.
+    let albSubnets: ec2.ISubnet[] = [...props.publicSubnets];
+    if (albSubnets.length < 2) {
+      // Pick an AZ different from the first subnet
+      const usedAz = albSubnets[0].availabilityZone;
+      const allAzs = cdk.Stack.of(this).availabilityZones;
+      const secondAz = allAzs.find(az => az !== usedAz) ?? allAzs[1] ?? `${this.region}b`;
 
-    // -- ACM Certificate -------------------------------------------------------
-    // If a pre-validated cert ARN is provided via CDK context, enable HTTPS.
-    // Otherwise, serve on HTTP only. To enable HTTPS:
-    //   1. Create ACM cert in AWS console for forge.qrucible.ai
-    //   2. Add the DNS validation CNAME to Hetzner
-    //   3. Once validated, redeploy with: -c acmCertArn=<arn>
-    const certArn = this.node.tryGetContext('acmCertArn') as string | undefined;
-
-    let primaryListener: elbv2.ApplicationListener;
-
-    if (certArn) {
-      // Use pre-validated certificate -- HTTPS mode
-      const certificate = acm.Certificate.fromCertificateArn(
-        this, 'ForgeAppCert', certArn,
-      );
-
-      primaryListener = alb.addListener('Https', {
-        port: 443,
-        certificates: [certificate],
-        sslPolicy: elbv2.SslPolicy.TLS13_RES,
+      const albSubnet2 = new ec2.PublicSubnet(this, 'AlbSubnet2', {
+        vpcId: props.vpc.vpcId,
+        cidrBlock: '10.0.128.0/24',  // High range to avoid existing subnets
+        availabilityZone: secondAz,
+        mapPublicIpOnLaunch: true,
       });
-
-      // HTTP listener -- redirect to HTTPS
-      alb.addListener('Http', {
-        port: 80,
-        defaultAction: elbv2.ListenerAction.redirect({
-          protocol: 'HTTPS',
-          port: '443',
-          permanent: true,
-        }),
-      });
-    } else {
-      // No cert yet -- serve on HTTP only (port 80 forwards to app)
-      primaryListener = alb.addListener('Http', {
-        port: 80,
-        open: true,
-      });
+      // Route internet traffic through the VPC's internet gateway
+      const igwId = props.vpc.internetGatewayId!;
+      albSubnet2.addDefaultInternetRoute(igwId, props.vpc.internetConnectivityEstablished);
+      albSubnets.push(albSubnet2);
     }
+
+    // -- Application Load Balancer --------------------------------------------
+    this.alb = new elbv2.ApplicationLoadBalancer(this, 'ForgeTestAlb', {
+      loadBalancerName: 'forge-test-alb',
+      vpc: props.vpc,
+      internetFacing: true,
+      securityGroup: props.albSecurityGroup,
+      vpcSubnets: { subnets: albSubnets },
+    });
+
+    // -- ACM Certificate (DNS validated via Route 53 -- fully automatic) ------
+    const certificate = new acm.Certificate(this, 'ForgeAppCert', {
+      domainName: props.domainName,
+      validation: acm.CertificateValidation.fromDns(hostedZone),
+      // Route 53 validation: CDK automatically creates the CNAME records
+      // in the hosted zone. No manual DNS steps needed.
+    });
+
+    // HTTPS listener (primary)
+    const httpsListener = this.alb.addListener('Https', {
+      port: 443,
+      certificates: [certificate],
+      sslPolicy: elbv2.SslPolicy.TLS13_RES,
+    });
+
+    // HTTP listener -- redirect to HTTPS
+    this.alb.addListener('Http', {
+      port: 80,
+      defaultAction: elbv2.ListenerAction.redirect({
+        protocol: 'HTTPS',
+        port: '443',
+        permanent: true,
+      }),
+    });
+
+    // -- Route 53 Alias Record ------------------------------------------------
+    // A record with Alias to ALB -- Route 53 automatically resolves to the
+    // ALB's current IPs. No CNAME needed, no manual DNS updates ever.
+    new route53.ARecord(this, 'ForgeAlbAlias', {
+      zone: hostedZone,
+      recordName: props.domainName,
+      target: route53.RecordTarget.fromAlias(
+        new route53Targets.LoadBalancerTarget(this.alb),
+      ),
+      comment: 'FORGE app ALB -- managed by CDK',
+    });
 
     // -- Fargate Service -------------------------------------------------------
     const service = new ecs.FargateService(this, 'ForgeAppService', {
@@ -220,7 +263,7 @@ export class ForgeAppStack extends cdk.Stack {
     this.serviceName = 'forge-app-test';
 
     // Register with ALB target group
-    primaryListener.addTargets('ForgeAppTarget', {
+    httpsListener.addTargets('ForgeAppTarget', {
       targets: [service],
       port: 3000,
       protocol: elbv2.ApplicationProtocol.HTTP,
@@ -236,7 +279,17 @@ export class ForgeAppStack extends cdk.Stack {
     });
 
     // -- Outputs ---------------------------------------------------------------
-    // ALB DNS is output by ForgeNetworkStack (stable, never changes).
+    this.albDnsName = new cdk.CfnOutput(this, 'AlbDnsName', {
+      value: this.alb.loadBalancerDnsName,
+      description: 'ALB DNS name (Route 53 Alias handles this -- no manual CNAME needed)',
+      exportName: `ForgeTestAlbDns-${props.forgeEnv}`,
+    });
+
+    new cdk.CfnOutput(this, 'AlbArn', {
+      value: this.alb.loadBalancerArn,
+      description: 'ALB ARN',
+    });
+
     new cdk.CfnOutput(this, 'EcrRepoUri', {
       value: ecrRepo.repositoryUri,
       description: 'ECR repository URI for forge-app-test images',
@@ -255,13 +308,13 @@ export class ForgeAppStack extends cdk.Stack {
     });
 
     new cdk.CfnOutput(this, 'DomainSetup', {
-      value: `MANUAL: Create CNAME ${props.domainName} -> ${alb.loadBalancerDnsName}`,
-      description: 'DNS configuration -- add this CNAME in Hetzner DNS',
+      value: `Route 53 Alias: ${props.domainName} -> ALB (automatic, no manual DNS needed)`,
+      description: 'DNS is fully managed by Route 53 + CDK',
     });
 
-    new cdk.CfnOutput(this, 'HttpsStatus', {
-      value: certArn ? `HTTPS enabled with cert ${certArn}` : 'HTTP-only mode. To enable HTTPS: create ACM cert, validate DNS, then pass -c acmCertArn=<arn>',
-      description: 'Current HTTPS/TLS status',
+    new cdk.CfnOutput(this, 'CertificateArn', {
+      value: certificate.certificateArn,
+      description: 'ACM certificate ARN (auto-validated via Route 53)',
     });
   }
 }
