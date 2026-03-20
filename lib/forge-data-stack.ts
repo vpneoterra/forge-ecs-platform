@@ -171,17 +171,18 @@ export class ForgeDataStack extends cdk.Stack {
         removalPolicy: cdk.RemovalPolicy.RETAIN,
         lifecycleRules: [
           {
-            // Keep only last 5 images — controls ECR storage cost
-            rulePriority: 1,
-            description: 'Keep last 5 images',
-            maxImageCount: 5,
-          },
-          {
             // Remove untagged images after 7 days
-            rulePriority: 2,
+            rulePriority: 1,
             description: 'Remove untagged after 7 days',
             tagStatus: ecr.TagStatus.UNTAGGED,
             maxImageAge: cdk.Duration.days(7),
+          },
+          {
+            // Keep only last 5 images — controls ECR storage cost
+            rulePriority: 2,
+            description: 'Keep last 5 images',
+            maxImageCount: 5,
+            // TagStatus.ANY must have the highest rulePriority
           },
         ],
       });
