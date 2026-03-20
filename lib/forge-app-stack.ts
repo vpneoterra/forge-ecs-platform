@@ -1,17 +1,15 @@
 /**
  * ForgeAppStack -- FORGE Web Application (test branch)
  *
- * Deploys the forge-app (Node.js Express) as an ECS service behind an ALB.
- * Uses the existing ECS cluster from ForgeComputeStack.
- * ALB handles TLS termination via ACM certificate for forgetest.qrucible.ai.
+ * Self-contained Fargate deployment: creates its own ECS cluster, ALB,
+ * and Fargate service. Does NOT depend on ForgeComputeStack.
  *
  * Cost breakdown:
  *   - ALB: ~$16/month (fixed) + $0.008/LCU-hour
- *   - ACM: free
- *   - ECS task: runs on existing Provider A Graviton Spot (no additional EC2)
- *   - Secrets Manager: $0.40/secret/month × 5 = $2/month
+ *   - Fargate (256 CPU / 512 MB): ~$9/month (on-demand), ~$6/month (Spot)
+ *   - Secrets Manager: $0.40/secret/month x 5 = $2/month
  *   - CloudWatch Logs: ~$0.50/month (7-day retention)
- *   Total incremental: ~$19/month
+ *   Total: ~$25/month
  */
 
 import * as cdk from 'aws-cdk-lib';
@@ -19,52 +17,46 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
-import * as acm from 'aws-cdk-lib/aws-certificatemanager';
-import * as route53 from 'aws-cdk-lib/aws-route53';
-import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
-import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
 import { Construct } from 'constructs';
 
 export interface ForgeAppStackProps extends cdk.StackProps {
   forgeEnv: string;
   vpc: ec2.Vpc;
-  ecsCluster: ecs.Cluster;
   ecsSecurityGroup: ec2.SecurityGroup;
   albSecurityGroup: ec2.SecurityGroup;
   privateSubnets: ec2.ISubnet[];
   publicSubnets: ec2.ISubnet[];
   domainName: string;       // e.g., 'forgetest.qrucible.ai'
-  hostedZoneId?: string;    // Route53 hosted zone ID (if DNS is on Route53)
-  hostedZoneName?: string;  // e.g., 'qrucible.ai'
   tags?: Record<string, string>;
 }
 
 export class ForgeAppStack extends cdk.Stack {
   public readonly alb: elbv2.ApplicationLoadBalancer;
   public readonly albDnsName: cdk.CfnOutput;
+  public readonly ecsCluster: ecs.Cluster;
+  public readonly serviceName: string;
 
   constructor(scope: Construct, id: string, props: ForgeAppStackProps) {
     super(scope, id, props);
 
-    // ── ECR Repository ──────────────────────────────────────────────────────
-    const ecrRepo = new ecr.Repository(this, 'ForgeAppRepo', {
-      repositoryName: 'forge-app-test',
-      imageScanOnPush: true,
-      lifecycleRules: [
-        {
-          description: 'Keep last 10 images',
-          maxImageCount: 10,
-          rulePriority: 1,
-        },
-      ],
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    // -- ECS Cluster (Fargate only -- no EC2 instances needed) ---------------
+    this.ecsCluster = new ecs.Cluster(this, 'ForgeAppCluster', {
+      clusterName: `forge-app-${props.forgeEnv}`,
+      vpc: props.vpc,
+      enableFargateCapacityProviders: true,
+      containerInsights: false, // Save cost in dev
     });
 
-    // ── Secrets ──────────────────────────────────────────────────────────────
-    // Placeholder secrets -- values must be set manually in AWS Console or CLI
+    // -- ECR Repository (import existing or create) --------------------------
+    // Use existing repo created by the CI/CD pipeline
+    const ecrRepo = ecr.Repository.fromRepositoryName(
+      this, 'ForgeAppRepo', 'forge-app-test',
+    );
+
+    // -- Secrets --------------------------------------------------------------
     const secretNames = [
       'supabase-url',
       'supabase-service-key',
@@ -83,14 +75,14 @@ export class ForgeAppStack extends cdk.Stack {
       secrets[envName] = ecs.Secret.fromSecretsManager(secret);
     }
 
-    // ── CloudWatch Log Group ────────────────────────────────────────────────
+    // -- CloudWatch Log Group ------------------------------------------------
     const logGroup = new logs.LogGroup(this, 'ForgeAppLogGroup', {
       logGroupName: '/forge/ecs/forge-app-test',
       retention: logs.RetentionDays.ONE_WEEK,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // ── Task Execution Role ─────────────────────────────────────────────────
+    // -- Task Execution Role --------------------------------------------------
     const executionRole = new iam.Role(this, 'TaskExecutionRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
       managedPolicies: [
@@ -103,12 +95,13 @@ export class ForgeAppStack extends cdk.Stack {
       actions: ['secretsmanager:GetSecretValue', 'kms:Decrypt'],
       resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:forge/test/*`],
     }));
+    // Allow pulling from ECR
+    ecrRepo.grantPull(executionRole);
 
-    // ── Task Role (runtime) ─────────────────────────────────────────────────
+    // -- Task Role (runtime) --------------------------------------------------
     const taskRole = new iam.Role(this, 'TaskRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
     });
-    // Allow ECS Exec for debugging
     taskRole.addToPolicy(new iam.PolicyStatement({
       actions: [
         'ssmmessages:CreateControlChannel', 'ssmmessages:CreateDataChannel',
@@ -117,18 +110,21 @@ export class ForgeAppStack extends cdk.Stack {
       resources: ['*'],
     }));
 
-    // ── ECS Task Definition ─────────────────────────────────────────────────
-    const taskDef = new ecs.Ec2TaskDefinition(this, 'ForgeAppTaskDef', {
+    // -- Fargate Task Definition ----------------------------------------------
+    const taskDef = new ecs.FargateTaskDefinition(this, 'ForgeAppTaskDef', {
       family: 'forge-app-test',
-      networkMode: ecs.NetworkMode.AWS_VPC,
+      cpu: 256,
+      memoryLimitMiB: 512,
       executionRole,
       taskRole,
+      runtimePlatform: {
+        cpuArchitecture: ecs.CpuArchitecture.X86_64,
+        operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+      },
     });
 
     const container = taskDef.addContainer('forge-app', {
       image: ecs.ContainerImage.fromEcrRepository(ecrRepo, 'latest'),
-      memoryLimitMiB: 512,
-      cpu: 256,
       essential: true,
       environment: {
         NODE_ENV: 'production',
@@ -148,13 +144,13 @@ export class ForgeAppStack extends cdk.Stack {
         interval: cdk.Duration.seconds(30),
         timeout: cdk.Duration.seconds(10),
         retries: 3,
-        startPeriod: cdk.Duration.seconds(30),
+        startPeriod: cdk.Duration.seconds(60),
       },
     });
 
     container.addPortMappings({ containerPort: 3000 });
 
-    // ── Application Load Balancer ───────────────────────────────────────────
+    // -- Application Load Balancer --------------------------------------------
     this.alb = new elbv2.ApplicationLoadBalancer(this, 'ForgeTestAlb', {
       loadBalancerName: 'forge-test-alb',
       vpc: props.vpc,
@@ -163,79 +159,32 @@ export class ForgeAppStack extends cdk.Stack {
       vpcSubnets: { subnets: props.publicSubnets },
     });
 
-    // HTTP -> HTTPS redirect
-    this.alb.addListener('HttpRedirect', {
+    // HTTP listener (no HTTPS -- DNS is on Hetzner, not Route53, so no auto ACM validation)
+    // Will serve on port 80 initially; HTTPS can be added after DNS is pointed
+    const httpListener = this.alb.addListener('Http', {
       port: 80,
-      defaultAction: elbv2.ListenerAction.redirect({
-        protocol: 'HTTPS',
-        port: '443',
-        permanent: true,
-      }),
     });
 
-    // ACM Certificate (DNS validation via Route53 or manual)
-    let certificate: acm.ICertificate;
-    
-    if (props.hostedZoneId && props.hostedZoneName) {
-      // Auto-validate via Route53
-      const hostedZone = route53.HostedZone.fromHostedZoneAttributes(this, 'Zone', {
-        hostedZoneId: props.hostedZoneId,
-        zoneName: props.hostedZoneName,
-      });
-
-      certificate = new acm.Certificate(this, 'ForgeTestCert', {
-        domainName: props.domainName,
-        validation: acm.CertificateValidation.fromDns(hostedZone),
-      });
-
-      // Route53 alias record -> ALB
-      new route53.ARecord(this, 'ForgeTestDns', {
-        zone: hostedZone,
-        recordName: props.domainName,
-        target: route53.RecordTarget.fromAlias(
-          new route53Targets.LoadBalancerTarget(this.alb),
-        ),
-        ttl: cdk.Duration.minutes(5),
-      });
-    } else {
-      // Manual DNS validation -- user must add CNAME records
-      certificate = new acm.Certificate(this, 'ForgeTestCert', {
-        domainName: props.domainName,
-        validation: acm.CertificateValidation.fromDns(),
-      });
-    }
-
-    // HTTPS listener with target group
-    const httpsListener = this.alb.addListener('Https', {
-      port: 443,
-      certificates: [certificate],
-      sslPolicy: elbv2.SslPolicy.TLS13_RES,
-    });
-
-    // ── ECS Service ─────────────────────────────────────────────────────────
-    const service = new ecs.Ec2Service(this, 'ForgeAppService', {
-      cluster: props.ecsCluster,
+    // -- Fargate Service -------------------------------------------------------
+    const service = new ecs.FargateService(this, 'ForgeAppService', {
+      cluster: this.ecsCluster,
       taskDefinition: taskDef,
       desiredCount: 1,
-      minHealthyPercent: 100,
-      maxHealthyPercent: 200,
       serviceName: 'forge-app-test',
       enableExecuteCommand: true,
       circuitBreaker: { rollback: true },
-      placementStrategies: [
-        ecs.PlacementStrategy.spreadAcrossInstances(),
-      ],
+      assignPublicIp: false, // Private subnet, uses NAT for outbound
+      securityGroups: [props.ecsSecurityGroup],
+      vpcSubnets: { subnets: props.privateSubnets },
       capacityProviderStrategies: [
-        {
-          capacityProvider: 'forge-graviton-spot',  // Provider A -- always-on
-          weight: 1,
-          base: 1,
-        },
+        { capacityProvider: 'FARGATE_SPOT', weight: 1, base: 1 },
       ],
     });
 
+    this.serviceName = 'forge-app-test';
+
     // Register with ALB target group
-    httpsListener.addTargets('ForgeAppTarget', {
+    httpListener.addTargets('ForgeAppTarget', {
       targets: [service],
       port: 3000,
       protocol: elbv2.ApplicationProtocol.HTTP,
@@ -250,7 +199,7 @@ export class ForgeAppStack extends cdk.Stack {
       deregistrationDelay: cdk.Duration.seconds(30),
     });
 
-    // ── Outputs ──────────────────────────────────────────────────────────────
+    // -- Outputs ---------------------------------------------------------------
     this.albDnsName = new cdk.CfnOutput(this, 'AlbDnsName', {
       value: this.alb.loadBalancerDnsName,
       description: 'ALB DNS name -- point forgetest.qrucible.ai CNAME here',
@@ -273,11 +222,15 @@ export class ForgeAppStack extends cdk.Stack {
       description: 'ECS service name',
     });
 
+    new cdk.CfnOutput(this, 'ClusterName', {
+      value: this.ecsCluster.clusterName,
+      description: 'ECS cluster name',
+      exportName: `ForgeAppClusterName-${props.forgeEnv}`,
+    });
+
     new cdk.CfnOutput(this, 'DomainSetup', {
-      value: props.hostedZoneId
-        ? `DNS auto-configured: ${props.domainName} -> ALB`
-        : `MANUAL: Create CNAME ${props.domainName} -> ${this.alb.loadBalancerDnsName}`,
-      description: 'DNS configuration status',
+      value: `MANUAL: Create CNAME ${props.domainName} -> ${this.alb.loadBalancerDnsName}`,
+      description: 'DNS configuration -- add this CNAME in Hetzner DNS',
     });
   }
 }
