@@ -63,6 +63,9 @@ export class ForgeAppStack extends cdk.Stack {
       'supabase-anon-key',
       'supabase-jwt-secret',
       'anthropic-api-key',
+      'tripo-api-key',
+      'together-api-key',
+      'lucid-token',
     ];
 
     const secrets: Record<string, ecs.Secret> = {};
@@ -133,6 +136,12 @@ export class ForgeAppStack extends cdk.Stack {
         DEV_MODE: 'false',
         AXIOM_ENABLED: 'true',
         AXIOM_STRICT: 'false',
+        COMPUTE_HOST: '89.167.79.141',
+        PICOGK_API_URL: 'http://89.167.79.141:8015',
+        SYSML_API_URL: 'http://89.167.79.141:8003',
+        HETZNER_COMPUTE_URL: 'http://89.167.79.141:8001',
+        LUCID_URL: 'https://api-lucid.qrucible.ai',
+        FREECAD_MCP_URL: 'http://89.167.79.141:8016',
       },
       secrets,
       logging: ecs.LogDrivers.awsLogs({
