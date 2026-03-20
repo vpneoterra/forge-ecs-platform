@@ -89,24 +89,30 @@ export class ForgeNetworkStack extends cdk.Stack {
       instanceType: new ec2.InstanceType('t4g.nano'),
       machineImage: natAmi,
       role: natRole,
-      securityGroup: natSecurityGroup,
+      // securityGroup and associatePublicIpAddress are set via CfnInstance networkInterfaces
+      // to avoid the "Network interfaces and an instance-level subnet ID" conflict
       spotOptions: {
         requestType: ec2.SpotRequestType.ONE_TIME,
         interruptionBehavior: ec2.SpotInstanceInterruption.STOP,
         maxPrice: 0.005, // $0.005/hr max (~$3.60/month) -- on-demand is $0.0042/hr
       },
-      // Source/dest check must be disabled for NAT
-      associatePublicIpAddress: true,
       userData: ec2.UserData.forLinux(),
     });
 
     // Deploy NAT instance in first public subnet
+    // NOTE: Cannot set subnetId at instance level when launch template has networkInterfaces
+    // (CDK creates networkInterfaces when securityGroup + associatePublicIpAddress are both set)
     const natInstance = new ec2.CfnInstance(this, 'NatInstance', {
       launchTemplate: {
         launchTemplateId: natLaunchTemplate.launchTemplateId,
         version: natLaunchTemplate.latestVersionNumber,
       },
-      subnetId: this.publicSubnets[0].subnetId,
+      networkInterfaces: [{
+        deviceIndex: '0',
+        subnetId: this.publicSubnets[0].subnetId,
+        associatePublicIpAddress: true,
+        groupSet: [natSecurityGroup.securityGroupId],
+      }],
       sourceDestCheck: false, // Critical: must be false for NAT to work
       tags: [{ key: 'Name', value: `forge-nat-${props.forgeEnv}` }],
     });
