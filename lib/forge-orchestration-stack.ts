@@ -269,6 +269,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
         fifo: true,
       }),
       messageBody: sfn.TaskInput.fromObject({
+        taskToken: sfn.JsonPath.taskToken,
         job_id: sfn.JsonPath.stringAt('$.job_id'),
         phase: 'config',
         input: sfn.JsonPath.stringAt('$.config_input'),
@@ -286,6 +287,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
         fifo: true,
       }),
       messageBody: sfn.TaskInput.fromObject({
+        taskToken: sfn.JsonPath.taskToken,
         job_id: sfn.JsonPath.stringAt('$.job_id'),
         phase: 'equilibrium',
         solver: 'VMEC++',
@@ -304,6 +306,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
         fifo: true,
       }),
       messageBody: sfn.TaskInput.fromObject({
+        taskToken: sfn.JsonPath.taskToken,
         job_id: sfn.JsonPath.stringAt('$.job_id'),
         phase: 'coil_optimization',
         equilibrium_s3_key: sfn.JsonPath.stringAt('$.phase2_result.output_s3_key'),
@@ -321,6 +324,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
         fifo: true,
       }),
       messageBody: sfn.TaskInput.fromObject({
+        taskToken: sfn.JsonPath.taskToken,
         job_id: sfn.JsonPath.stringAt('$.job_id'),
         phase: 'cad_generation',
         coils_s3_key: sfn.JsonPath.stringAt('$.phase3_result.output_s3_key'),
@@ -338,6 +342,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
         fifo: true,
       }),
       messageBody: sfn.TaskInput.fromObject({
+        taskToken: sfn.JsonPath.taskToken,
         job_id: sfn.JsonPath.stringAt('$.job_id'),
         phase: 'neutronics',
         solver: 'OpenMC',
@@ -356,6 +361,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
         fifo: true,
       }),
       messageBody: sfn.TaskInput.fromObject({
+        taskToken: sfn.JsonPath.taskToken,
         job_id: sfn.JsonPath.stringAt('$.job_id'),
         phase: 'structural_thermal',
         solver: 'Elmer',
