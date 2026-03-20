@@ -38,7 +38,7 @@ export interface SolverTask {
   scalingMode: ScalingMode;
   /** Human description of what this task consolidates */
   description: string;
-  /** SQS FIFO queue name — required when scalingMode = 'sqs-driven' */
+  /** SQS FIFO queue name -- required when scalingMode = 'sqs-driven' */
   sqsQueueName?: string;
   /** Environment variables injected at runtime (values resolved from SSM/Secrets Manager at deploy) */
   environment: Record<string, string>;
@@ -50,7 +50,7 @@ export interface SolverTask {
 
 export const SOLVER_MANIFEST: SolverTask[] = [
   // ─────────────────────────────────────────────────────────────
-  // PROVIDER A — Graviton Spot, c6g.xlarge, always-on
+  // PROVIDER A -- Graviton Spot, c6g.xlarge, always-on
   // ─────────────────────────────────────────────────────────────
   {
     name: 'forge-lightweight',
@@ -156,7 +156,7 @@ export const SOLVER_MANIFEST: SolverTask[] = [
   },
 
   // ─────────────────────────────────────────────────────────────
-  // PROVIDER A — SQS-driven scale-to-zero
+  // PROVIDER A -- SQS-driven scale-to-zero
   // ─────────────────────────────────────────────────────────────
   {
     name: 'forge-stellarator-config',
@@ -169,7 +169,7 @@ export const SOLVER_MANIFEST: SolverTask[] = [
     essential: true,
     scalingMode: 'sqs-driven',
     sqsQueueName: 'forge-stellarator-config.fifo',
-    description: 'Stellarator configuration solver: DESC, pyQSC, pyQIC. Scale 0→1 on SQS message.',
+    description: 'Stellarator configuration solver: DESC, pyQSC, pyQIC. Scale 0->1 on SQS message.',
     environment: {
       SERVICE_MODE: 'stellarator-config',
       LOG_LEVEL: 'INFO',
@@ -186,7 +186,7 @@ export const SOLVER_MANIFEST: SolverTask[] = [
   },
 
   // ─────────────────────────────────────────────────────────────
-  // PROVIDER B — x86 Spot, scale-to-zero heavy compute
+  // PROVIDER B -- x86 Spot, scale-to-zero heavy compute
   // ─────────────────────────────────────────────────────────────
   {
     name: 'forge-hpc',
@@ -199,7 +199,7 @@ export const SOLVER_MANIFEST: SolverTask[] = [
     essential: true,
     scalingMode: 'sqs-driven',
     sqsQueueName: 'forge-hpc.fifo',
-    description: 'Cluster B HPC: PROCESS, VMEC++, OpenMC. Scale 0→N on SQS message.',
+    description: 'Cluster B HPC: PROCESS, VMEC++, OpenMC. Scale 0->N on SQS message.',
     environment: {
       SERVICE_MODE: 'hpc',
       LOG_LEVEL: 'INFO',

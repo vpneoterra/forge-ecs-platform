@@ -3,8 +3,8 @@
  * Step Functions state machines, EventBridge rules, CloudWatch alarms + dashboard.
  *
  * State machines:
- *   1. CEM Loop       — 7-state concurrent engineering loop (Declare → Solve → Compile → Validate → Evaluate → Iterate)
- *   2. Stellarator Pipeline — 8-phase stellarator design pipeline
+ *   1. CEM Loop       -- 7-state concurrent engineering loop (Declare -> Solve -> Compile -> Validate -> Evaluate -> Iterate)
+ *   2. Stellarator Pipeline -- 8-phase stellarator design pipeline
  *
  * SQS-driven tasks use Step Functions ECS RunTask integration to spin up compute on demand.
  * Cost: Step Functions ($1/month at 1000 state transitions/day), EventBridge ($0/month for default bus).
@@ -134,9 +134,9 @@ export class ForgeOrchestrationStack extends cdk.Stack {
 
     // ── CEM Loop State Machine ─────────────────────────────────────────────────
     // Concurrent Engineering Model for fusion component design.
-    // Phases: Declare → Solve → Compile → Validate (CFD || EM in parallel) → Evaluate → Iterate
+    // Phases: Declare -> Solve -> Compile -> Validate (CFD || EM in parallel) -> Evaluate -> Iterate
 
-    // State: Declare — record job in DynamoDB
+    // State: Declare -- record job in DynamoDB
     const cemDeclare = new sfnTasks.DynamoPutItem(this, 'CemDeclare', {
       table: props.jobsTable,
       item: {
@@ -154,7 +154,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
       resultPath: '$.declare_result',
     });
 
-    // State: Solve — run geometry (always-on, no RunTask needed — send via SQS to forge-lightweight)
+    // State: Solve -- run geometry (always-on, no RunTask needed -- send via SQS to forge-lightweight)
     const cemSolveSqsSend = new sfnTasks.SqsSendMessage(this, 'CemSolve', {
       queue: props.sqsQueues.get('forge-hpc') || new sqs.Queue(this, 'FallbackQueue', {
         queueName: 'forge-cem-fallback.fifo',
@@ -190,7 +190,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
     cemValidate.branch(cemValidateCfd);
     cemValidate.branch(cemValidateEm);
 
-    // State: Evaluate — check if results meet criteria
+    // State: Evaluate -- check if results meet criteria
     const cemEvaluate = new sfnTasks.DynamoUpdateItem(this, 'CemEvaluate', {
       table: props.jobsTable,
       key: {
@@ -231,7 +231,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
       resultPath: '$.solved_result',
     });
 
-    // Chain: Declare → Solve → Validate (parallel) → Evaluate → Iterate
+    // Chain: Declare -> Solve -> Validate (parallel) -> Evaluate -> Iterate
     const cemChain = sfn.Chain.start(cemDeclare)
       .next(cemSolveSqsSend)
       .next(cemUpdateSolved)
@@ -255,14 +255,14 @@ export class ForgeOrchestrationStack extends cdk.Stack {
         level: sfn.LogLevel.ERROR,
         includeExecutionData: false,
       },
-      tracingEnabled: false, // X-Ray adds cost — disable for dev
+      tracingEnabled: false, // X-Ray adds cost -- disable for dev
       timeout: cdk.Duration.hours(24),
     });
 
     // ── Stellarator Pipeline State Machine ────────────────────────────────────
-    // 8-phase pipeline: Config → Equilibrium → Coils → CAD → HPC → FEM → Analysis → Export
+    // 8-phase pipeline: Config -> Equilibrium -> Coils -> CAD -> HPC -> FEM -> Analysis -> Export
 
-    // Phase 1: Config — pyQSC/pyQIC/DESC (via SQS → forge-stellarator-config)
+    // Phase 1: Config -- pyQSC/pyQIC/DESC (via SQS -> forge-stellarator-config)
     const stPhase1 = new sfnTasks.SqsSendMessage(this, 'StPhase1Config', {
       queue: props.sqsQueues.get('forge-stellarator-config') || new sqs.Queue(this, 'FallbackStConfig', {
         queueName: 'forge-st-config-fallback.fifo',
@@ -280,7 +280,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
       messageDeduplicationId: sfn.JsonPath.format('{}-phase1', sfn.JsonPath.stringAt('$.job_id')),
     });
 
-    // Phase 2: Equilibrium — VMEC++ (via SQS → forge-hpc)
+    // Phase 2: Equilibrium -- VMEC++ (via SQS -> forge-hpc)
     const stPhase2 = new sfnTasks.SqsSendMessage(this, 'StPhase2Equilibrium', {
       queue: props.sqsQueues.get('forge-hpc') || new sqs.Queue(this, 'FallbackStHpc', {
         queueName: 'forge-st-hpc-fallback.fifo',
@@ -299,7 +299,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
       messageDeduplicationId: sfn.JsonPath.format('{}-phase2', sfn.JsonPath.stringAt('$.job_id')),
     });
 
-    // Phase 3: Coil optimization — SIMSOPT (via SQS → forge-stellarator-coils)
+    // Phase 3: Coil optimization -- SIMSOPT (via SQS -> forge-stellarator-coils)
     const stPhase3 = new sfnTasks.SqsSendMessage(this, 'StPhase3Coils', {
       queue: props.sqsQueues.get('forge-stellarator-coils') || new sqs.Queue(this, 'FallbackStCoils', {
         queueName: 'forge-st-coils-fallback.fifo',
@@ -317,7 +317,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
       messageDeduplicationId: sfn.JsonPath.format('{}-phase3', sfn.JsonPath.stringAt('$.job_id')),
     });
 
-    // Phase 4: CAD generation — Bluemira/ParaStell (via SQS → forge-stellarator-cad)
+    // Phase 4: CAD generation -- Bluemira/ParaStell (via SQS -> forge-stellarator-cad)
     const stPhase4 = new sfnTasks.SqsSendMessage(this, 'StPhase4Cad', {
       queue: props.sqsQueues.get('forge-stellarator-cad') || new sqs.Queue(this, 'FallbackStCad', {
         queueName: 'forge-st-cad-fallback.fifo',
@@ -335,7 +335,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
       messageDeduplicationId: sfn.JsonPath.format('{}-phase4', sfn.JsonPath.stringAt('$.job_id')),
     });
 
-    // Phase 5: HPC neutronics — OpenMC
+    // Phase 5: HPC neutronics -- OpenMC
     const stPhase5 = new sfnTasks.SqsSendMessage(this, 'StPhase5Hpc', {
       queue: props.sqsQueues.get('forge-hpc') || new sqs.Queue(this, 'FallbackStHpc2', {
         queueName: 'forge-st-hpc2-fallback.fifo',
@@ -354,7 +354,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
       messageDeduplicationId: sfn.JsonPath.format('{}-phase5', sfn.JsonPath.stringAt('$.job_id')),
     });
 
-    // Phase 6: FEM analysis — Elmer (thermal/structural)
+    // Phase 6: FEM analysis -- Elmer (thermal/structural)
     const stPhase6 = new sfnTasks.SqsSendMessage(this, 'StPhase6Fem', {
       queue: props.sqsQueues.get('forge-fem-cfd') || new sqs.Queue(this, 'FallbackStFem', {
         queueName: 'forge-st-fem-fallback.fifo',
@@ -373,7 +373,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
       messageDeduplicationId: sfn.JsonPath.format('{}-phase6', sfn.JsonPath.stringAt('$.job_id')),
     });
 
-    // Phase 7: Analysis — record results in DynamoDB
+    // Phase 7: Analysis -- record results in DynamoDB
     const stPhase7 = new sfnTasks.DynamoUpdateItem(this, 'StPhase7Analysis', {
       table: props.jobsTable,
       key: {
@@ -388,7 +388,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
       resultPath: '$.phase7_result',
     });
 
-    // Phase 8: Export — mark complete
+    // Phase 8: Export -- mark complete
     const stPhase8 = new sfnTasks.DynamoUpdateItem(this, 'StPhase8Export', {
       table: props.jobsTable,
       key: {
@@ -445,7 +445,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
 
     // ── EventBridge Rules ──────────────────────────────────────────────────────
 
-    // Rule: ECS task state change → CloudWatch custom metric
+    // Rule: ECS task state change -> CloudWatch custom metric
     new events.Rule(this, 'EcsTaskStateChangeRule', {
       eventPattern: {
         source: ['aws.ecs'],
@@ -465,10 +465,10 @@ export class ForgeOrchestrationStack extends cdk.Stack {
       ],
     });
 
-    // Rule: SQS DLQ depth > 0 → alert
+    // Rule: SQS DLQ depth > 0 -> alert
     new events.Rule(this, 'DlqAlertRule', {
       schedule: events.Schedule.rate(cdk.Duration.minutes(15)),
-      targets: [], // Placeholder — use CloudWatch alarm instead (below)
+      targets: [], // Placeholder -- use CloudWatch alarm instead (below)
     });
 
     // ── CloudWatch Alarms ──────────────────────────────────────────────────────
@@ -515,10 +515,10 @@ export class ForgeOrchestrationStack extends cdk.Stack {
 
     // Alarm: SQS DLQ depth > 0 (failed jobs)
     for (const [taskName, queue] of props.sqsQueues.entries()) {
-      // DLQ alarm — check approximate DLQ depth via metric filter
+      // DLQ alarm -- check approximate DLQ depth via metric filter
       const dlqAlarm = new cloudwatch.Alarm(this, `DlqAlarm${taskName.replace(/-/g, '')}`, {
         alarmName: `forge-dlq-${taskName}-${props.forgeEnv}`,
-        alarmDescription: `DLQ depth > 0 for ${taskName} — job processing failed`,
+        alarmDescription: `DLQ depth > 0 for ${taskName} -- job processing failed`,
         metric: queue.metricApproximateNumberOfMessagesVisible({
           statistic: 'Maximum',
           period: cdk.Duration.minutes(5),

@@ -34,7 +34,7 @@ export interface CapacityProviderConfig {
  * Provider A: Graviton Spot, always-on.
  * Hosts: forge-lightweight + forge-devops + forge-monitoring (all fit on c6g.xlarge: 4 vCPU, 8 GB)
  * Total always-on CPU: 7 vCPU, ~12.8 GB. Fits on c6g.xlarge with ~10% headroom.
- * Spot price: ~$0.07/hr → $51/month
+ * Spot price: ~$0.07/hr -> $51/month
  */
 export const PROVIDER_A: CapacityProviderConfig = {
   name: 'ForgeProviderA',
@@ -87,7 +87,7 @@ export const PROVIDER_B: CapacityProviderConfig = {
  * Hosts: Modulus, DeepXDE, PINN training jobs.
  * Min: 0 (no instances unless training triggered).
  * g5.xlarge: 1x A10G GPU, 4 vCPU, 16 GB.
- * Spot price: ~$0.34/hr → $1.40 at 4 hrs/month.
+ * Spot price: ~$0.34/hr -> $1.40 at 4 hrs/month.
  */
 export const PROVIDER_C: CapacityProviderConfig = {
   name: 'ForgeProviderC',

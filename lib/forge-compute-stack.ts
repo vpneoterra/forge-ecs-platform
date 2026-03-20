@@ -1,5 +1,5 @@
 /**
- * ForgeComputeStack — THE CORE
+ * ForgeComputeStack -- THE CORE
  *
  * ECS cluster with 3 managed capacity providers:
  *   Provider A: Graviton Spot c6g.xlarge (always-on, $51/month)
@@ -8,7 +8,7 @@
  *
  * 8 ECS task definitions, 4 always-on services, 4 SQS-driven scale-to-zero tasks.
  * Cloud Map private DNS: forge.local
- * ALB skipped for dev — Nginx in forge-devops handles routing via Elastic IP.
+ * ALB skipped for dev -- Nginx in forge-devops handles routing via Elastic IP.
  */
 
 import * as cdk from 'aws-cdk-lib';
@@ -57,8 +57,8 @@ export class ForgeComputeStack extends cdk.Stack {
     this.ecsCluster = new ecs.Cluster(this, 'ForgeCluster', {
       clusterName: `forge-${props.forgeEnv}`,
       vpc: props.vpc,
-      containerInsights: isProd, // Costs extra ($0.40/GB) — disable for dev
-      enableFargateCapacityProviders: false, // We use EC2 only (no Fargate — too expensive)
+      containerInsights: isProd, // Costs extra ($0.40/GB) -- disable for dev
+      enableFargateCapacityProviders: false, // We use EC2 only (no Fargate -- too expensive)
     });
 
     // ── Cloud Map: forge.local ────────────────────────────────────────────────
@@ -102,7 +102,7 @@ export class ForgeComputeStack extends cdk.Stack {
     props.dataBucket.grantReadWrite(taskRole);
     // DynamoDB for job state
     props.jobsTable.grantReadWriteData(taskRole);
-    // SQS — will add specific queue permissions below
+    // SQS -- will add specific queue permissions below
     taskRole.addToPolicy(new iam.PolicyStatement({
       actions: [
         'sqs:SendMessage', 'sqs:ReceiveMessage', 'sqs:DeleteMessage',
@@ -237,7 +237,7 @@ export class ForgeComputeStack extends cdk.Stack {
       autoScalingGroup: asgB,
       capacityProviderName: PROVIDER_B.name,
       enableManagedScaling: true,
-      targetCapacityPercent: PROVIDER_B.targetCapacityPercent, // 100% — max bin-packing
+      targetCapacityPercent: PROVIDER_B.targetCapacityPercent, // 100% -- max bin-packing
       enableManagedTerminationProtection: false,
       enableManagedDraining: true,
       machineImageType: ecs.MachineImageType.AMAZON_LINUX_2,
@@ -313,7 +313,7 @@ export class ForgeComputeStack extends cdk.Stack {
     for (const task of SQS_DRIVEN_TASKS) {
       if (!task.sqsQueueName) continue;
 
-      // Dead-letter queue — receives messages that fail after 3 attempts
+      // Dead-letter queue -- receives messages that fail after 3 attempts
       const dlq = new sqs.Queue(this, `Dlq${task.name.replace(/-/g, '')}`, {
         queueName: `${task.sqsQueueName.replace('.fifo', '-dlq')}.fifo`,
         fifo: true,
@@ -404,7 +404,7 @@ export class ForgeComputeStack extends cdk.Stack {
       },
     });
 
-    // Build environment variables — inject runtime config
+    // Build environment variables -- inject runtime config
     const envVars: { [key: string]: string } = {
       ...task.environment,
       AWS_REGION: this.region,

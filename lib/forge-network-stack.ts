@@ -1,6 +1,6 @@
 /**
  * ForgeNetworkStack
- * VPC with NAT Instance (t4g.nano) instead of NAT Gateway — saves ~$29/month.
+ * VPC with NAT Instance (t4g.nano) instead of NAT Gateway -- saves ~$29/month.
  * Single-AZ for dev (minimum cost), dual-AZ for prod.
  * VPC endpoints: S3 Gateway (free) + ECR (needed for image pulls).
  * Security groups for ECS tasks, ALB, RDS, EFS.
@@ -57,7 +57,7 @@ export class ForgeNetworkStack extends cdk.Stack {
     this.publicSubnets = this.vpc.publicSubnets;
     this.privateSubnets = this.vpc.privateSubnets;
 
-    // ── NAT Instance (t4g.nano Spot) — replaces NAT Gateway ─────────────────
+    // ── NAT Instance (t4g.nano Spot) -- replaces NAT Gateway ─────────────────
     // fck-nat: community-maintained Graviton NAT instance AMI
     // Saves ~$29/month vs NAT Gateway ($3/month vs $32/month)
     const natRole = new iam.Role(this, 'NatInstanceRole', {
@@ -69,7 +69,7 @@ export class ForgeNetworkStack extends cdk.Stack {
 
     const natSecurityGroup = new ec2.SecurityGroup(this, 'NatSg', {
       vpc: this.vpc,
-      description: 'NAT instance — allow all outbound, allow inbound from private subnets',
+      description: 'NAT instance -- allow all outbound, allow inbound from private subnets',
       allowAllOutbound: true,
     });
     natSecurityGroup.addIngressRule(
@@ -78,7 +78,7 @@ export class ForgeNetworkStack extends cdk.Stack {
       'Allow all traffic from VPC CIDR',
     );
 
-    // fck-nat ARM64 AMI (us-east-1) — community-maintained cost-optimized NAT instance
+    // fck-nat ARM64 AMI (us-east-1) -- community-maintained cost-optimized NAT instance
     // See https://fck-nat.dev for regional AMI IDs
     const natAmi = ec2.MachineImage.lookup({
       name: 'fck-nat-al2023-*-arm64-ebs',
@@ -93,7 +93,7 @@ export class ForgeNetworkStack extends cdk.Stack {
       spotOptions: {
         requestType: ec2.SpotRequestType.ONE_TIME,
         interruptionBehavior: ec2.SpotInstanceInterruption.STOP,
-        maxPrice: 0.005, // $0.005/hr max (~$3.60/month) — on-demand is $0.0042/hr
+        maxPrice: 0.005, // $0.005/hr max (~$3.60/month) -- on-demand is $0.0042/hr
       },
       // Source/dest check must be disabled for NAT
       associatePublicIpAddress: true,
@@ -122,7 +122,7 @@ export class ForgeNetworkStack extends cdk.Stack {
       instanceId: natInstance.ref,
     });
 
-    // Route private subnets → NAT instance
+    // Route private subnets -> NAT instance
     for (let i = 0; i < this.privateSubnets.length; i++) {
       const subnet = this.privateSubnets[i] as ec2.Subnet;
       new ec2.CfnRoute(this, `NatRoute${i}`, {
@@ -133,7 +133,7 @@ export class ForgeNetworkStack extends cdk.Stack {
     }
 
     // ── VPC Endpoints ────────────────────────────────────────────────────────
-    // S3 Gateway endpoint (free — no data transfer charges through NAT)
+    // S3 Gateway endpoint (free -- no data transfer charges through NAT)
     this.vpc.addGatewayEndpoint('S3Endpoint', {
       service: ec2.GatewayVpcEndpointAwsService.S3,
       subnets: [{ subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS }],
@@ -143,7 +143,7 @@ export class ForgeNetworkStack extends cdk.Stack {
     // Cost: ~$7.30/month each but saves more in NAT data transfer for large images
     const ecrEndpointSg = new ec2.SecurityGroup(this, 'EcrEndpointSg', {
       vpc: this.vpc,
-      description: 'ECR VPC endpoint — allow HTTPS from ECS tasks',
+      description: 'ECR VPC endpoint -- allow HTTPS from ECS tasks',
       allowAllOutbound: false,
     });
     ecrEndpointSg.addIngressRule(
@@ -169,7 +169,7 @@ export class ForgeNetworkStack extends cdk.Stack {
     // ALB Security Group (internet-facing entry point via Nginx)
     this.albSecurityGroup = new ec2.SecurityGroup(this, 'AlbSg', {
       vpc: this.vpc,
-      description: 'ALB — allow HTTP/HTTPS from internet',
+      description: 'ALB -- allow HTTP/HTTPS from internet',
       allowAllOutbound: true,
     });
     this.albSecurityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), 'HTTP');
@@ -178,7 +178,7 @@ export class ForgeNetworkStack extends cdk.Stack {
     // ECS Tasks Security Group
     this.ecsSecurityGroup = new ec2.SecurityGroup(this, 'EcsSg', {
       vpc: this.vpc,
-      description: 'ECS tasks — allow inbound from ALB and within ECS',
+      description: 'ECS tasks -- allow inbound from ALB and within ECS',
       allowAllOutbound: true,
     });
     // Allow all traffic within ECS (service-to-service via Cloud Map)
@@ -203,7 +203,7 @@ export class ForgeNetworkStack extends cdk.Stack {
     // RDS Security Group
     this.rdsSecurityGroup = new ec2.SecurityGroup(this, 'RdsSg', {
       vpc: this.vpc,
-      description: 'RDS PostgreSQL — allow only from ECS tasks',
+      description: 'RDS PostgreSQL -- allow only from ECS tasks',
       allowAllOutbound: false,
     });
     this.rdsSecurityGroup.addIngressRule(
@@ -215,7 +215,7 @@ export class ForgeNetworkStack extends cdk.Stack {
     // EFS Security Group
     this.efsSecurityGroup = new ec2.SecurityGroup(this, 'EfsSg', {
       vpc: this.vpc,
-      description: 'EFS — allow NFS from ECS tasks',
+      description: 'EFS -- allow NFS from ECS tasks',
       allowAllOutbound: false,
     });
     this.efsSecurityGroup.addIngressRule(
@@ -227,7 +227,7 @@ export class ForgeNetworkStack extends cdk.Stack {
     // ── Outputs ──────────────────────────────────────────────────────────────
     this.natInstanceId = new cdk.CfnOutput(this, 'NatInstanceId', {
       value: natInstance.ref,
-      description: 'NAT Instance ID — use this to hibernate (stop) the instance',
+      description: 'NAT Instance ID -- use this to hibernate (stop) the instance',
       exportName: `ForgeNatInstanceId-${props.forgeEnv}`,
     });
 

@@ -1,12 +1,12 @@
 /**
  * ForgeDataStack
  * Persistent data layer: S3 (Intelligent-Tiering), EFS (bursting), RDS (t4g.micro optional),
- * ECR (8 repos), DynamoDB (pay-per-request — free tier covers most usage).
+ * ECR (8 repos), DynamoDB (pay-per-request -- free tier covers most usage).
  *
  * Key cost decisions:
  * - S3 Intelligent-Tiering: auto-moves cold data to cheaper tiers
  * - EFS bursting (0 provisioned throughput): $0.30/GB-month
- * - RDS t4g.micro: $12/month — skipRds=true to use external Supabase ($0)
+ * - RDS t4g.micro: $12/month -- skipRds=true to use external Supabase ($0)
  * - DynamoDB pay-per-request: free tier = 25 GB, 25 WCU, 25 RCU
  * - ECR 8 repos: ~$2/month for 20 GB storage
  */
@@ -26,7 +26,7 @@ export interface ForgeDataStackProps extends cdk.StackProps {
   vpc: ec2.Vpc;
   dbSecurityGroup: ec2.SecurityGroup;
   efsSecurityGroup: ec2.SecurityGroup;
-  /** Set true to skip RDS — use external Supabase instead */
+  /** Set true to skip RDS -- use external Supabase instead */
   skipRds: boolean;
   tags?: Record<string, string>;
 }
@@ -45,7 +45,7 @@ export class ForgeDataStack extends cdk.Stack {
     const isProd = props.forgeEnv === 'prod';
 
     // ── S3: forge-platform-data ───────────────────────────────────────────────
-    // Intelligent-Tiering transitions cold data automatically — no lifecycle rule complexity.
+    // Intelligent-Tiering transitions cold data automatically -- no lifecycle rule complexity.
     // First 128 KB of each object stays in frequent access tier always.
     this.dataBucket = new s3.Bucket(this, 'DataBucket', {
       bucketName: `forge-platform-data-${this.account}-${this.region}`,
@@ -90,7 +90,7 @@ export class ForgeDataStack extends cdk.Stack {
       vpc: props.vpc,
       vpcSubnets: {
         subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
-        // Single subnet for dev — avoid cross-AZ EFS mount target charges
+        // Single subnet for dev -- avoid cross-AZ EFS mount target charges
         availabilityZones: isProd ? undefined : [props.vpc.availabilityZones[0]],
       },
       securityGroup: props.efsSecurityGroup,
@@ -103,7 +103,7 @@ export class ForgeDataStack extends cdk.Stack {
       enableAutomaticBackups: isProd,
     });
 
-    // EFS Access Points — one per service group for isolation
+    // EFS Access Points -- one per service group for isolation
     const efsAccessPoints: Record<string, efs.AccessPoint> = {};
     const efsPaths = [
       '/geometry',
@@ -130,7 +130,7 @@ export class ForgeDataStack extends cdk.Stack {
 
     // ── DynamoDB: forge-jobs ──────────────────────────────────────────────────
     // Pay-per-request = free tier covers 1-2 person team usage easily.
-    // No Redis needed — use DynamoDB for job state and simple caching.
+    // No Redis needed -- use DynamoDB for job state and simple caching.
     this.jobsTable = new dynamodb.Table(this, 'JobsTable', {
       tableName: 'forge-jobs',
       partitionKey: { name: 'job_id', type: dynamodb.AttributeType.STRING },
@@ -159,7 +159,7 @@ export class ForgeDataStack extends cdk.Stack {
       nonKeyAttributes: ['job_id', 'created_at', 'updated_at', 'result_s3_key'],
     });
 
-    // ── ECR Repositories — one per consolidated task ──────────────────────────
+    // ── ECR Repositories -- one per consolidated task ──────────────────────────
     this.ecrRepos = new Map<string, ecr.Repository>();
 
     for (const task of SOLVER_MANIFEST) {
@@ -178,7 +178,7 @@ export class ForgeDataStack extends cdk.Stack {
             maxImageAge: cdk.Duration.days(7),
           },
           {
-            // Keep only last 5 images — controls ECR storage cost
+            // Keep only last 5 images -- controls ECR storage cost
             rulePriority: 2,
             description: 'Keep last 5 images',
             maxImageCount: 5,
@@ -190,9 +190,9 @@ export class ForgeDataStack extends cdk.Stack {
     }
 
     // ── RDS PostgreSQL (optional) ─────────────────────────────────────────────
-    // t4g.micro: cheapest RDS instance — $12/month.
+    // t4g.micro: cheapest RDS instance -- $12/month.
     // Shared by forge-devops (Forgejo + SysON) with separate databases.
-    // skipRds=true: use external Supabase (free tier) — saves $12/month.
+    // skipRds=true: use external Supabase (free tier) -- saves $12/month.
     if (!props.skipRds) {
       const dbSubnetGroup = new rds.SubnetGroup(this, 'DbSubnetGroup', {
         vpc: props.vpc,
@@ -221,7 +221,7 @@ export class ForgeDataStack extends cdk.Stack {
         backupRetention: isProd ? cdk.Duration.days(7) : cdk.Duration.days(1),
         deletionProtection: isProd,
         removalPolicy: isProd ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY,
-        // Auto-stop after 7 days idle (dev only) — saves ~$8/month
+        // Auto-stop after 7 days idle (dev only) -- saves ~$8/month
         // Note: RDS auto-stop only applies to RDS instances in "dev" mode.
         // For prod, use manual stop/start via scripts/hibernate.sh
         enablePerformanceInsights: false, // Saves $0/month on t4g.micro (not available)
@@ -234,7 +234,7 @@ export class ForgeDataStack extends cdk.Stack {
           }),
           parameters: {
             'shared_buffers': '128MB',
-            'max_connections': '50', // t4g.micro has 1GB RAM — keep connections low
+            'max_connections': '50', // t4g.micro has 1GB RAM -- keep connections low
             'log_statement': 'none', // Reduce logging cost
             'log_min_duration_statement': '5000', // Only log queries >5s
           },
@@ -242,7 +242,7 @@ export class ForgeDataStack extends cdk.Stack {
       });
 
       // Expose RDS endpoint for compute stack
-      // Use string escape to avoid circular ref — ComputeStack reads from CfnOutput
+      // Use string escape to avoid circular ref -- ComputeStack reads from CfnOutput
       new cdk.CfnOutput(this, 'RdsEndpoint', {
         value: dbInstance.dbInstanceEndpointAddress,
         description: 'RDS PostgreSQL endpoint',
@@ -260,7 +260,7 @@ export class ForgeDataStack extends cdk.Stack {
     }
 
     // Expose rdsEndpoint as string for compute stack
-    // If skipRds, empty string — compute stack checks for this
+    // If skipRds, empty string -- compute stack checks for this
     this.rdsEndpoint = props.skipRds
       ? ''
       : cdk.Fn.importValue(`ForgeRdsEndpoint-${props.forgeEnv}`);

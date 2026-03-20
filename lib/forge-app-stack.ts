@@ -1,5 +1,5 @@
 /**
- * ForgeAppStack — FORGE Web Application (test branch)
+ * ForgeAppStack -- FORGE Web Application (test branch)
  *
  * Deploys the forge-app (Node.js Express) as an ECS service behind an ALB.
  * Uses the existing ECS cluster from ForgeComputeStack.
@@ -64,7 +64,7 @@ export class ForgeAppStack extends cdk.Stack {
     });
 
     // ── Secrets ──────────────────────────────────────────────────────────────
-    // Placeholder secrets — values must be set manually in AWS Console or CLI
+    // Placeholder secrets -- values must be set manually in AWS Console or CLI
     const secretNames = [
       'supabase-url',
       'supabase-service-key',
@@ -77,7 +77,7 @@ export class ForgeAppStack extends cdk.Stack {
     for (const name of secretNames) {
       const secret = new secretsmanager.Secret(this, `Secret${name.replace(/-/g, '')}`, {
         secretName: `forge/test/${name}`,
-        description: `FORGE test env — ${name}`,
+        description: `FORGE test env -- ${name}`,
       });
       const envName = name.replace(/-/g, '_').toUpperCase();
       secrets[envName] = ecs.Secret.fromSecretsManager(secret);
@@ -163,7 +163,7 @@ export class ForgeAppStack extends cdk.Stack {
       vpcSubnets: { subnets: props.publicSubnets },
     });
 
-    // HTTP → HTTPS redirect
+    // HTTP -> HTTPS redirect
     this.alb.addListener('HttpRedirect', {
       port: 80,
       defaultAction: elbv2.ListenerAction.redirect({
@@ -188,7 +188,7 @@ export class ForgeAppStack extends cdk.Stack {
         validation: acm.CertificateValidation.fromDns(hostedZone),
       });
 
-      // Route53 alias record → ALB
+      // Route53 alias record -> ALB
       new route53.ARecord(this, 'ForgeTestDns', {
         zone: hostedZone,
         recordName: props.domainName,
@@ -198,7 +198,7 @@ export class ForgeAppStack extends cdk.Stack {
         ttl: cdk.Duration.minutes(5),
       });
     } else {
-      // Manual DNS validation — user must add CNAME records
+      // Manual DNS validation -- user must add CNAME records
       certificate = new acm.Certificate(this, 'ForgeTestCert', {
         domainName: props.domainName,
         validation: acm.CertificateValidation.fromDns(),
@@ -227,7 +227,7 @@ export class ForgeAppStack extends cdk.Stack {
       ],
       capacityProviderStrategies: [
         {
-          capacityProvider: 'forge-graviton-spot',  // Provider A — always-on
+          capacityProvider: 'forge-graviton-spot',  // Provider A -- always-on
           weight: 1,
           base: 1,
         },
@@ -253,7 +253,7 @@ export class ForgeAppStack extends cdk.Stack {
     // ── Outputs ──────────────────────────────────────────────────────────────
     this.albDnsName = new cdk.CfnOutput(this, 'AlbDnsName', {
       value: this.alb.loadBalancerDnsName,
-      description: 'ALB DNS name — point forgetest.qrucible.ai CNAME here',
+      description: 'ALB DNS name -- point forgetest.qrucible.ai CNAME here',
       exportName: `ForgeTestAlbDns-${props.forgeEnv}`,
     });
 
@@ -275,8 +275,8 @@ export class ForgeAppStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, 'DomainSetup', {
       value: props.hostedZoneId
-        ? `DNS auto-configured: ${props.domainName} → ALB`
-        : `MANUAL: Create CNAME ${props.domainName} → ${this.alb.loadBalancerDnsName}`,
+        ? `DNS auto-configured: ${props.domainName} -> ALB`
+        : `MANUAL: Create CNAME ${props.domainName} -> ${this.alb.loadBalancerDnsName}`,
       description: 'DNS configuration status',
     });
   }
