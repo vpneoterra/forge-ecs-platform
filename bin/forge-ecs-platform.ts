@@ -86,6 +86,22 @@ if (deployApp) {
   appStack.addDependency(networkStack);
 }
 
+// -- Preserve cross-stack exports if legacy stacks (Data/Compute) still exist in AWS.
+// When those stacks import Network exports, CDK must not remove them even if we
+// are not synthesising those stacks in this run.  We create lightweight CfnOutputs
+// that keep the auto-generated export names alive.
+if (!deploySolvers) {
+  // These read the property which forces CDK to keep the cross-stack export
+  new cdk.CfnOutput(networkStack, 'KeepEfsSgExport', {
+    value: networkStack.efsSecurityGroup.securityGroupId,
+    description: 'Preserved for legacy ForgeData stack import',
+  });
+  new cdk.CfnOutput(networkStack, 'KeepRdsSgExport', {
+    value: networkStack.rdsSecurityGroup.securityGroupId,
+    description: 'Preserved for legacy ForgeData stack import',
+  });
+}
+
 // -- MODE 2: Full solver platform (EC2 compute) ------------------------------
 if (deploySolvers) {
   const dataStack = new ForgeDataStack(app, `ForgeData-${env}`, {
