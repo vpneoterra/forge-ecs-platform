@@ -205,7 +205,7 @@ export class ForgeAppStack extends cdk.Stack {
       internetFacing: true,
       securityGroup: props.albSecurityGroup,
       vpcSubnets: { subnets: albSubnets },
-      idleTimeout: cdk.Duration.seconds(180),  // I2D pipeline needs >60s
+      idleTimeout: cdk.Duration.seconds(600),  // I2D pipeline: 7 phases × solver steps
     });
 
     // -- ACM Certificate (DNS validated via Route 53 -- fully automatic) ------
