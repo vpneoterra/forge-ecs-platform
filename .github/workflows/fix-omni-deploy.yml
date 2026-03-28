@@ -1,0 +1,61 @@
+name: Fix OMNI Deploy (delete failed stack + redeploy)
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  fix-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Delete failed ForgeOmni-dev stack
+        run: |
+          echo "Checking ForgeOmni-dev stack status..."
+          STATUS=$(aws cloudformation describe-stacks --stack-name ForgeOmni-dev \
+            --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+          echo "Current status: $STATUS"
+          
+          if [ "$STATUS" = "ROLLBACK_COMPLETE" ] || [ "$STATUS" = "CREATE_FAILED" ]; then
+            echo "Deleting failed stack..."
+            aws cloudformation delete-stack --stack-name ForgeOmni-dev
+            echo "Waiting for deletion..."
+            aws cloudformation wait stack-delete-complete --stack-name ForgeOmni-dev
+            echo "Stack deleted."
+          elif [ "$STATUS" = "DOES_NOT_EXIST" ]; then
+            echo "Stack doesn't exist, proceeding with fresh deploy."
+          else
+            echo "Stack in status: $STATUS — proceeding with CDK deploy."
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install CDK dependencies
+        run: npm ci
+
+      - name: CDK Deploy
+        run: |
+          npx cdk deploy ForgeNetwork-dev ForgeOmni-dev \
+            --require-approval never \
+            --outputs-file cdk-outputs.json \
+            -c env=dev \
+            -c deployOmni=true
+
+      - name: Show stack outputs
+        run: |
+          echo "=== OMNI Deployment Outputs ==="
+          cat cdk-outputs.json | python3 -m json.tool
