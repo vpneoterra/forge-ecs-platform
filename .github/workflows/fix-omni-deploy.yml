@@ -32,8 +32,42 @@ jobs:
             echo "Waiting for deletion..."
             aws cloudformation wait stack-delete-complete --stack-name ForgeOmni-dev
             echo "Stack deleted."
+          elif [ "$STATUS" = "ROLLBACK_FAILED" ]; then
+            echo "Stack in ROLLBACK_FAILED state — need to delete with retain of stuck resources..."
+            # First, find resources that failed to delete
+            RETAIN=$(aws cloudformation describe-stack-resources --stack-name ForgeOmni-dev \
+              --query "StackResources[?ResourceStatus=='DELETE_FAILED'].LogicalResourceId" \
+              --output text 2>/dev/null || echo "")
+            echo "Resources to retain: $RETAIN"
+            
+            if [ -n "$RETAIN" ]; then
+              # Convert space-separated to array for --retain-resources
+              RETAIN_ARGS=""
+              for r in $RETAIN; do
+                RETAIN_ARGS="$RETAIN_ARGS $r"
+              done
+              echo "Deleting stack with --retain-resources $RETAIN_ARGS ..."
+              aws cloudformation delete-stack --stack-name ForgeOmni-dev --retain-resources $RETAIN_ARGS
+            else
+              echo "No stuck resources found, attempting normal delete..."
+              aws cloudformation delete-stack --stack-name ForgeOmni-dev
+            fi
+            
+            echo "Waiting for deletion..."
+            aws cloudformation wait stack-delete-complete --stack-name ForgeOmni-dev --no-cli-pager || true
+            
+            # Clean up retained ECS resources manually
+            echo "Cleaning up any retained ECS resources..."
+            # Delete the ECS cluster if it was retained
+            aws ecs delete-cluster --cluster omni-dev 2>/dev/null && echo "Deleted retained ECS cluster omni-dev" || echo "No retained cluster to delete"
+            
+            echo "Stack deleted."
           elif [ "$STATUS" = "DOES_NOT_EXIST" ]; then
             echo "Stack doesn't exist, proceeding with fresh deploy."
+          elif [ "$STATUS" = "DELETE_IN_PROGRESS" ]; then
+            echo "Stack deletion already in progress, waiting..."
+            aws cloudformation wait stack-delete-complete --stack-name ForgeOmni-dev
+            echo "Stack deleted."
           else
             echo "Stack in status: $STATUS — proceeding with CDK deploy."
           fi
