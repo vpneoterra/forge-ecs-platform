@@ -12,7 +12,7 @@
  * Cost breakdown:
  *   - ALB: ~$16/month (fixed) + $0.008/LCU-hour
  *   - Fargate (2048 CPU / 4096 MB): ~$70/month (on-demand)
- *   - Secrets Manager: $0.40/secret/month x 1 = $0.40/month
+ *   - Secrets Manager: imported (managed outside this stack)
  *   - CloudWatch Logs: ~$0.50/month (7-day retention)
  *   - Route 53 hosted zone: $0.50/month + $0.40/million queries
  *   - ACM certificate: free
@@ -74,10 +74,9 @@ export class ForgeOmniStack extends cdk.Stack {
     );
 
     // -- Secrets --------------------------------------------------------------
-    const omniApiKeySecret = new secretsmanager.Secret(this, 'SecretOmniApiKey', {
-      secretName: `forge/${env}/omni-api-key`,
-      description: `OMNI ${env} env -- omni-api-key`,
-    });
+    const omniApiKeySecret = secretsmanager.Secret.fromSecretNameV2(
+      this, 'SecretOmniApiKey', `forge/${env}/omni-api-key`,
+    );
 
     const secrets: Record<string, ecs.Secret> = {
       API_KEY: ecs.Secret.fromSecretsManager(omniApiKeySecret),
