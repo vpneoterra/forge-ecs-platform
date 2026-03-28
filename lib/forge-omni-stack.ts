@@ -11,7 +11,7 @@
  *
  * Cost breakdown:
  *   - ALB: ~$16/month (fixed) + $0.008/LCU-hour
- *   - Fargate (2048 CPU / 4096 MB): ~$70/month (on-demand)
+ *   - Fargate (4096 CPU / 16384 MB): ~$70/month (on-demand)
  *   - Secrets Manager: imported (managed outside this stack)
  *   - CloudWatch Logs: ~$0.50/month (7-day retention)
  *   - Route 53 hosted zone: $0.50/month + $0.40/million queries
@@ -119,8 +119,8 @@ export class ForgeOmniStack extends cdk.Stack {
     // -- Fargate Task Definition ----------------------------------------------
     const taskDef = new ecs.FargateTaskDefinition(this, 'OmniTaskDef', {
       family: 'omni',
-      cpu: 2048,
-      memoryLimitMiB: 4096,
+      cpu: 4096,
+      memoryLimitMiB: 16384,
       executionRole,
       taskRole,
       runtimePlatform: {
