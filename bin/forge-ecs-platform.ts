@@ -15,13 +15,16 @@
  * Context variables:
  *   env           "dev" (default) | "prod"
  *   deployApp     "true" to deploy ForgeAppStack (Fargate web app)
+ *   deployOmni    "true" to deploy ForgeOmniStack (OMNI PicoGK Fargate)
  *   deploySolvers "true" to deploy full Compute + Orchestration stacks
  *   skipRds       "true" to skip RDS (use external Supabase)
  *   appDomain     Domain for forge-app (default: forgetest.qrucible.ai)
+ *   omniDomain    Domain for OMNI (default: omni.qrucible.ai)
  *   alertEmail    Email for CloudWatch alerts (default: ops@forge.local)
  *
  * Usage:
  *   npx cdk deploy --all -c env=dev -c deployApp=true -c appDomain=forgetest.qrucible.ai -c skipRds=true
+ *   npx cdk deploy ForgeOmni-dev -c env=dev -c deployOmni=true -c omniDomain=omni.qrucible.ai
  *   npx cdk deploy --all -c env=dev -c deploySolvers=true -c alertEmail=you@example.com
  */
 
@@ -30,6 +33,7 @@ import { ForgeNetworkStack } from '../lib/forge-network-stack';
 import { ForgeDataStack } from '../lib/forge-data-stack';
 import { ForgeComputeStack } from '../lib/forge-compute-stack';
 import { ForgeAppStack } from '../lib/forge-app-stack';
+import { ForgeOmniStack } from '../lib/forge-omni-stack';
 import { ForgeOrchestrationStack } from '../lib/forge-orchestration-stack';
 
 const app = new cdk.App();
@@ -46,6 +50,10 @@ const deploySolvers =
   (app.node.tryGetContext('deploySolvers') as string | undefined) === 'true';
 const appDomain =
   (app.node.tryGetContext('appDomain') as string | undefined) ?? 'forge.qrucible.ai';
+const deployOmni =
+  (app.node.tryGetContext('deployOmni') as string | undefined) === 'true';
+const omniDomain =
+  (app.node.tryGetContext('omniDomain') as string | undefined) ?? 'omni.qrucible.ai';
 
 const awsEnv: cdk.Environment = {
   account: process.env.CDK_DEFAULT_ACCOUNT ?? process.env.AWS_ACCOUNT_ID,
@@ -85,6 +93,24 @@ if (deployApp) {
     tags: sharedTags,
   });
   appStack.addDependency(networkStack);
+}
+
+// -- OMNI PicoGK Fountain Pen Generator (Fargate) ----------------------------
+if (deployOmni) {
+  const omniStack = new ForgeOmniStack(app, `ForgeOmni-${env}`, {
+    env: awsEnv,
+    description: 'OMNI PicoGK Fountain Pen Generator -- Fargate, ALB, Route 53, ACM',
+    forgeEnv: env,
+    vpc: networkStack.vpc,
+    ecsSecurityGroup: networkStack.ecsSecurityGroup,
+    albSecurityGroup: networkStack.albSecurityGroup,
+    privateSubnets: networkStack.privateSubnets,
+    publicSubnets: networkStack.publicSubnets,
+    domainName: omniDomain,
+    hostedZoneDomain: omniDomain.split('.').slice(-2).join('.'),
+    tags: sharedTags,
+  });
+  omniStack.addDependency(networkStack);
 }
 
 // -- Preserve cross-stack exports if legacy stacks (Data/Compute) still exist.
