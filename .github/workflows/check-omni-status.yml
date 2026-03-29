@@ -28,66 +28,76 @@ jobs:
         run: |
           echo "=== ECS Service Status ==="
           aws ecs describe-services --cluster omni-dev --services omni-dev \
-            --query 'services[0].{Status:status,Desired:desiredCount,Running:runningCount,Pending:pendingCount,Events:events[0:5]}' \
+            --query 'services[0].{Status:status,Desired:desiredCount,Running:runningCount,Pending:pendingCount}' \
             --output json 2>/dev/null || echo "Service not found"
+          
+          echo ""
+          echo "=== ECS Service Events (latest 5) ==="
+          aws ecs describe-services --cluster omni-dev --services omni-dev \
+            --query 'services[0].events[0:5].message' \
+            --output text 2>/dev/null || echo "No events"
 
       - name: Check ECS tasks
         run: |
+          set +e
           echo "=== Running Tasks ==="
-          TASKS=$(aws ecs list-tasks --cluster omni-dev --service-name omni-dev --query 'taskArns' --output text 2>/dev/null)
-          if [ -n "$TASKS" ] && [ "$TASKS" != "None" ]; then
-            aws ecs describe-tasks --cluster omni-dev --tasks $TASKS \
-              --query 'tasks[*].{TaskId:taskArn,Status:lastStatus,StopCode:stopCode,StopReason:stoppedReason,Health:healthStatus}' \
-              --output table
-          else
-            echo "No running tasks found"
-          fi
-
+          TASKS=$(aws ecs list-tasks --cluster omni-dev --service-name omni-dev --query 'taskArns' --output json 2>/dev/null)
+          echo "Running task arns: $TASKS"
+          
           echo ""
-          echo "=== Recently Stopped Tasks ==="
-          STOPPED=$(aws ecs list-tasks --cluster omni-dev --service-name omni-dev --desired-status STOPPED --query 'taskArns' --output text 2>/dev/null)
+          echo "=== Stopped Tasks ==="
+          STOPPED=$(aws ecs list-tasks --cluster omni-dev --service-name omni-dev --desired-status STOPPED --query 'taskArns[]' --output text 2>/dev/null)
           if [ -n "$STOPPED" ] && [ "$STOPPED" != "None" ]; then
-            aws ecs describe-tasks --cluster omni-dev --tasks $STOPPED \
-              --query 'tasks[*].{TaskId:taskArn,Status:lastStatus,StopCode:stopCode,StopReason:stoppedReason}' \
-              --output table
+            for TASK in $STOPPED; do
+              echo "--- Task: $TASK ---"
+              aws ecs describe-tasks --cluster omni-dev --tasks "$TASK" \
+                --query 'tasks[0].{Status:lastStatus,StopCode:stopCode,StopReason:stoppedReason,ContainerStatus:containers[0].{Status:lastStatus,Reason:reason,ExitCode:exitCode}}' \
+                --output json 2>/dev/null
+              echo ""
+            done
           else
             echo "No stopped tasks"
           fi
 
       - name: Check CloudWatch Logs
         run: |
-          echo "=== Recent Container Logs (last 50 lines) ==="
-          LOG_STREAMS=$(aws logs describe-log-streams \
+          set +e
+          echo "=== Log Streams ==="
+          aws logs describe-log-streams \
             --log-group-name /forge/ecs/omni \
             --order-by LastEventTime \
             --descending \
             --limit 3 \
-            --query 'logStreams[*].logStreamName' \
+            --output json 2>/dev/null | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for s in data.get('logStreams', []):
+            print(f'Stream: {s[\"logStreamName\"]}')
+          " 2>/dev/null || echo "No log streams"
+          
+          echo ""
+          echo "=== Recent Logs ==="
+          STREAM=$(aws logs describe-log-streams \
+            --log-group-name /forge/ecs/omni \
+            --order-by LastEventTime \
+            --descending \
+            --limit 1 \
+            --query 'logStreams[0].logStreamName' \
             --output text 2>/dev/null)
           
-          if [ -n "$LOG_STREAMS" ]; then
-            for STREAM in $LOG_STREAMS; do
-              echo "--- Stream: $STREAM ---"
-              aws logs get-log-events \
-                --log-group-name /forge/ecs/omni \
-                --log-stream-name "$STREAM" \
-                --limit 50 \
-                --query 'events[*].message' \
-                --output text 2>/dev/null | tail -50
-              echo ""
-            done
+          if [ -n "$STREAM" ] && [ "$STREAM" != "None" ]; then
+            echo "Reading from stream: $STREAM"
+            aws logs get-log-events \
+              --log-group-name /forge/ecs/omni \
+              --log-stream-name "$STREAM" \
+              --limit 100 \
+              --query 'events[*].message' \
+              --output json 2>/dev/null | python3 -c "
+          import sys, json
+          msgs = json.load(sys.stdin)
+          for m in msgs:
+            print(m)
+          " 2>/dev/null || echo "Could not read logs"
           else
-            echo "No log streams found"
-          fi
-
-      - name: Check ALB health
-        run: |
-          echo "=== ALB Target Health ==="
-          TG_ARN=$(aws elbv2 describe-target-groups \
-            --query "TargetGroups[?contains(TargetGroupName, 'ForgeO') || contains(TargetGroupName, 'Omni')].TargetGroupArn" \
-            --output text 2>/dev/null)
-          if [ -n "$TG_ARN" ]; then
-            aws elbv2 describe-target-health --target-group-arn "$TG_ARN" --output table 2>/dev/null
-          else
-            echo "Target group not found"
+            echo "No log streams available"
           fi
