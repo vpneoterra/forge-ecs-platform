@@ -19,81 +19,96 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Delete failed ForgeOmni-dev stack
+      - name: Force delete ForgeOmni-dev stack
         run: |
           set +e
-          echo "Checking ForgeOmni-dev stack status..."
+          echo "=== Current Stack Status ==="
           STATUS=$(aws cloudformation describe-stacks --stack-name ForgeOmni-dev \
             --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
-          echo "Current status: $STATUS"
-          
+          echo "Status: $STATUS"
+
           if [ "$STATUS" = "DOES_NOT_EXIST" ]; then
             echo "Stack doesn't exist, proceeding with fresh deploy."
             exit 0
           fi
 
-          if [ "$STATUS" = "DELETE_IN_PROGRESS" ]; then
-            echo "Stack deletion already in progress, waiting..."
-            aws cloudformation wait stack-delete-complete --stack-name ForgeOmni-dev || true
-            # Check if it ended in DELETE_FAILED
-            STATUS=$(aws cloudformation describe-stacks --stack-name ForgeOmni-dev \
-              --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
-            echo "Status after wait: $STATUS"
-          fi
-
-          if [ "$STATUS" = "ROLLBACK_COMPLETE" ] || [ "$STATUS" = "CREATE_FAILED" ]; then
-            echo "Deleting failed stack (normal delete)..."
-            aws cloudformation delete-stack --stack-name ForgeOmni-dev
-            echo "Waiting for deletion..."
-            aws cloudformation wait stack-delete-complete --stack-name ForgeOmni-dev
-            echo "Stack deleted."
-            exit 0
-          fi
-
-          if [ "$STATUS" = "ROLLBACK_FAILED" ]; then
-            echo "Stack in ROLLBACK_FAILED state. Attempting normal delete first..."
-            aws cloudformation delete-stack --stack-name ForgeOmni-dev
-            echo "Waiting for deletion to complete (may fail on stuck resources)..."
-            aws cloudformation wait stack-delete-complete --stack-name ForgeOmni-dev 2>/dev/null || true
-            sleep 5
+          # For any failed state, force delete with retain
+          if [[ "$STATUS" == *"FAILED"* ]] || [[ "$STATUS" == *"ROLLBACK"* ]]; then
+            echo "Stack in bad state ($STATUS). Force deleting..."
             
-            # Check if we're now in DELETE_FAILED
+            # Step 1: Try normal delete
+            aws cloudformation delete-stack --stack-name ForgeOmni-dev 2>/dev/null
+            echo "Waiting for delete (max 5 min)..."
+            timeout 300 aws cloudformation wait stack-delete-complete --stack-name ForgeOmni-dev 2>/dev/null || true
+            sleep 10
+            
+            # Step 2: Check if stuck in DELETE_FAILED
             STATUS=$(aws cloudformation describe-stacks --stack-name ForgeOmni-dev \
               --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
-            echo "Status after first delete attempt: $STATUS"
+            echo "Status after delete attempt: $STATUS"
             
             if [ "$STATUS" = "DOES_NOT_EXIST" ]; then
-              echo "Stack successfully deleted."
+              echo "Stack deleted successfully."
               exit 0
             fi
             
-            if [ "$STATUS" = "DELETE_FAILED" ]; then
-              echo "Stack in DELETE_FAILED — now using --retain-resources for stuck resources..."
+            if [ "$STATUS" = "DELETE_FAILED" ] || [[ "$STATUS" == *"FAILED"* ]]; then
+              echo "Delete failed. Getting stuck resources..."
               RETAIN=$(aws cloudformation describe-stack-resources --stack-name ForgeOmni-dev \
                 --query "StackResources[?ResourceStatus=='DELETE_FAILED'].LogicalResourceId" \
                 --output text 2>/dev/null || echo "")
               echo "Resources to retain: $RETAIN"
               
               if [ -n "$RETAIN" ]; then
+                echo "Retrying delete with --retain-resources $RETAIN"
                 aws cloudformation delete-stack --stack-name ForgeOmni-dev --retain-resources $RETAIN
               else
-                aws cloudformation delete-stack --stack-name ForgeOmni-dev
+                # Retain all resources if we can't determine which are stuck
+                ALL_RESOURCES=$(aws cloudformation describe-stack-resources --stack-name ForgeOmni-dev \
+                  --query "StackResources[*].LogicalResourceId" --output text 2>/dev/null || echo "")
+                echo "Retrying delete retaining ALL resources: $ALL_RESOURCES"
+                aws cloudformation delete-stack --stack-name ForgeOmni-dev --retain-resources $ALL_RESOURCES
               fi
               
               echo "Waiting for final deletion..."
-              aws cloudformation wait stack-delete-complete --stack-name ForgeOmni-dev || true
-              
-              # Clean up retained ECS resources
-              echo "Cleaning up retained resources..."
-              aws ecs delete-cluster --cluster omni-dev 2>/dev/null && echo "Deleted retained cluster" || echo "No cluster to delete"
-              echo "Stack deleted."
-              exit 0
+              timeout 300 aws cloudformation wait stack-delete-complete --stack-name ForgeOmni-dev 2>/dev/null || true
+              sleep 10
             fi
             
-            echo "Unexpected status: $STATUS after delete attempt. Will try CDK anyway."
+            # Step 3: Final check
+            STATUS=$(aws cloudformation describe-stacks --stack-name ForgeOmni-dev \
+              --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+            echo "Final status: $STATUS"
+            
+            if [ "$STATUS" != "DOES_NOT_EXIST" ]; then
+              echo "ERROR: Could not delete stack. Status: $STATUS"
+              echo "Attempting to continue anyway..."
+            fi
           fi
+
+          # Clean up orphaned ECS resources
+          echo ""
+          echo "=== Cleaning up orphaned ECS resources ==="
           
-          echo "Stack in status: $STATUS. Proceeding with CDK deploy."
+          # Deregister old task definitions
+          for TD in $(aws ecs list-task-definitions --family-prefix omni --query 'taskDefinitionArns[]' --output text 2>/dev/null); do
+            echo "Deregistering: $TD"
+            aws ecs deregister-task-definition --task-definition "$TD" 2>/dev/null || true
+          done
+          
+          # Delete services in the cluster (if any remain)
+          for SVC in $(aws ecs list-services --cluster omni-dev --query 'serviceArns[]' --output text 2>/dev/null); do
+            echo "Force deleting service: $SVC"
+            aws ecs update-service --cluster omni-dev --service "$SVC" --desired-count 0 2>/dev/null || true
+            aws ecs delete-service --cluster omni-dev --service "$SVC" --force 2>/dev/null || true
+          done
+          sleep 5
+          
+          # Delete the cluster itself
+          echo "Deleting ECS cluster omni-dev..."
+          aws ecs delete-cluster --cluster omni-dev 2>/dev/null && echo "Cluster deleted" || echo "Cluster already deleted or doesn't exist"
+          
+          echo "Cleanup complete."
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -104,8 +119,9 @@ jobs:
       - name: Install CDK dependencies
         run: npm ci
 
-      - name: CDK Deploy
+      - name: CDK Deploy (fresh)
         run: |
+          echo "Deploying fresh ForgeOmni-dev stack..."
           npx cdk deploy ForgeNetwork-dev ForgeOmni-dev \
             --require-approval never \
             --outputs-file cdk-outputs.json \
