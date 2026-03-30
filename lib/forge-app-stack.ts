@@ -1,22 +1,30 @@
 /**
- * ForgeAppStack -- FORGE Web Application (test branch)
+ * ForgeAppStack -- FORGE Web Application + OMNI API
  *
  * Self-contained Fargate deployment: creates its own ECS cluster, ALB,
- * and Fargate service. Does NOT depend on ForgeComputeStack.
+ * and two Fargate services (forge-app + forge-omni). Host-header routing
+ * on the shared ALB separates traffic:
+ *   - forge.qrucible.ai  → forge-app (Node.js, port 3000)
+ *   - omni.qrucible.ai   → forge-omni (PicoGK .NET, port 5000)
+ *
+ * Internal connectivity: forge-app reaches OMNI via Cloud Map private DNS
+ * at omni.forge.local:5000 (no public internet hop).
  *
  * Route 53 integration:
- *   - ACM certificate with automated DNS validation via Route 53
- *   - A/AAAA Alias records pointing to the ALB (auto-follow ALB IP changes)
+ *   - ACM certificate with SAN covering both domains (auto DNS validation)
+ *   - A/AAAA Alias records for both domains pointing to the ALB
  *   - No manual DNS updates ever needed -- Route 53 handles everything
  *
  * Cost breakdown:
- *   - ALB: ~$16/month (fixed) + $0.008/LCU-hour
- *   - Fargate (256 CPU / 512 MB): ~$9/month (on-demand), ~$6/month (Spot)
- *   - Secrets Manager: $0.40/secret/month x 5 = $2/month
- *   - CloudWatch Logs: ~$0.50/month (7-day retention)
+ *   - ALB: ~$16/month (fixed, shared) + $0.008/LCU-hour
+ *   - Fargate forge-app (256 CPU / 512 MB Spot): ~$6/month
+ *   - Fargate forge-omni (4096 CPU / 8192 MB Spot): ~$36/month
+ *   - Secrets Manager: $0.40/secret/month x 6 = $2.40/month
+ *   - CloudWatch Logs: ~$1/month (7-day retention, 2 log groups)
  *   - Route 53 hosted zone: $0.50/month + $0.40/million queries
  *   - ACM certificate: free
- *   Total: ~$26/month
+ *   - Cloud Map namespace: free (first 1000 instances)
+ *   Total: ~$62/month
  */
 
 import * as cdk from 'aws-cdk-lib';
@@ -41,6 +49,7 @@ export interface ForgeAppStackProps extends cdk.StackProps {
   privateSubnets: ec2.ISubnet[];
   publicSubnets: ec2.ISubnet[];
   domainName: string;       // e.g., 'forge.qrucible.ai'
+  omniDomainName: string;   // e.g., 'omni.qrucible.ai'
   hostedZoneDomain: string; // e.g., 'qrucible.ai'
   tags?: Record<string, string>;
 }
@@ -224,8 +233,10 @@ export class ForgeAppStack extends cdk.Stack {
     });
 
     // -- ACM Certificate (DNS validated via Route 53 -- fully automatic) ------
+    // Single certificate covers both forge.qrucible.ai and omni.qrucible.ai
     const certificate = new acm.Certificate(this, 'ForgeAppCert', {
       domainName: props.domainName,
+      subjectAlternativeNames: [props.omniDomainName],
       validation: acm.CertificateValidation.fromDns(hostedZone),
       // Route 53 validation: CDK automatically creates the CNAME records
       // in the hosted zone. No manual DNS steps needed.
@@ -248,8 +259,8 @@ export class ForgeAppStack extends cdk.Stack {
       }),
     });
 
-    // -- Route 53 Alias Record ------------------------------------------------
-    // A record with Alias to ALB -- Route 53 automatically resolves to the
+    // -- Route 53 Alias Records ------------------------------------------------
+    // A records with Alias to ALB -- Route 53 automatically resolves to the
     // ALB's current IPs. No CNAME needed, no manual DNS updates ever.
     new route53.ARecord(this, 'ForgeAlbAlias', {
       zone: hostedZone,
@@ -258,6 +269,16 @@ export class ForgeAppStack extends cdk.Stack {
         new route53Targets.LoadBalancerTarget(this.alb),
       ),
       comment: 'FORGE app ALB -- managed by CDK',
+    });
+
+    // omni.qrucible.ai → same ALB (host-header routing separates traffic)
+    new route53.ARecord(this, 'OmniAlbAlias', {
+      zone: hostedZone,
+      recordName: props.omniDomainName,
+      target: route53.RecordTarget.fromAlias(
+        new route53Targets.LoadBalancerTarget(this.alb),
+      ),
+      comment: 'OMNI API ALB -- managed by CDK',
     });
 
     // -- Fargate Service -------------------------------------------------------
@@ -278,7 +299,7 @@ export class ForgeAppStack extends cdk.Stack {
 
     this.serviceName = 'forge-app-test';
 
-    // Register with ALB target group
+    // Register forge-app as default target group (all traffic not matched by host rules)
     httpsListener.addTargets('ForgeAppTarget', {
       targets: [service],
       port: 3000,
@@ -362,6 +383,26 @@ export class ForgeAppStack extends cdk.Stack {
       },
     });
 
+    // -- OMNI ALB target group (host-header routing: omni.qrucible.ai) --------
+    httpsListener.addTargets('OmniTarget', {
+      targets: [omniService],
+      port: 5000,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      priority: 10,
+      conditions: [
+        elbv2.ListenerCondition.hostHeaders([props.omniDomainName]),
+      ],
+      healthCheck: {
+        path: '/api/health',
+        interval: cdk.Duration.seconds(30),
+        timeout: cdk.Duration.seconds(10),
+        healthyHttpCodes: '200',
+        unhealthyThresholdCount: 3,
+        healthyThresholdCount: 2,
+      },
+      deregistrationDelay: cdk.Duration.seconds(30),
+    });
+
     // -- Outputs ---------------------------------------------------------------
     this.albDnsName = new cdk.CfnOutput(this, 'AlbDnsName', {
       value: this.alb.loadBalancerDnsName,
@@ -394,6 +435,11 @@ export class ForgeAppStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'OmniServiceDiscovery', {
       value: 'omni.forge.local:5000',
       description: 'OMNI internal endpoint via Cloud Map',
+    });
+
+    new cdk.CfnOutput(this, 'OmniPublicDomain', {
+      value: `https://${props.omniDomainName}`,
+      description: 'OMNI public URL (Route 53 Alias → ALB, host-header routing)',
     });
 
     new cdk.CfnOutput(this, 'DomainSetup', {
