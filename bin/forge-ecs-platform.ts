@@ -81,7 +81,7 @@ const networkStack = new ForgeNetworkStack(app, `ForgeNetwork-${env}`, {
 if (deployApp) {
   const appStack = new ForgeAppStack(app, `ForgeApp-${env}`, {
     env: awsEnv,
-    description: 'FORGE Web App -- Fargate, ALB, Route 53, ACM, Secrets',
+    description: 'FORGE Web App + OMNI -- Fargate, ALB, Route 53, ACM, Secrets',
     forgeEnv: env,
     vpc: networkStack.vpc,
     ecsSecurityGroup: networkStack.ecsSecurityGroup,
@@ -89,6 +89,7 @@ if (deployApp) {
     privateSubnets: networkStack.privateSubnets,
     publicSubnets: networkStack.publicSubnets,
     domainName: appDomain,
+    omniDomainName: omniDomain,
     hostedZoneDomain: appDomain.split('.').slice(-2).join('.'), // e.g., 'qrucible.ai'
     tags: sharedTags,
   });
