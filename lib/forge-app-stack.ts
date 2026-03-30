@@ -30,6 +30,7 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
+import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
 import { Construct } from 'constructs';
 
 export interface ForgeAppStackProps extends cdk.StackProps {
@@ -68,10 +69,21 @@ export class ForgeAppStack extends cdk.Stack {
       containerInsights: false, // Save cost in dev
     });
 
+    // -- Cloud Map Namespace (private DNS for service discovery) --------------
+    const namespace = new servicediscovery.PrivateDnsNamespace(this, 'ForgeNamespace', {
+      name: 'forge.local',
+      vpc: props.vpc,
+      description: 'FORGE private service discovery',
+    });
+
     // -- ECR Repository (import existing or create) --------------------------
     // Use existing repo created by the CI/CD pipeline
     const ecrRepo = ecr.Repository.fromRepositoryName(
       this, 'ForgeAppRepo', 'forge-app-test',
+    );
+
+    const omniEcrRepo = ecr.Repository.fromRepositoryName(
+      this, 'OmniRepo', 'forge-omni',
     );
 
     // -- Secrets --------------------------------------------------------------
@@ -160,6 +172,9 @@ export class ForgeAppStack extends cdk.Stack {
         HETZNER_COMPUTE_URL: 'http://89.167.79.141:8001',
         LUCID_URL: 'https://api-lucid.qrucible.ai',
         FREECAD_MCP_URL: 'http://89.167.79.141:8016',
+        OMNI_API_URL: 'http://omni.forge.local:5000',
+        OMNI_HOST: 'omni.forge.local',
+        OMNI_PORT: '5000',
       },
       secrets,
       logging: ecs.LogDrivers.awsLogs({
@@ -279,6 +294,74 @@ export class ForgeAppStack extends cdk.Stack {
       deregistrationDelay: cdk.Duration.seconds(30),
     });
 
+    // -- OMNI Service (Fargate Spot with Cloud Map) ----------------------------
+    const omniLogGroup = new logs.LogGroup(this, 'OmniLogGroup', {
+      logGroupName: '/forge/ecs/forge-omni',
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const omniTaskDef = new ecs.FargateTaskDefinition(this, 'OmniTaskDef', {
+      family: 'forge-omni',
+      cpu: 4096,
+      memoryLimitMiB: 8192,
+      executionRole,
+      taskRole,
+      runtimePlatform: {
+        cpuArchitecture: ecs.CpuArchitecture.X86_64,
+        operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+      },
+    });
+
+    omniEcrRepo.grantPull(executionRole);
+
+    const omniContainer = omniTaskDef.addContainer('omni-api', {
+      image: ecs.ContainerImage.fromEcrRepository(omniEcrRepo, 'latest'),
+      essential: true,
+      environment: {
+        DISPLAY: ':99',
+        DOTNET_ENVIRONMENT: 'Production',
+        PORT: '5000',
+      },
+      secrets: {
+        ANTHROPIC_API_KEY: secrets['ANTHROPIC_API_KEY'],
+      },
+      logging: ecs.LogDrivers.awsLogs({
+        logGroup: omniLogGroup,
+        streamPrefix: 'omni',
+      }),
+      healthCheck: {
+        command: ['CMD-SHELL', 'wget -qO- http://localhost:5000/api/health || exit 1'],
+        interval: cdk.Duration.seconds(30),
+        timeout: cdk.Duration.seconds(10),
+        retries: 5,
+        startPeriod: cdk.Duration.seconds(120),
+      },
+    });
+
+    omniContainer.addPortMappings({ containerPort: 5000 });
+
+    const omniService = new ecs.FargateService(this, 'OmniService', {
+      cluster: this.ecsCluster,
+      taskDefinition: omniTaskDef,
+      desiredCount: 1,
+      serviceName: 'forge-omni',
+      enableExecuteCommand: true,
+      circuitBreaker: { rollback: true },
+      assignPublicIp: false,
+      securityGroups: [props.ecsSecurityGroup],
+      vpcSubnets: { subnets: props.privateSubnets },
+      capacityProviderStrategies: [
+        { capacityProvider: 'FARGATE_SPOT', weight: 1, base: 1 },
+      ],
+      cloudMapOptions: {
+        name: 'omni',
+        cloudMapNamespace: namespace,
+        dnsRecordType: servicediscovery.DnsRecordType.A,
+        dnsTtl: cdk.Duration.seconds(10),
+      },
+    });
+
     // -- Outputs ---------------------------------------------------------------
     this.albDnsName = new cdk.CfnOutput(this, 'AlbDnsName', {
       value: this.alb.loadBalancerDnsName,
@@ -306,6 +389,11 @@ export class ForgeAppStack extends cdk.Stack {
       value: this.ecsCluster.clusterName,
       description: 'ECS cluster name',
       exportName: `ForgeAppClusterName-${props.forgeEnv}`,
+    });
+
+    new cdk.CfnOutput(this, 'OmniServiceDiscovery', {
+      value: 'omni.forge.local:5000',
+      description: 'OMNI internal endpoint via Cloud Map',
     });
 
     new cdk.CfnOutput(this, 'DomainSetup', {
