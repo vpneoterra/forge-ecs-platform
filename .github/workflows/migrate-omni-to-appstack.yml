@@ -1,0 +1,149 @@
+name: Migrate OMNI to ForgeAppStack (one-time)
+
+# One-time migration: Delete the standalone ForgeOmni-dev stack,
+# then deploy ForgeAppStack with OMNI embedded (shared ALB).
+# After this runs successfully, delete this workflow file.
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  migrate:
+    name: Delete ForgeOmni-dev + Deploy ForgeApp-dev
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: List current CloudFormation stacks
+        run: |
+          echo "=== Current Stacks ==="
+          aws cloudformation list-stacks \
+            --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE UPDATE_ROLLBACK_COMPLETE ROLLBACK_COMPLETE \
+            --query 'StackSummaries[?starts_with(StackName,`Forge`)].{Name:StackName,Status:StackStatus}' \
+            --output table
+
+      - name: Delete ForgeOmni-dev stack
+        run: |
+          STATUS=$(aws cloudformation describe-stacks --stack-name ForgeOmni-dev \
+            --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+          echo "ForgeOmni-dev status: $STATUS"
+
+          if [ "$STATUS" = "DOES_NOT_EXIST" ]; then
+            echo "ForgeOmni-dev doesn't exist, skipping delete."
+            exit 0
+          fi
+
+          echo "Deleting ForgeOmni-dev stack..."
+          aws cloudformation delete-stack --stack-name ForgeOmni-dev
+
+          echo "Waiting for stack deletion (up to 10 min)..."
+          timeout 600 aws cloudformation wait stack-delete-complete --stack-name ForgeOmni-dev || true
+
+          STATUS=$(aws cloudformation describe-stacks --stack-name ForgeOmni-dev \
+            --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+          echo "Post-delete status: $STATUS"
+
+          if [ "$STATUS" = "DELETE_FAILED" ]; then
+            echo "Delete failed. Retrying with --retain-resources..."
+            RETAIN=$(aws cloudformation describe-stack-resources --stack-name ForgeOmni-dev \
+              --query "StackResources[?ResourceStatus=='DELETE_FAILED'].LogicalResourceId" \
+              --output text 2>/dev/null || echo "")
+            if [ -n "$RETAIN" ]; then
+              aws cloudformation delete-stack --stack-name ForgeOmni-dev --retain-resources $RETAIN
+            fi
+            timeout 300 aws cloudformation wait stack-delete-complete --stack-name ForgeOmni-dev || true
+          fi
+
+          FINAL=$(aws cloudformation describe-stacks --stack-name ForgeOmni-dev \
+            --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+          echo "Final status: $FINAL"
+          if [ "$FINAL" != "DOES_NOT_EXIST" ]; then
+            echo "ERROR: ForgeOmni-dev still exists with status $FINAL"
+            exit 1
+          fi
+          echo "ForgeOmni-dev deleted successfully."
+
+      - name: Clean up orphaned OMNI ECS resources
+        run: |
+          # Deregister old omni task definitions
+          for TD in $(aws ecs list-task-definitions --family-prefix omni --query 'taskDefinitionArns[]' --output text 2>/dev/null); do
+            echo "Deregistering: $TD"
+            aws ecs deregister-task-definition --task-definition "$TD" > /dev/null 2>&1 || true
+          done
+
+          # Delete omni-dev cluster if it exists
+          for SVC in $(aws ecs list-services --cluster omni-dev --query 'serviceArns[]' --output text 2>/dev/null); do
+            echo "Force deleting service: $SVC"
+            aws ecs update-service --cluster omni-dev --service "$SVC" --desired-count 0 > /dev/null 2>&1 || true
+            aws ecs delete-service --cluster omni-dev --service "$SVC" --force > /dev/null 2>&1 || true
+          done
+          sleep 5
+
+          aws ecs delete-cluster --cluster omni-dev > /dev/null 2>&1 && echo "Deleted omni-dev cluster" || echo "omni-dev cluster doesn't exist"
+
+          # Delete orphaned omni ALB if it exists
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names omni-alb \
+            --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || echo "NONE")
+          if [ "$ALB_ARN" != "NONE" ] && [ "$ALB_ARN" != "None" ]; then
+            echo "Deleting orphaned omni-alb: $ALB_ARN"
+            # First delete listeners
+            for LISTENER in $(aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" \
+              --query 'Listeners[].ListenerArn' --output text 2>/dev/null); do
+              aws elbv2 delete-listener --listener-arn "$LISTENER" 2>/dev/null || true
+            done
+            aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN" 2>/dev/null || true
+            echo "Deleted omni-alb"
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install CDK dependencies
+        run: npm ci
+
+      - name: Verify stacks before deploy
+        run: |
+          echo "=== Stacks after ForgeOmni-dev deletion ==="
+          aws cloudformation list-stacks \
+            --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE UPDATE_ROLLBACK_COMPLETE \
+            --query 'StackSummaries[?starts_with(StackName,`Forge`)].{Name:StackName,Status:StackStatus}' \
+            --output table
+
+      - name: CDK Deploy (ForgeNetwork + ForgeApp with OMNI)
+        run: |
+          npx cdk deploy --all \
+            --require-approval never \
+            --outputs-file cdk-outputs.json \
+            -c env=dev \
+            -c deployApp=true \
+            -c appDomain=forge.qrucible.ai \
+            -c skipRds=true
+
+      - name: Show stack outputs
+        run: |
+          echo "=== Deployment Outputs ==="
+          cat cdk-outputs.json | python3 -m json.tool
+
+      - name: Verify services
+        run: |
+          echo "=== ECS Services in forge-app-dev ==="
+          aws ecs list-services --cluster forge-app-dev --output table 2>/dev/null || echo "Cluster not found"
+          
+          echo ""
+          echo "=== Health check ==="
+          sleep 10
+          curl -sf https://omni.qrucible.ai/api/health 2>/dev/null && echo "OMNI health: OK" || echo "OMNI health: not yet available (may need more time)"
+          curl -sf https://forge.qrucible.ai 2>/dev/null && echo "Forge app: OK" || echo "Forge app: not yet available"

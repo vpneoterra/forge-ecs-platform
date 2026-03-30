@@ -86,7 +86,7 @@ jobs:
       - name: CDK diff
         id: diff
         run: |
-          DIFF_OUTPUT=$(npx cdk diff --all -c env=dev 2>&1 || true)
+          DIFF_OUTPUT=$(npx cdk diff --all -c env=dev -c deployApp=true -c appDomain=forge.qrucible.ai -c skipRds=true 2>&1 || true)
           echo "$DIFF_OUTPUT"
           echo "diff_output<<EOF" >> $GITHUB_OUTPUT
           echo "$DIFF_OUTPUT" >> $GITHUB_OUTPUT
@@ -150,7 +150,9 @@ jobs:
         run: |
           npx cdk synth --all \
             -c env=${{ github.event.inputs.environment || 'dev' }} \
-            -c skipRds=${{ github.event.inputs.skipRds || 'false' }} \
+            -c deployApp=true \
+            -c appDomain=forge.qrucible.ai \
+            -c skipRds=true \
             -c alertEmail=${{ github.event.inputs.alertEmail || 'ops@forge.local' }}
 
       - name: CDK Deploy
@@ -159,7 +161,9 @@ jobs:
             --require-approval never \
             --outputs-file cdk-outputs.json \
             -c env=${{ github.event.inputs.environment || 'dev' }} \
-            -c skipRds=${{ github.event.inputs.skipRds || 'false' }} \
+            -c deployApp=true \
+            -c appDomain=forge.qrucible.ai \
+            -c skipRds=true \
             -c alertEmail=${{ github.event.inputs.alertEmail || 'ops@forge.local' }}
 
       - name: Upload CDK outputs
@@ -177,20 +181,10 @@ jobs:
       - name: Smoke test
         run: |
           # Wait for ECS services to stabilize
-          CLUSTER=$(cat cdk-outputs.json | python3 -c "
-          import sys, json
-          data = json.load(sys.stdin)
-          for stack, outputs in data.items():
-            if 'ClusterName' in outputs:
-              print(outputs['ClusterName'])
-              break
-          " 2>/dev/null || echo "")
-
-          if [ -n "$CLUSTER" ]; then
-            echo "Waiting for ECS services to become stable in cluster: $CLUSTER"
-            aws ecs wait services-stable \
-              --cluster "$CLUSTER" \
-              --services forge-lightweight forge-devops forge-monitoring \
-              --region ${{ env.AWS_REGION }} || echo "Warning: services not stable yet (may still be starting)"
-          fi
+          CLUSTER="forge-app-dev"
+          echo "Waiting for ECS services to become stable in cluster: $CLUSTER"
+          aws ecs wait services-stable \
+            --cluster "$CLUSTER" \
+            --services forge-app-service omni-service \
+            --region ${{ env.AWS_REGION }} || echo "Warning: services not stable yet (may still be starting)"
           echo "Smoke test complete"
