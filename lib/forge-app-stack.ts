@@ -373,7 +373,8 @@ export class ForgeAppStack extends cdk.Stack {
       securityGroups: [props.ecsSecurityGroup],
       vpcSubnets: { subnets: props.privateSubnets },
       capacityProviderStrategies: [
-        { capacityProvider: 'FARGATE_SPOT', weight: 1, base: 1 },
+        { capacityProvider: 'FARGATE_SPOT', weight: 3 },
+        { capacityProvider: 'FARGATE', weight: 1, base: 1 },
       ],
       cloudMapOptions: {
         name: 'omni',
