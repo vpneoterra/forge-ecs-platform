@@ -137,13 +137,59 @@ jobs:
           echo "=== Deployment Outputs ==="
           cat cdk-outputs.json | python3 -m json.tool
 
+      - name: Scale up OMNI service
+        run: |
+          echo "=== Scaling OMNI service to 1 task ==="
+          aws ecs update-service \
+            --cluster forge-app-dev \
+            --service forge-omni \
+            --desired-count 1 \
+            --query 'service.{status:status,desiredCount:desiredCount,runningCount:runningCount}' \
+            --output table
+
+          echo ""
+          echo "=== Waiting for task to start (max 5 min) ==="
+          for i in $(seq 1 30); do
+            RUNNING=$(aws ecs describe-services --cluster forge-app-dev --services forge-omni \
+              --query 'services[0].runningCount' --output text 2>/dev/null || echo "0")
+            echo "Attempt $i/30: running=$RUNNING"
+            if [ "$RUNNING" -ge 1 ] 2>/dev/null; then
+              echo "OMNI task is running"
+              break
+            fi
+            sleep 10
+          done
+
+          echo ""
+          echo "=== Recent OMNI logs ==="
+          aws logs get-log-events \
+            --log-group-name /forge/dev/omni \
+            --log-stream-name $(aws logs describe-log-streams \
+              --log-group-name /forge/dev/omni \
+              --order-by LastEventTime --descending --limit 1 \
+              --query 'logStreams[0].logStreamName' --output text 2>/dev/null || echo "none") \
+            --limit 50 \
+            --query 'events[*].message' --output text 2>/dev/null || echo "No logs yet"
+
       - name: Verify services
         run: |
           echo "=== ECS Services in forge-app-dev ==="
-          aws ecs list-services --cluster forge-app-dev --output table 2>/dev/null || echo "Cluster not found"
+          aws ecs describe-services --cluster forge-app-dev --services forge-app-service forge-omni \
+            --query 'services[*].{name:serviceName,status:status,desired:desiredCount,running:runningCount,pending:pendingCount}' \
+            --output table 2>/dev/null || echo "Service not found"
           
           echo ""
+          echo "=== OMNI task details ==="
+          TASK_ARN=$(aws ecs list-tasks --cluster forge-app-dev --service-name forge-omni \
+            --query 'taskArns[0]' --output text 2>/dev/null || echo "NONE")
+          if [ "$TASK_ARN" != "NONE" ] && [ -n "$TASK_ARN" ]; then
+            aws ecs describe-tasks --cluster forge-app-dev --tasks "$TASK_ARN" \
+              --query 'tasks[0].{lastStatus:lastStatus,stoppedReason:stoppedReason,containers:containers[*].{name:name,lastStatus:lastStatus,exitCode:exitCode,reason:reason}}' \
+              --output json
+          fi
+
+          echo ""
           echo "=== Health check ==="
-          sleep 10
+          sleep 30
           curl -sf https://omni.qrucible.ai/api/health 2>/dev/null && echo "OMNI health: OK" || echo "OMNI health: not yet available (may need more time)"
           curl -sf https://forge.qrucible.ai 2>/dev/null && echo "Forge app: OK" || echo "Forge app: not yet available"
