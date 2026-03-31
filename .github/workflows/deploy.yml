@@ -1,14 +1,8 @@
 name: Deploy FORGE Platform
 
+# CDK deploys are slow (10-30 min) — only trigger manually for infra changes.
+# Application code deploys go through forgenew/deploy-test.yml (2-3 min).
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'bin/**'
-      - 'lib/**'
-      - 'package.json'
-      - 'tsconfig.json'
-      - 'cdk.json'
   workflow_dispatch:
     inputs:
       environment:
