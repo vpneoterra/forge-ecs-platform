@@ -329,7 +329,7 @@ export class ForgeAppStack extends cdk.Stack {
       executionRole,
       taskRole,
       runtimePlatform: {
-        cpuArchitecture: ecs.CpuArchitecture.ARM64,
+        cpuArchitecture: ecs.CpuArchitecture.X86_64,
         operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
       },
     });
@@ -365,11 +365,10 @@ export class ForgeAppStack extends cdk.Stack {
     const omniService = new ecs.FargateService(this, 'OmniService', {
       cluster: this.ecsCluster,
       taskDefinition: omniTaskDef,
-      desiredCount: 0,  // Start at 0 to avoid circuit breaker during initial deploy
+      desiredCount: 1,
       serviceName: 'forge-omni',
       enableExecuteCommand: true,
-      // circuitBreaker disabled for initial deployment — enable once service is stable
-      // circuitBreaker: { rollback: true },
+      circuitBreaker: { rollback: true },
       assignPublicIp: false,
       securityGroups: [props.ecsSecurityGroup],
       vpcSubnets: { subnets: props.privateSubnets },
