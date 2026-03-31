@@ -1,0 +1,104 @@
+name: Scale OMNI Service
+
+on:
+  workflow_dispatch:
+    inputs:
+      desired_count:
+        description: 'Desired task count'
+        required: true
+        default: '1'
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  scale:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Scale OMNI service
+        run: |
+          echo "=== Current state ==="
+          aws ecs describe-services --cluster forge-app-dev --services forge-omni \
+            --query 'services[0].{status:status,desired:desiredCount,running:runningCount,pending:pendingCount}' \
+            --output table
+
+          echo ""
+          echo "=== Scaling to ${{ github.event.inputs.desired_count }} ==="
+          aws ecs update-service \
+            --cluster forge-app-dev \
+            --service forge-omni \
+            --desired-count ${{ github.event.inputs.desired_count }} \
+            --query 'service.{status:status,desiredCount:desiredCount}' \
+            --output table
+
+      - name: Wait for task and check logs
+        if: github.event.inputs.desired_count != '0'
+        run: |
+          echo "=== Waiting for task to start (max 5 min) ==="
+          for i in $(seq 1 30); do
+            RUNNING=$(aws ecs describe-services --cluster forge-app-dev --services forge-omni \
+              --query 'services[0].runningCount' --output text 2>/dev/null || echo "0")
+            PENDING=$(aws ecs describe-services --cluster forge-app-dev --services forge-omni \
+              --query 'services[0].pendingCount' --output text 2>/dev/null || echo "0")
+            echo "Attempt $i/30: running=$RUNNING pending=$PENDING"
+            if [ "$RUNNING" -ge 1 ] 2>/dev/null; then
+              echo "OMNI task is running!"
+              break
+            fi
+            sleep 10
+          done
+
+          echo ""
+          echo "=== Task details ==="
+          TASK_ARN=$(aws ecs list-tasks --cluster forge-app-dev --service-name forge-omni \
+            --query 'taskArns[0]' --output text 2>/dev/null || echo "NONE")
+          if [ "$TASK_ARN" != "NONE" ] && [ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ]; then
+            aws ecs describe-tasks --cluster forge-app-dev --tasks "$TASK_ARN" \
+              --query 'tasks[0].{lastStatus:lastStatus,stoppedReason:stoppedReason,stopCode:stopCode,containers:containers[*].{name:name,lastStatus:lastStatus,exitCode:exitCode,reason:reason}}' \
+              --output json
+          else
+            echo "No tasks found"
+          fi
+
+          # Check stopped tasks for error details
+          echo ""
+          echo "=== Recent stopped tasks ==="
+          STOPPED=$(aws ecs list-tasks --cluster forge-app-dev --service-name forge-omni \
+            --desired-status STOPPED --query 'taskArns[0]' --output text 2>/dev/null || echo "NONE")
+          if [ "$STOPPED" != "NONE" ] && [ -n "$STOPPED" ] && [ "$STOPPED" != "None" ]; then
+            aws ecs describe-tasks --cluster forge-app-dev --tasks "$STOPPED" \
+              --query 'tasks[0].{lastStatus:lastStatus,stoppedReason:stoppedReason,stopCode:stopCode,containers:containers[*].{name:name,exitCode:exitCode,reason:reason}}' \
+              --output json
+          fi
+
+          echo ""
+          echo "=== Recent OMNI logs ==="
+          LOG_STREAM=$(aws logs describe-log-streams \
+            --log-group-name /forge/dev/omni \
+            --order-by LastEventTime --descending --limit 1 \
+            --query 'logStreams[0].logStreamName' --output text 2>/dev/null || echo "none")
+          if [ "$LOG_STREAM" != "none" ] && [ "$LOG_STREAM" != "None" ]; then
+            aws logs get-log-events \
+              --log-group-name /forge/dev/omni \
+              --log-stream-name "$LOG_STREAM" \
+              --limit 50 \
+              --query 'events[*].message' --output text 2>/dev/null || echo "No logs"
+          else
+            echo "No log streams found"
+          fi
+
+      - name: Health check
+        if: github.event.inputs.desired_count != '0'
+        continue-on-error: true
+        run: |
+          echo "=== Health check (waiting 30s) ==="
+          sleep 30
+          curl -sf https://omni.qrucible.ai/api/health && echo "OMNI: HEALTHY" || echo "OMNI: not responding yet"
+          curl -sf https://forge.qrucible.ai && echo "Forge app: OK" || echo "Forge app: not responding"
