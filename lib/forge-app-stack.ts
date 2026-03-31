@@ -365,10 +365,11 @@ export class ForgeAppStack extends cdk.Stack {
     const omniService = new ecs.FargateService(this, 'OmniService', {
       cluster: this.ecsCluster,
       taskDefinition: omniTaskDef,
-      desiredCount: 1,
+      desiredCount: 0,  // Start at 0 to avoid circuit breaker during initial deploy
       serviceName: 'forge-omni',
       enableExecuteCommand: true,
-      circuitBreaker: { rollback: true },
+      // circuitBreaker disabled for initial deployment — enable once service is stable
+      // circuitBreaker: { rollback: true },
       assignPublicIp: false,
       securityGroups: [props.ecsSecurityGroup],
       vpcSubnets: { subnets: props.privateSubnets },
