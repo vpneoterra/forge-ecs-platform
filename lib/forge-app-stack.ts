@@ -137,6 +137,10 @@ export class ForgeAppStack extends cdk.Stack {
       actions: ['secretsmanager:GetSecretValue', 'kms:Decrypt'],
       resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:forge/test/*`],
     }));
+    executionRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['ssm:GetParameters', 'ssm:GetParameter'],
+      resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter/forge/*`],
+    }));
     // Allow pulling from ECR
     ecrRepo.grantPull(executionRole);
 

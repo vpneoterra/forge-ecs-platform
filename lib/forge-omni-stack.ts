@@ -102,6 +102,10 @@ export class ForgeOmniStack extends cdk.Stack {
       actions: ['secretsmanager:GetSecretValue', 'kms:Decrypt'],
       resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:forge/${env}/*`],
     }));
+    executionRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['ssm:GetParameters', 'ssm:GetParameter'],
+      resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter/forge/*`],
+    }));
     ecrRepo.grantPull(executionRole);
 
     // -- Task Role (runtime) --------------------------------------------------
