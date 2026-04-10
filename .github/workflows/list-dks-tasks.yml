@@ -1,0 +1,48 @@
+name: "DKS: List Running Tasks"
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER: forge-app-dev
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: List all tasks on cluster
+        run: |
+          echo "=== All tasks on ${{ env.CLUSTER }} ==="
+          TASK_ARNS=$(aws ecs list-tasks --cluster ${{ env.CLUSTER }} --query 'taskArns' --output json)
+          echo "Task ARNs: $TASK_ARNS"
+          
+          if [ "$TASK_ARNS" != "[]" ]; then
+            aws ecs describe-tasks --cluster ${{ env.CLUSTER }} --tasks $(echo "$TASK_ARNS" | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin)))") \
+              --query 'tasks[*].{taskArn:taskArn,status:lastStatus,taskDef:taskDefinitionArn,cpu:cpu,memory:memory,startedAt:startedAt,stopCode:stopCode,exitCode:containers[0].exitCode,networkMode:attachments[0].details[?name==`subnetId`].value|[0]}' \
+              --output table
+          else
+            echo "No running tasks."
+          fi
+
+      - name: List recent stopped tasks (dks family)
+        run: |
+          echo "=== Recent stopped dks-download tasks ==="
+          for FAMILY in dks-download dks-ingest; do
+            echo "--- $FAMILY ---"
+            TASK_ARNS=$(aws ecs list-tasks --cluster ${{ env.CLUSTER }} --family "$FAMILY" --desired-status STOPPED --query 'taskArns[:3]' --output json 2>/dev/null || echo "[]")
+            if [ "$TASK_ARNS" != "[]" ] && [ "$TASK_ARNS" != "" ]; then
+              aws ecs describe-tasks --cluster ${{ env.CLUSTER }} --tasks $(echo "$TASK_ARNS" | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin)))") \
+                --query 'tasks[*].{taskArn:taskArn,status:lastStatus,exitCode:containers[0].exitCode,startedAt:startedAt,stoppedAt:stoppedAt,stopReason:stoppedReason}' \
+                --output table 2>/dev/null || echo "No stopped tasks found."
+            else
+              echo "No stopped tasks."
+            fi
+          done
