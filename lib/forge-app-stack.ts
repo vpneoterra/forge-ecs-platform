@@ -502,7 +502,7 @@ export class ForgeAppStack extends cdk.Stack {
       const dksQueryService = new ecs.FargateService(this, 'DksQueryService', {
         cluster: this.ecsCluster,
         taskDefinition: dksQueryTaskDef,
-        desiredCount: 1,
+        desiredCount: 0, // Start at 0 — scale up after images are pushed to ECR
         serviceName: 'dks-query',
         enableExecuteCommand: true,
         circuitBreaker: { rollback: true },
@@ -522,7 +522,7 @@ export class ForgeAppStack extends cdk.Stack {
 
       // dks-query auto-scaling
       const dksQueryScaling = dksQueryService.autoScaleTaskCount({
-        minCapacity: 1,
+        minCapacity: 0, // Allow scale-to-zero until images are ready
         maxCapacity: 3,
       });
 
