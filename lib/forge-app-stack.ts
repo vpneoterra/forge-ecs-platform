@@ -39,6 +39,7 @@ import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
+import * as efs from 'aws-cdk-lib/aws-efs';
 import { Construct } from 'constructs';
 
 export interface ForgeAppStackProps extends cdk.StackProps {
@@ -434,6 +435,26 @@ export class ForgeAppStack extends cdk.Stack {
         removalPolicy: cdk.RemovalPolicy.DESTROY,
       });
 
+      // DKS EFS for dataset storage
+      const dksEfs = new efs.FileSystem(this, 'DksEfs', {
+        vpc: props.vpc,
+        performanceMode: efs.PerformanceMode.GENERAL_PURPOSE,
+        throughputMode: efs.ThroughputMode.BURSTING,
+        encrypted: true,
+        removalPolicy: cdk.RemovalPolicy.RETAIN,
+        lifecyclePolicy: efs.LifecyclePolicy.AFTER_30_DAYS,
+      });
+
+      // Allow ECS tasks to access EFS
+      dksEfs.connections.allowDefaultPortFrom(props.ecsSecurityGroup);
+
+      // Access point for DKS data
+      const dksAccessPoint = dksEfs.addAccessPoint('DksDataAP', {
+        path: '/dks-data',
+        createAcl: { ownerUid: '1000', ownerGid: '1000', permissions: '755' },
+        posixUser: { uid: '1000', gid: '1000' },
+      });
+
       // dks-query task definition
       const dksQueryTaskDef = new ecs.FargateTaskDefinition(this, 'DksQueryTaskDef', {
         family: 'dks-query',
@@ -524,7 +545,7 @@ export class ForgeAppStack extends cdk.Stack {
         },
       });
 
-      dksIngestTaskDef.addContainer('dks-ingest', {
+      const dksIngestContainer = dksIngestTaskDef.addContainer('dks-ingest', {
         image: ecs.ContainerImage.fromEcrRepository(dksIngestEcrRepo, 'latest'),
         essential: true,
         environment: {
@@ -537,6 +558,69 @@ export class ForgeAppStack extends cdk.Stack {
           logGroup: dksIngestLogGroup,
           streamPrefix: 'dks-ingest',
         }),
+      });
+
+      // EFS volume + mount for dks-ingest
+      dksIngestTaskDef.addVolume({
+        name: 'dks-data',
+        efsVolumeConfiguration: {
+          fileSystemId: dksEfs.fileSystemId,
+          transitEncryption: 'ENABLED',
+          authorizationConfig: {
+            accessPointId: dksAccessPoint.accessPointId,
+            iam: 'ENABLED',
+          },
+        },
+      });
+
+      dksIngestContainer.addMountPoints({
+        sourceVolume: 'dks-data',
+        containerPath: '/data',
+        readOnly: false,
+      });
+
+      // Grant EFS access to task role
+      dksEfs.grantReadWrite(taskRole);
+
+      // dks-download task definition (lightweight — for downloading datasets to EFS)
+      const dksDownloadTaskDef = new ecs.FargateTaskDefinition(this, 'DksDownloadTaskDef', {
+        family: 'dks-download',
+        cpu: 1024,
+        memoryLimitMiB: 2048,
+        executionRole,
+        taskRole,
+        runtimePlatform: {
+          cpuArchitecture: ecs.CpuArchitecture.X86_64,
+          operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+        },
+      });
+
+      const dlContainer = dksDownloadTaskDef.addContainer('downloader', {
+        image: ecs.ContainerImage.fromRegistry('amazon/aws-cli:latest'),
+        essential: true,
+        command: ['echo', 'Override command at run-task time'],
+        logging: ecs.LogDrivers.awsLogs({
+          logGroup: dksIngestLogGroup,
+          streamPrefix: 'dks-download',
+        }),
+      });
+
+      dksDownloadTaskDef.addVolume({
+        name: 'dks-data',
+        efsVolumeConfiguration: {
+          fileSystemId: dksEfs.fileSystemId,
+          transitEncryption: 'ENABLED',
+          authorizationConfig: {
+            accessPointId: dksAccessPoint.accessPointId,
+            iam: 'ENABLED',
+          },
+        },
+      });
+
+      dlContainer.addMountPoints({
+        sourceVolume: 'dks-data',
+        containerPath: '/data',
+        readOnly: false,
       });
 
       // DKS outputs
@@ -558,6 +642,16 @@ export class ForgeAppStack extends cdk.Stack {
       new cdk.CfnOutput(this, 'DksIngestLogGroup', {
         value: '/forge/ecs/dks-ingest',
         description: 'DKS Ingest CloudWatch log group',
+      });
+
+      new cdk.CfnOutput(this, 'DksEfsId', {
+        value: dksEfs.fileSystemId,
+        description: 'DKS EFS file system ID',
+      });
+
+      new cdk.CfnOutput(this, 'DksDownloadTaskDefArn', {
+        value: dksDownloadTaskDef.taskDefinitionArn,
+        description: 'DKS Download task definition ARN',
       });
     }
 
