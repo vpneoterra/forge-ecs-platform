@@ -1,0 +1,24 @@
+name: "DKS: Stop Task"
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: "ECS task ID to stop"
+        required: true
+env:
+  AWS_REGION: us-east-1
+  CLUSTER: forge-app-dev
+jobs:
+  stop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: |
+          aws ecs stop-task --cluster ${{ env.CLUSTER }} \
+            --task "arn:aws:ecs:${{ env.AWS_REGION }}:266087050444:task/${{ env.CLUSTER }}/${{ inputs.task_id }}" \
+            --reason "Replacing with combined download+ingest approach"
+          echo "Task stopped."
