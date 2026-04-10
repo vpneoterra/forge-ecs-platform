@@ -1,0 +1,93 @@
+name: "DKS: Fast Download (4 vCPU)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      stop_task_id:
+        description: "Task ID to stop first"
+        required: false
+        default: ""
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER: forge-app-dev
+  SECURITY_GROUP: sg-0871ce467d6c10739
+
+jobs:
+  fast-download:
+    name: Download Fusion 360 (4 vCPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Stop old task
+        if: inputs.stop_task_id != ''
+        run: |
+          aws ecs stop-task --cluster ${{ env.CLUSTER }} \
+            --task "arn:aws:ecs:${{ env.AWS_REGION }}:266087050444:task/${{ env.CLUSTER }}/${{ inputs.stop_task_id }}" \
+            --reason "Relaunching with 4 vCPU for faster 7z extraction" 2>&1 || true
+          sleep 5
+
+      - name: Find public subnet
+        id: net
+        run: |
+          SUBNET=$(aws cloudformation list-exports \
+            --query "Exports[?Name=='ForgePublicSubnetIds-dev'].Value" --output text | cut -d',' -f1)
+          echo "subnet=$SUBNET" >> $GITHUB_OUTPUT
+          echo "Public subnet: $SUBNET"
+
+      - name: Launch with 4 vCPU / 8 GB
+        id: launch
+        run: |
+          TASK_DEF=$(aws ecs list-task-definitions --family-prefix dks-download --sort DESC --max-items 1 --query 'taskDefinitionArns[0]' --output text)
+          
+          TASK_ARN=$(aws ecs run-task \
+            --cluster ${{ env.CLUSTER }} \
+            --task-definition "$TASK_DEF" \
+            --launch-type FARGATE \
+            --platform-version LATEST \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ steps.net.outputs.subnet }}],securityGroups=[${{ env.SECURITY_GROUP }}],assignPublicIp=ENABLED}" \
+            --overrides '{
+              "cpu": "4096",
+              "memory": "8192",
+              "containerOverrides": [{
+                "name": "downloader",
+                "cpu": 4096,
+                "memory": 8192,
+                "command": ["bash", "-c", "set -euo pipefail; echo \"=== DKS Fast Download (4 vCPU / 8 GB) ===\"; echo \"Started: $(date -u)\"; apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl p7zip-full >/dev/null 2>&1 && echo \"Tools ready: $(date -u)\"; mkdir -p /data/datasets/fusion360/j1.0.0; cd /data/datasets/fusion360/j1.0.0; if [ -d joint ] && [ $(find joint -name *.json 2>/dev/null | wc -l) -gt 100 ]; then echo \"Data already on EFS!\"; find joint -name *.json | wc -l; exit 0; fi; echo \"Downloading j1.0.0.7z (2.8 GB)...\"; time curl -fSL --retry 3 -o j1.0.0.7z https://fusion-360-gallery-dataset.s3.us-west-2.amazonaws.com/assembly/j1.0.0/j1.0.0.7z && echo \"Download done: $(date -u)\" && ls -lh j1.0.0.7z; echo \"Extracting with 4 threads...\"; time 7z x j1.0.0.7z -y -mmt4 && echo \"Extract done: $(date -u)\"; rm -f j1.0.0.7z; echo \"JSON files:\"; find . -name *.json | wc -l; du -sh .; echo \"DONE: $(date -u)\""]
+              }]
+            }' \
+            --query 'tasks[0].taskArn' --output text)
+          
+          TASK_ID=$(echo "$TASK_ARN" | rev | cut -d'/' -f1 | rev)
+          echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
+          echo "task_id=$TASK_ID" >> $GITHUB_OUTPUT
+          echo "::notice::Task ID: $TASK_ID"
+
+      - name: Monitor
+        run: |
+          TASK_ARN="${{ steps.launch.outputs.task_arn }}"
+          TIMEOUT=3600
+          ELAPSED=0
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            STATUS=$(aws ecs describe-tasks --cluster ${{ env.CLUSTER }} --tasks "$TASK_ARN" \
+              --query 'tasks[0].lastStatus' --output text 2>/dev/null || echo "UNKNOWN")
+            echo "[$((ELAPSED/60))m] $STATUS"
+            if [ "$STATUS" = "STOPPED" ]; then
+              RESULT=$(aws ecs describe-tasks --cluster ${{ env.CLUSTER }} --tasks "$TASK_ARN" \
+                --query 'tasks[0].{exit:containers[0].exitCode,reason:stoppedReason}' --output json)
+              echo "$RESULT"
+              EXIT=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('exit',1))")
+              [ "$EXIT" = "0" ] && echo "::notice::Download complete!" && exit 0
+              echo "::error::Failed: exit $EXIT" && exit 1
+            fi
+            sleep 30
+            ELAPSED=$((ELAPSED + 30))
+          done
+          echo "::warning::Timeout. Task: ${{ steps.launch.outputs.task_id }}"
