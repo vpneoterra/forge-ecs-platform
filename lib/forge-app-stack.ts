@@ -629,17 +629,17 @@ export class ForgeAppStack extends cdk.Stack {
         description: 'DKS Query internal endpoint via Cloud Map',
       });
 
-      new cdk.CfnOutput(this, 'DksQueryLogGroup', {
+      new cdk.CfnOutput(this, 'DksQueryLogGroupOutput', {
         value: '/forge/ecs/dks-query',
         description: 'DKS Query CloudWatch log group',
       });
 
-      new cdk.CfnOutput(this, 'DksIngestTaskDef', {
+      new cdk.CfnOutput(this, 'DksIngestTaskDefOutput', {
         value: dksIngestTaskDef.taskDefinitionArn,
         description: 'DKS Ingest task definition ARN (for run-task)',
       });
 
-      new cdk.CfnOutput(this, 'DksIngestLogGroup', {
+      new cdk.CfnOutput(this, 'DksIngestLogGroupOutput', {
         value: '/forge/ecs/dks-ingest',
         description: 'DKS Ingest CloudWatch log group',
       });
