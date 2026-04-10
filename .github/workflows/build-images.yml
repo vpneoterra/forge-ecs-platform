@@ -65,6 +65,16 @@ jobs:
             dockerfile: Dockerfile
             platforms: linux/amd64
 
+          - name: dks-query
+            repo: forge-dks
+            dockerfile: Dockerfile.query
+            platforms: linux/amd64
+
+          - name: dks-ingest
+            repo: forge-dks
+            dockerfile: Dockerfile.ingest
+            platforms: linux/amd64
+
     steps:
       - name: Check if this image should build
         id: filter
@@ -157,4 +167,4 @@ jobs:
           echo "## Image Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "| Image | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| All 8 FORGE images | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| All 10 FORGE images | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY

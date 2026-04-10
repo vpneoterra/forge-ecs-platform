@@ -51,6 +51,7 @@ export interface ForgeAppStackProps extends cdk.StackProps {
   domainName: string;       // e.g., 'forge.qrucible.ai'
   omniDomainName: string;   // e.g., 'omni.qrucible.ai'
   hostedZoneDomain: string; // e.g., 'qrucible.ai'
+  deployDks?: boolean;
   tags?: Record<string, string>;
 }
 
@@ -105,6 +106,7 @@ export class ForgeAppStack extends cdk.Stack {
       'tripo-api-key',
       'together-api-key',
       'lucid-token',
+      'database-url',
     ];
 
     const secrets: Record<string, ecs.Secret> = {};
@@ -188,6 +190,8 @@ export class ForgeAppStack extends cdk.Stack {
         OMNI_API_URL: 'http://omni.forge.local:5000',
         OMNI_HOST: 'omni.forge.local',
         OMNI_PORT: '5000',
+        DKS_ENABLED: 'false',
+        KNOWLEDGE_SERVICE_URL: 'http://dks-query.forge.local:8020',
       },
       secrets,
       logging: ecs.LogDrivers.awsLogs({
@@ -347,6 +351,7 @@ export class ForgeAppStack extends cdk.Stack {
         DISPLAY: ':99',
         DOTNET_ENVIRONMENT: 'Production',
         PORT: '5000',
+        KNOWLEDGE_SERVICE_URL: 'http://dks-query.forge.local:8020',
       },
       secrets: {
         ANTHROPIC_API_KEY: secrets['ANTHROPIC_API_KEY'],
@@ -407,6 +412,154 @@ export class ForgeAppStack extends cdk.Stack {
       },
       deregistrationDelay: cdk.Duration.seconds(30),
     });
+
+    // -- DKS (Design Knowledge System) -- conditional on deployDks -------------
+    if (props.deployDks) {
+      // ECR repos
+      const dksQueryEcrRepo = ecr.Repository.fromRepositoryName(this, 'DksQueryRepo', 'dks-query');
+      const dksIngestEcrRepo = ecr.Repository.fromRepositoryName(this, 'DksIngestRepo', 'dks-ingest');
+      dksQueryEcrRepo.grantPull(executionRole);
+      dksIngestEcrRepo.grantPull(executionRole);
+
+      // Log groups
+      const dksQueryLogGroup = new logs.LogGroup(this, 'DksQueryLogGroup', {
+        logGroupName: '/forge/ecs/dks-query',
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      });
+
+      const dksIngestLogGroup = new logs.LogGroup(this, 'DksIngestLogGroup', {
+        logGroupName: '/forge/ecs/dks-ingest',
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      });
+
+      // dks-query task definition
+      const dksQueryTaskDef = new ecs.FargateTaskDefinition(this, 'DksQueryTaskDef', {
+        family: 'dks-query',
+        cpu: 512,
+        memoryLimitMiB: 1024,
+        executionRole,
+        taskRole,
+        runtimePlatform: {
+          cpuArchitecture: ecs.CpuArchitecture.X86_64,
+          operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+        },
+      });
+
+      const dksQueryContainer = dksQueryTaskDef.addContainer('dks-query', {
+        image: ecs.ContainerImage.fromEcrRepository(dksQueryEcrRepo, 'latest'),
+        essential: true,
+        environment: {
+          LLM_BACKEND: 'claude',
+          OLLAMA_HOST: 'http://ollama.forge.local:11434',
+          OLLAMA_MODEL: 'gemma3:27b',
+          DKS_CONFIDENCE_THRESHOLD: '0.6',
+          DKS_DRY_RUN: '0',
+          DKS_EMBEDDING_MODEL: 'all-MiniLM-L6-v2',
+        },
+        secrets: {
+          DATABASE_URL: secrets['DATABASE_URL'],
+          ANTHROPIC_API_KEY: secrets['ANTHROPIC_API_KEY'],
+        },
+        logging: ecs.LogDrivers.awsLogs({
+          logGroup: dksQueryLogGroup,
+          streamPrefix: 'dks-query',
+        }),
+        healthCheck: {
+          command: ['CMD-SHELL', 'wget -qO- http://localhost:8020/api/knowledge/stats || exit 1'],
+          interval: cdk.Duration.seconds(30),
+          timeout: cdk.Duration.seconds(10),
+          retries: 3,
+          startPeriod: cdk.Duration.seconds(90),
+        },
+      });
+
+      dksQueryContainer.addPortMappings({ containerPort: 8020 });
+
+      // dks-query ECS service with Cloud Map
+      const dksQueryService = new ecs.FargateService(this, 'DksQueryService', {
+        cluster: this.ecsCluster,
+        taskDefinition: dksQueryTaskDef,
+        desiredCount: 1,
+        serviceName: 'dks-query',
+        enableExecuteCommand: true,
+        circuitBreaker: { rollback: true },
+        assignPublicIp: false,
+        securityGroups: [props.ecsSecurityGroup],
+        vpcSubnets: { subnets: props.privateSubnets },
+        capacityProviderStrategies: [
+          { capacityProvider: 'FARGATE_SPOT', weight: 1, base: 1 },
+        ],
+        cloudMapOptions: {
+          name: 'dks-query',
+          cloudMapNamespace: namespace,
+          dnsRecordType: servicediscovery.DnsRecordType.A,
+          dnsTtl: cdk.Duration.seconds(10),
+        },
+      });
+
+      // dks-query auto-scaling
+      const dksQueryScaling = dksQueryService.autoScaleTaskCount({
+        minCapacity: 1,
+        maxCapacity: 3,
+      });
+
+      dksQueryScaling.scaleOnCpuUtilization('DksQueryCpuScaling', {
+        targetUtilizationPercent: 60,
+        scaleOutCooldown: cdk.Duration.seconds(180),
+        scaleInCooldown: cdk.Duration.seconds(600),
+      });
+
+      // dks-ingest task definition (standalone — no service, launched via run-task)
+      const dksIngestTaskDef = new ecs.FargateTaskDefinition(this, 'DksIngestTaskDef', {
+        family: 'dks-ingest',
+        cpu: 4096,
+        memoryLimitMiB: 8192,
+        executionRole,
+        taskRole,
+        runtimePlatform: {
+          cpuArchitecture: ecs.CpuArchitecture.X86_64,
+          operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+        },
+      });
+
+      dksIngestTaskDef.addContainer('dks-ingest', {
+        image: ecs.ContainerImage.fromEcrRepository(dksIngestEcrRepo, 'latest'),
+        essential: true,
+        environment: {
+          DKS_EMBEDDING_MODEL: 'all-MiniLM-L6-v2',
+        },
+        secrets: {
+          DATABASE_URL: secrets['DATABASE_URL'],
+        },
+        logging: ecs.LogDrivers.awsLogs({
+          logGroup: dksIngestLogGroup,
+          streamPrefix: 'dks-ingest',
+        }),
+      });
+
+      // DKS outputs
+      new cdk.CfnOutput(this, 'DksQueryServiceDiscovery', {
+        value: 'dks-query.forge.local:8020',
+        description: 'DKS Query internal endpoint via Cloud Map',
+      });
+
+      new cdk.CfnOutput(this, 'DksQueryLogGroup', {
+        value: '/forge/ecs/dks-query',
+        description: 'DKS Query CloudWatch log group',
+      });
+
+      new cdk.CfnOutput(this, 'DksIngestTaskDef', {
+        value: dksIngestTaskDef.taskDefinitionArn,
+        description: 'DKS Ingest task definition ARN (for run-task)',
+      });
+
+      new cdk.CfnOutput(this, 'DksIngestLogGroup', {
+        value: '/forge/ecs/dks-ingest',
+        description: 'DKS Ingest CloudWatch log group',
+      });
+    }
 
     // -- Outputs ---------------------------------------------------------------
     this.albDnsName = new cdk.CfnOutput(this, 'AlbDnsName', {

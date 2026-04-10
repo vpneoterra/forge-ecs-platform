@@ -16,6 +16,7 @@
  *   env           "dev" (default) | "prod"
  *   deployApp     "true" to deploy ForgeAppStack (Fargate web app)
  *   deployOmni    "true" to deploy ForgeOmniStack (OMNI PicoGK Fargate)
+ *   deployDks     "true" to deploy DKS (Design Knowledge System) in ForgeAppStack
  *   deploySolvers "true" to deploy full Compute + Orchestration stacks
  *   skipRds       "true" to skip RDS (use external Supabase)
  *   appDomain     Domain for forge-app (default: forgetest.qrucible.ai)
@@ -50,6 +51,8 @@ const deploySolvers =
   (app.node.tryGetContext('deploySolvers') as string | undefined) === 'true';
 const appDomain =
   (app.node.tryGetContext('appDomain') as string | undefined) ?? 'forge.qrucible.ai';
+const deployDks =
+  (app.node.tryGetContext('deployDks') as string | undefined) === 'true';
 const deployOmni =
   (app.node.tryGetContext('deployOmni') as string | undefined) === 'true';
 const omniDomain =
@@ -91,6 +94,7 @@ if (deployApp) {
     domainName: appDomain,
     omniDomainName: omniDomain,
     hostedZoneDomain: appDomain.split('.').slice(-2).join('.'), // e.g., 'qrucible.ai'
+    deployDks,
     tags: sharedTags,
   });
   appStack.addDependency(networkStack);
