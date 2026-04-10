@@ -57,11 +57,23 @@ jobs:
           echo "Task started: $TASK_ARN"
           echo "task_arn=$TASK_ARN" >> $GITHUB_ENV
           
-          # Wait for task to complete (timeout after 60 minutes)
-          echo "Waiting for task to complete..."
-          aws ecs wait tasks-stopped \
-            --cluster ${{ env.CLUSTER }} \
-            --tasks "$TASK_ARN" || true
+          # Poll for task completion (timeout 90 minutes for large download+extract)
+          echo "Waiting for task to complete (polling every 60s, timeout 90min)..."
+          TIMEOUT=5400
+          ELAPSED=0
+          INTERVAL=60
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            STATUS=$(aws ecs describe-tasks \
+              --cluster ${{ env.CLUSTER }} \
+              --tasks "$TASK_ARN" \
+              --query 'tasks[0].lastStatus' --output text 2>/dev/null || echo "UNKNOWN")
+            echo "[$((ELAPSED/60))m] Task status: $STATUS"
+            if [ "$STATUS" = "STOPPED" ]; then
+              break
+            fi
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
           
           # Check task result
           RESULT=$(aws ecs describe-tasks \
@@ -71,11 +83,18 @@ jobs:
             --output json)
           echo "Task result: $RESULT"
           
+          STATUS=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))")
+          if [ "$STATUS" != "STOPPED" ]; then
+            echo "Task still running after timeout — check ECS console"
+            exit 1
+          fi
+          
           EXIT_CODE=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('exitCode',1))")
           if [ "$EXIT_CODE" != "0" ]; then
             echo "Task failed with exit code $EXIT_CODE"
             exit 1
           fi
+          echo "Download task completed successfully"
 
       - name: Run ingest-fusion360 task
         if: github.event.inputs.task_type == 'ingest-fusion360'
