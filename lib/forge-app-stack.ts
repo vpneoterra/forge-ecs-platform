@@ -211,6 +211,23 @@ export class ForgeAppStack extends cdk.Stack {
         ROSETTA_ENABLED: props.deployGemma ? 'true' : 'false',
         ROSETTA_SHADOW_RATE: '0.10',
         ROSETTA_SHADOW_TIMEOUT_MS: '10000',
+        // -- Geometry Platform feature flags (all OFF by default) --
+        // Capability 1: B-Rep / STEP Engine
+        BREP_ENGINE_ENABLED: 'false',
+        BREP_ENDPOINT: 'http://forge-brep.forge-geometry.local:5090',
+        // Capability 2: GPU SDF Engine (DORMANT — do not activate yet)
+        GPU_SDF_ENABLED: 'false',
+        GPU_SDF_ENDPOINT: 'http://forge-sdf-gpu.forge-geometry.local:5080',
+        GPU_SDF_VOXEL_THRESHOLD: '1000000',
+        // Capability 3: Neural SDF Engine (DORMANT — do not activate yet)
+        NEURAL_SDF_ENABLED: 'false',
+        NEURAL_SDF_ENDPOINT: 'http://forge-neural-sdf.forge-geometry.local:5100',
+        // Capability 4: Visual ASG Editor (client-side only)
+        ASG_EDITOR_ENABLED: 'false',
+        // Capability 5: Field-Driven TPMS (uses existing FluxTK)
+        FIELD_DRIVEN_ENABLED: 'false',
+        FIELD_DRIVEN_MIN_THICKNESS_MM: '0.3',
+        FIELD_DRIVEN_MAX_THICKNESS_MM: '5.0',
       },
       secrets,
       logging: ecs.LogDrivers.awsLogs({

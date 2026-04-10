@@ -18,7 +18,7 @@ Optimized for minimum cost: $72–$116/month for 1–2 person team.
 - Single c6g.xlarge Graviton Spot handles all always-on services
 
 ### Architecture
-- 4 CDK stacks: Network → Data → Compute → Orchestration
+- 5+ CDK stacks: Network → Data → Compute → Orchestration + Geometry (optional)
 - Provider A: Graviton ARM Spot (c6g.xlarge) — always-on services
 - Provider B: x86 Spot (c5.2xlarge/c5.4xlarge) — scale-to-zero heavy compute
 - Provider C: GPU Spot (g5.xlarge) — pay-per-use only
@@ -37,13 +37,15 @@ Optimized for minimum cost: $72–$116/month for 1–2 person team.
 
 | File | Purpose |
 |------|---------|
-| `bin/forge-ecs-platform.ts` | CDK app entry — creates 4 stacks |
+| `bin/forge-ecs-platform.ts` | CDK app entry — creates stacks based on context flags |
 | `lib/config/solver-manifest.ts` | All 8 task configs (cpu, memory, env vars) |
 | `lib/config/capacity-providers.ts` | Provider A/B/C instance type configs |
 | `lib/forge-network-stack.ts` | VPC + NAT instance + security groups |
 | `lib/forge-data-stack.ts` | S3 + EFS + RDS + ECR + DynamoDB |
 | `lib/forge-compute-stack.ts` | ECS cluster + capacity providers + tasks + services |
 | `lib/forge-orchestration-stack.ts` | Step Functions + EventBridge + CloudWatch |
+| `lib/forge-geometry-stack.ts` | Geometry Platform: B-Rep, GPU SDF, Neural SDF |
+| `lib/config/geometry-manifest.ts` | 5 geometry capability configs + feature flags |
 
 ## Service Consolidation
 
@@ -88,12 +90,35 @@ mixedInstancesPolicy: {
 
 ## CDK Context Variables
 - `env` (dev|prod) — controls AZ count, RDS multi-AZ, container insights
+- `deployApp` (true|false) — deploy ForgeAppStack (Fargate web app)
+- `deployOmni` (true|false) — deploy OMNI PicoGK standalone
+- `deployDks` (true|false) — deploy DKS in ForgeAppStack
+- `deployGemma` (true|false) — deploy Gemma GPU inference
+- `deployGeometry` (true|false) — deploy Geometry Platform
+- `deploySolvers` (true|false) — deploy full Compute + Orchestration
 - `skipRds` (true|false) — skip RDS, use external Supabase
 - `alertEmail` — SNS subscription email
+
+## Geometry Platform
+
+Five capabilities, double-gated (service desiredCount + feature flag env var).
+All deploy OFF. Operator activates per runbook.
+
+| # | Capability | Container | Flag | Status |
+|---|-----------|-----------|------|--------|
+| 1 | B-Rep / STEP Engine | forge-brep (:5090) Fargate | BREP_ENGINE_ENABLED | Ready to activate |
+| 2 | GPU SDF Engine | forge-sdf-gpu (:5080) EC2 GPU | GPU_SDF_ENABLED | Dormant (task def only) |
+| 3 | Neural SDF Engine | forge-neural-sdf (:5100) EC2 GPU | NEURAL_SDF_ENABLED | Dormant (task def only) |
+| 4 | Visual ASG Editor | None (client-side JS) | ASG_EDITOR_ENABLED | Ready to activate |
+| 5 | Field-Driven TPMS | None (uses FluxTK) | FIELD_DRIVEN_ENABLED | Ready to activate |
+
+Activation: `aws ecs update-service --cluster forge-geometry-{env} --service forge-brep --desired-count 1`
+then set `BREP_ENGINE_ENABLED=true` in forge-app env and restart.
 
 ## Estimated Stack Deploy Times (first run)
 - ForgeNetwork: ~5 minutes (VPC + NAT instance)
 - ForgeData: ~8 minutes (RDS takes longest if enabled)
 - ForgeCompute: ~10 minutes (ASGs, ECS services)
 - ForgeOrchestration: ~3 minutes
+- ForgeGeometry: ~4 minutes (ECR + Fargate service + GPU task defs)
 - Total: ~25 minutes first run, ~5 minutes updates

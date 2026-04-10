@@ -1,0 +1,144 @@
+name: Build Geometry Container Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_image:
+        description: 'Specific image to build (leave empty for all)'
+        required: false
+        default: ''
+  schedule:
+    # Weekly Wednesday 6am UTC — refresh geometry base images
+    - cron: '0 6 * * 3'
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  build:
+    name: Build ${{ matrix.image.name }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: forge-brep
+            repo: forge-brep
+            source_repo: forgenew
+            dockerfile: docker/brep/Dockerfile
+            platforms: linux/amd64
+            ecr_name: forge-brep
+
+          # forge-sdf-gpu uses a CUDA multi-stage build and should be built on a
+          # machine with the CUDA toolkit installed, or via docker buildx with an
+          # appropriate CUDA-capable builder. The linux/amd64 platform is required.
+          - name: forge-sdf-gpu
+            repo: forge-sdf-gpu
+            source_repo: forgenew
+            dockerfile: docker/sdf-gpu/Dockerfile
+            platforms: linux/amd64
+            ecr_name: forge-sdf-gpu
+
+          - name: forge-neural-sdf
+            repo: forge-neural-sdf
+            source_repo: forgenew
+            dockerfile: docker/neural-sdf/Dockerfile
+            platforms: linux/amd64
+            ecr_name: forge-neural-sdf
+
+    steps:
+      - name: Check if this image should build
+        id: filter
+        run: |
+          TARGET="${{ github.event.inputs.target_image }}"
+          if [ -z "$TARGET" ] || [ "$TARGET" = "${{ matrix.image.name }}" ]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure AWS credentials
+        if: steps.filter.outputs.should_build == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        if: steps.filter.outputs.should_build == 'true'
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up QEMU (for multi-arch builds)
+        if: steps.filter.outputs.should_build == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.filter.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - uses: actions/checkout@v4
+        if: steps.filter.outputs.should_build == 'true'
+        with:
+          repository: vpneoterra/${{ matrix.image.source_repo }}
+          token: ${{ secrets.GH_PAT }}
+          path: image-source
+
+      - name: Set image metadata
+        if: steps.filter.outputs.should_build == 'true'
+        id: meta
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URI=$ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ matrix.image.ecr_name }}
+          echo "ecr_uri=$ECR_URI" >> $GITHUB_OUTPUT
+          echo "build_date=$(date -u +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+          echo "git_sha=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+
+      - name: Build and push
+        if: steps.filter.outputs.should_build == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./image-source
+          file: ./image-source/${{ matrix.image.dockerfile }}
+          platforms: ${{ matrix.image.platforms }}
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.ecr_uri }}:latest
+            ${{ steps.meta.outputs.ecr_uri }}:${{ steps.meta.outputs.build_date }}
+            ${{ steps.meta.outputs.ecr_uri }}:${{ steps.meta.outputs.git_sha }}
+          cache-from: type=registry,ref=${{ steps.meta.outputs.ecr_uri }}:cache
+          cache-to: type=registry,ref=${{ steps.meta.outputs.ecr_uri }}:cache,mode=max
+          build-args: |
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+            GIT_SHA=${{ steps.meta.outputs.git_sha }}
+
+      - name: Image vulnerability scan summary
+        if: steps.filter.outputs.should_build == 'true'
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "Checking ECR scan results for ${{ matrix.image.ecr_name }}..."
+          # Brief wait for scan to complete (non-blocking — just informational)
+          sleep 30
+          aws ecr describe-image-scan-findings \
+            --repository-name ${{ matrix.image.ecr_name }} \
+            --image-id imageTag=latest \
+            --region ${{ env.AWS_REGION }} \
+            --query 'imageScanFindings.findingSeverityCounts' \
+            --output table 2>/dev/null || echo "Scan not yet complete — check ECR console"
+
+  notify:
+    name: Notify build complete
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
+    steps:
+      - name: Build summary
+        run: |
+          echo "## Geometry Image Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| All 3 geometry images | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY

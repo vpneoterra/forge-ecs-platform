@@ -18,6 +18,7 @@
  *   deployOmni    "true" to deploy ForgeOmniStack (OMNI PicoGK Fargate)
  *   deployDks     "true" to deploy DKS (Design Knowledge System) in ForgeAppStack
  *   deployGemma   "true" to deploy Gemma GPU inference stack (g6.2xlarge + NLB)
+ *   deployGeometry "true" to deploy Geometry Platform stack (B-Rep, GPU SDF, Neural SDF)
  *   deploySolvers "true" to deploy full Compute + Orchestration stacks
  *   skipRds       "true" to skip RDS (use external Supabase)
  *   appDomain     Domain for forge-app (default: forgetest.qrucible.ai)
@@ -28,6 +29,7 @@
  *   npx cdk deploy --all -c env=dev -c deployApp=true -c appDomain=forgetest.qrucible.ai -c skipRds=true
  *   npx cdk deploy ForgeOmni-dev -c env=dev -c deployOmni=true -c omniDomain=omni.qrucible.ai
  *   npx cdk deploy --all -c env=dev -c deploySolvers=true -c alertEmail=you@example.com
+ *   npx cdk deploy ForgeGeometry-dev -c env=dev -c deployGeometry=true
  */
 
 import * as cdk from 'aws-cdk-lib';
@@ -38,6 +40,7 @@ import { ForgeAppStack } from '../lib/forge-app-stack';
 import { ForgeOmniStack } from '../lib/forge-omni-stack';
 import { ForgeGemmaStack } from '../lib/forge-gemma-stack';
 import { ForgeOrchestrationStack } from '../lib/forge-orchestration-stack';
+import { ForgeGeometryStack } from '../lib/forge-geometry-stack';
 
 const app = new cdk.App();
 
@@ -59,6 +62,8 @@ const deployOmni =
   (app.node.tryGetContext('deployOmni') as string | undefined) === 'true';
 const deployGemma =
   (app.node.tryGetContext('deployGemma') as string | undefined) === 'true';
+const deployGeometry =
+  (app.node.tryGetContext('deployGeometry') as string | undefined) === 'true';
 const omniDomain =
   (app.node.tryGetContext('omniDomain') as string | undefined) ?? 'omni.qrucible.ai';
 
@@ -141,6 +146,21 @@ if (deployOmni) {
     tags: sharedTags,
   });
   omniStack.addDependency(networkStack);
+}
+
+// -- Geometry Platform Stack (optional) ----------------------------------------
+if (deployGeometry) {
+  const geometryStack = new ForgeGeometryStack(app, `ForgeGeometry-${env}`, {
+    env: awsEnv,
+    description: 'FORGE Geometry Platform -- B-Rep, GPU SDF, Neural SDF, ECR repos, feature flags',
+    forgeEnv: env,
+    vpc: networkStack.vpc,
+    ecsSecurityGroup: networkStack.ecsSecurityGroup,
+    privateSubnets: networkStack.privateSubnets,
+    publicSubnets: networkStack.publicSubnets,
+    tags: sharedTags,
+  });
+  geometryStack.addDependency(networkStack);
 }
 
 // -- Preserve cross-stack exports if legacy stacks (Data/Compute) still exist.
