@@ -49,7 +49,7 @@ jobs:
             --overrides '{
               "containerOverrides": [{
                 "name": "downloader",
-                "command": ["sh", "-c", "yum install -y p7zip && mkdir -p /data/datasets/fusion360/j1.0.0 && cd /data/datasets/fusion360/j1.0.0 && echo Downloading Fusion 360 j1.0.0 dataset... && aws s3 cp s3://fusion-360-gallery-dataset/assembly/j1.0.0/j1.0.0.7z j1.0.0.7z --region us-west-2 --no-sign-request && echo Download complete. Size: && ls -lh j1.0.0.7z && echo Extracting... && 7za x j1.0.0.7z -y && rm j1.0.0.7z && echo Extraction complete. Files: && find . -type f | wc -l"]
+                "command": ["bash", "-c", "apt-get update && apt-get install -y curl p7zip-full && mkdir -p /data/datasets/fusion360/j1.0.0 && cd /data/datasets/fusion360/j1.0.0 && echo Downloading Fusion 360 j1.0.0 dataset... && curl -fSL https://fusion-360-gallery-dataset.s3.us-west-2.amazonaws.com/assembly/j1.0.0/j1.0.0.7z -o j1.0.0.7z && echo Download complete. Size: && ls -lh j1.0.0.7z && echo Extracting... && 7z x j1.0.0.7z -y && rm j1.0.0.7z && echo Extraction complete. Files: && find . -type f | wc -l"]
               }]
             }' \
             --query 'tasks[0].taskArn' --output text)

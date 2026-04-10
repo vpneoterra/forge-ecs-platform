@@ -596,7 +596,7 @@ export class ForgeAppStack extends cdk.Stack {
       });
 
       const dlContainer = dksDownloadTaskDef.addContainer('downloader', {
-        image: ecs.ContainerImage.fromRegistry('amazon/aws-cli:latest'),
+        image: ecs.ContainerImage.fromRegistry('ubuntu:22.04'),
         essential: true,
         command: ['echo', 'Override command at run-task time'],
         logging: ecs.LogDrivers.awsLogs({
