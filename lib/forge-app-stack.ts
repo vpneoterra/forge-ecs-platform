@@ -53,6 +53,10 @@ export interface ForgeAppStackProps extends cdk.StackProps {
   omniDomainName: string;   // e.g., 'omni.qrucible.ai'
   hostedZoneDomain: string; // e.g., 'qrucible.ai'
   deployDks?: boolean;
+  /** Gemma self-hosted inference endpoint (from ForgeGemmaStack NLB) */
+  gemmaEndpoint?: string;
+  /** Enable Gemma routing in the forge-app task definition */
+  deployGemma?: boolean;
   tags?: Record<string, string>;
 }
 
@@ -193,6 +197,20 @@ export class ForgeAppStack extends cdk.Stack {
         OMNI_PORT: '5000',
         DKS_ENABLED: 'false',
         KNOWLEDGE_SERVICE_URL: 'http://dks-query.forge.local:8020',
+        // -- Gemma 4 self-hosted inference (Model Router) --
+        // When GEMMA_ENABLED=false (default), all LLM calls route to Claude.
+        // When GEMMA_ENABLED=true, the Model Router selects Claude vs Gemma per call.
+        // Flip to 'true' AFTER the GPU instance + NLB are verified healthy.
+        GEMMA_ENABLED: props.deployGemma ? 'false' : 'false', // Always deploy as disabled; flip via env update
+        GEMMA_ENDPOINT: props.gemmaEndpoint || 'http://gemma-internal:8000/v1',
+        GEMMA_MODEL: 'google/gemma-4-26b-a4b-it-gptq-4bit',
+        GEMMA_TIMEOUT_MS: '15000',
+        GEMMA_CB_THRESHOLD: '5',
+        GEMMA_CB_RECOVERY_MS: '60000',
+        // Hephaestus Rosetta A/B testing
+        ROSETTA_ENABLED: props.deployGemma ? 'true' : 'false',
+        ROSETTA_SHADOW_RATE: '0.10',
+        ROSETTA_SHADOW_TIMEOUT_MS: '10000',
       },
       secrets,
       logging: ecs.LogDrivers.awsLogs({

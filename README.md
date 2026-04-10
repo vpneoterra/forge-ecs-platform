@@ -173,12 +173,15 @@ forge-ecs-platform/
 │   ├── forge-network-stack.ts   # VPC + NAT instance + security groups
 │   ├── forge-data-stack.ts      # S3 + EFS + RDS + ECR + DynamoDB
 │   ├── forge-compute-stack.ts   # ECS cluster + tasks + services
+│   ├── forge-gemma-stack.ts     # Gemma GPU inference (g6.2xlarge + vLLM + NLB)
 │   └── forge-orchestration-stack.ts # Step Functions + EventBridge + CloudWatch
 ├── scripts/
 │   ├── deploy.sh                # Local deployment
 │   ├── destroy.sh               # Full teardown
 │   ├── hibernate.sh             # Scale to near-zero
-│   └── wake.sh                  # Restore from hibernate
+│   ├── wake.sh                  # Restore from hibernate
+│   ├── gemma-hibernate.sh       # Stop GPU instance (fallback to Claude)
+│   └── gemma-wake.sh            # Start GPU instance for Gemma inference
 ├── docker/
 │   └── build-all.sh             # Build & push all Docker images
 ├── .github/workflows/
@@ -201,6 +204,7 @@ forge-ecs-platform/
 | `ForgeNetwork-{env}` | VPC, public/private subnets, NAT instance, VPC endpoints, security groups |
 | `ForgeData-{env}` | S3 bucket, EFS filesystem, RDS PostgreSQL, 8 ECR repos, DynamoDB |
 | `ForgeCompute-{env}` | ECS cluster, 3 capacity providers, 8 task definitions, 3 ECS services, SQS queues |
+| `ForgeGemma-{env}` | Gemma 4 GPU inference -- g6.2xlarge, vLLM, internal NLB |
 | `ForgeOrchestration-{env}` | Step Functions (CEM loop + Stellarator pipeline), EventBridge, CloudWatch dashboard, SNS alerts |
 
 ---
@@ -241,12 +245,19 @@ forge-ecs-platform/
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `env` | `dev` | Environment (`dev` or `prod`) |
+| `deployApp` | `false` | Deploy ForgeAppStack (Fargate web app) |
+| `deployDks` | `false` | Deploy DKS (Design Knowledge System) |
+| `deployGemma` | `false` | Deploy Gemma GPU inference stack (g6.2xlarge + NLB) |
+| `deploySolvers` | `false` | Deploy full Compute + Orchestration stacks |
 | `skipRds` | `false` | Skip RDS — use external Supabase |
 | `alertEmail` | `ops@forge.local` | Email for CloudWatch alerts |
 
 ```bash
 # Dev with Supabase (cheapest)
-npx cdk deploy --all -c env=dev -c skipRds=true -c alertEmail=you@example.com
+npx cdk deploy --all -c env=dev -c deployApp=true -c skipRds=true
+
+# Dev with Gemma GPU inference
+npx cdk deploy --all -c env=dev -c deployApp=true -c deployGemma=true -c skipRds=true
 
 # Prod with RDS
 npx cdk deploy --all -c env=prod -c alertEmail=you@example.com

@@ -33,6 +33,14 @@ on:
         options:
           - 'true'
           - 'false'
+      deployGemma:
+        description: 'Deploy Gemma GPU inference stack (g6.2xlarge + NLB)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 env:
   AWS_REGION: us-east-1
@@ -88,7 +96,7 @@ jobs:
       - name: CDK diff
         id: diff
         run: |
-          DIFF_OUTPUT=$(npx cdk diff --all -c env=dev -c deployApp=true -c deployDks=true -c appDomain=forge.qrucible.ai -c skipRds=true 2>&1 || true)
+          DIFF_OUTPUT=$(npx cdk diff --all -c env=dev -c deployApp=true -c deployDks=true -c deployGemma=false -c appDomain=forge.qrucible.ai -c skipRds=true 2>&1 || true)
           echo "$DIFF_OUTPUT"
           echo "diff_output<<EOF" >> $GITHUB_OUTPUT
           echo "$DIFF_OUTPUT" >> $GITHUB_OUTPUT
@@ -154,6 +162,7 @@ jobs:
             -c env=${{ github.event.inputs.environment || 'dev' }} \
             -c deployApp=true \
             -c deployDks=${{ github.event.inputs.deployDks || 'true' }} \
+            -c deployGemma=${{ github.event.inputs.deployGemma || 'false' }} \
             -c appDomain=forge.qrucible.ai \
             -c skipRds=true \
             -c alertEmail=${{ github.event.inputs.alertEmail || 'ops@forge.local' }}
@@ -166,6 +175,7 @@ jobs:
             -c env=${{ github.event.inputs.environment || 'dev' }} \
             -c deployApp=true \
             -c deployDks=${{ github.event.inputs.deployDks || 'true' }} \
+            -c deployGemma=${{ github.event.inputs.deployGemma || 'false' }} \
             -c appDomain=forge.qrucible.ai \
             -c skipRds=true \
             -c alertEmail=${{ github.event.inputs.alertEmail || 'ops@forge.local' }}

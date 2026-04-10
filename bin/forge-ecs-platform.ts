@@ -17,6 +17,7 @@
  *   deployApp     "true" to deploy ForgeAppStack (Fargate web app)
  *   deployOmni    "true" to deploy ForgeOmniStack (OMNI PicoGK Fargate)
  *   deployDks     "true" to deploy DKS (Design Knowledge System) in ForgeAppStack
+ *   deployGemma   "true" to deploy Gemma GPU inference stack (g6.2xlarge + NLB)
  *   deploySolvers "true" to deploy full Compute + Orchestration stacks
  *   skipRds       "true" to skip RDS (use external Supabase)
  *   appDomain     Domain for forge-app (default: forgetest.qrucible.ai)
@@ -35,6 +36,7 @@ import { ForgeDataStack } from '../lib/forge-data-stack';
 import { ForgeComputeStack } from '../lib/forge-compute-stack';
 import { ForgeAppStack } from '../lib/forge-app-stack';
 import { ForgeOmniStack } from '../lib/forge-omni-stack';
+import { ForgeGemmaStack } from '../lib/forge-gemma-stack';
 import { ForgeOrchestrationStack } from '../lib/forge-orchestration-stack';
 
 const app = new cdk.App();
@@ -55,6 +57,8 @@ const deployDks =
   (app.node.tryGetContext('deployDks') as string | undefined) === 'true';
 const deployOmni =
   (app.node.tryGetContext('deployOmni') as string | undefined) === 'true';
+const deployGemma =
+  (app.node.tryGetContext('deployGemma') as string | undefined) === 'true';
 const omniDomain =
   (app.node.tryGetContext('omniDomain') as string | undefined) ?? 'omni.qrucible.ai';
 
@@ -81,6 +85,22 @@ const networkStack = new ForgeNetworkStack(app, `ForgeNetwork-${env}`, {
 });
 
 // -- MODE 1: App-only (Fargate) ----------------------------------------------
+// -- Gemma GPU Stack (optional, self-hosted inference) -------------------------
+let gemmaStack: ForgeGemmaStack | undefined;
+if (deployGemma) {
+  gemmaStack = new ForgeGemmaStack(app, `ForgeGemma-${env}`, {
+    env: awsEnv,
+    description: 'FORGE Gemma 4 GPU Inference -- g6.2xlarge, vLLM, internal NLB',
+    forgeEnv: env,
+    vpc: networkStack.vpc,
+    ecsSecurityGroup: networkStack.ecsSecurityGroup,
+    privateSubnets: networkStack.privateSubnets,
+    publicSubnets: networkStack.publicSubnets,
+    tags: sharedTags,
+  });
+  gemmaStack.addDependency(networkStack);
+}
+
 if (deployApp) {
   const appStack = new ForgeAppStack(app, `ForgeApp-${env}`, {
     env: awsEnv,
@@ -95,9 +115,14 @@ if (deployApp) {
     omniDomainName: omniDomain,
     hostedZoneDomain: appDomain.split('.').slice(-2).join('.'), // e.g., 'qrucible.ai'
     deployDks,
+    deployGemma,
+    gemmaEndpoint: gemmaStack?.gemmaEndpoint,
     tags: sharedTags,
   });
   appStack.addDependency(networkStack);
+  if (gemmaStack) {
+    appStack.addDependency(gemmaStack);
+  }
 }
 
 // -- OMNI PicoGK Fountain Pen Generator (Fargate) ----------------------------
