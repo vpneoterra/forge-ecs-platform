@@ -1,0 +1,133 @@
+name: Run DKS ECS Task
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_type:
+        description: 'Task to run'
+        required: true
+        type: choice
+        options:
+          - download-fusion360
+          - ingest-fusion360
+          - custom
+      custom_command:
+        description: 'Custom command (only for task_type=custom)'
+        required: false
+        default: ''
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER: forge-app-dev
+  SUBNET: subnet-0cf05d1da402a138c
+  SECURITY_GROUP: sg-0871ce467d6c10739
+
+jobs:
+  run-task:
+    name: Run DKS ${{ github.event.inputs.task_type }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run download-fusion360 task
+        if: github.event.inputs.task_type == 'download-fusion360'
+        run: |
+          TASK_DEF=$(aws ecs list-task-definitions --family-prefix dks-download --sort DESC --max-items 1 --query 'taskDefinitionArns[0]' --output text)
+          echo "Using task definition: $TASK_DEF"
+          
+          TASK_ARN=$(aws ecs run-task \
+            --cluster ${{ env.CLUSTER }} \
+            --task-definition "$TASK_DEF" \
+            --launch-type FARGATE \
+            --platform-version LATEST \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ env.SUBNET }}],securityGroups=[${{ env.SECURITY_GROUP }}],assignPublicIp=DISABLED}" \
+            --overrides '{
+              "containerOverrides": [{
+                "name": "dks-download",
+                "command": ["sh", "-c", "yum install -y p7zip && mkdir -p /data/datasets/fusion360/j1.0.0 && cd /data/datasets/fusion360/j1.0.0 && echo Downloading Fusion 360 j1.0.0 dataset... && aws s3 cp s3://fusion-360-gallery-dataset/assembly/j1.0.0/j1.0.0.7z j1.0.0.7z --region us-west-2 --no-sign-request && echo Download complete. Size: && ls -lh j1.0.0.7z && echo Extracting... && 7za x j1.0.0.7z -y && rm j1.0.0.7z && echo Extraction complete. Files: && find . -type f | wc -l"]
+              }]
+            }' \
+            --query 'tasks[0].taskArn' --output text)
+          
+          echo "Task started: $TASK_ARN"
+          echo "task_arn=$TASK_ARN" >> $GITHUB_ENV
+          
+          # Wait for task to complete (timeout after 60 minutes)
+          echo "Waiting for task to complete..."
+          aws ecs wait tasks-stopped \
+            --cluster ${{ env.CLUSTER }} \
+            --tasks "$TASK_ARN" || true
+          
+          # Check task result
+          RESULT=$(aws ecs describe-tasks \
+            --cluster ${{ env.CLUSTER }} \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].{status:lastStatus,stopCode:stopCode,stopReason:stoppedReason,exitCode:containers[0].exitCode}' \
+            --output json)
+          echo "Task result: $RESULT"
+          
+          EXIT_CODE=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('exitCode',1))")
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "Task failed with exit code $EXIT_CODE"
+            exit 1
+          fi
+
+      - name: Run ingest-fusion360 task
+        if: github.event.inputs.task_type == 'ingest-fusion360'
+        run: |
+          TASK_DEF=$(aws ecs list-task-definitions --family-prefix dks-ingest --sort DESC --max-items 1 --query 'taskDefinitionArns[0]' --output text)
+          echo "Using task definition: $TASK_DEF"
+          
+          TASK_ARN=$(aws ecs run-task \
+            --cluster ${{ env.CLUSTER }} \
+            --task-definition "$TASK_DEF" \
+            --launch-type FARGATE \
+            --platform-version LATEST \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ env.SUBNET }}],securityGroups=[${{ env.SECURITY_GROUP }}],assignPublicIp=DISABLED}" \
+            --overrides '{
+              "containerOverrides": [{
+                "name": "dks-ingest",
+                "command": ["python", "-m", "dks", "--fusion360", "/data/datasets/fusion360/j1.0.0/joint/", "--output", "/data/chunks", "--embed", "--pgvector", "--workers", "4"]
+              }]
+            }' \
+            --query 'tasks[0].taskArn' --output text)
+          
+          echo "Task started: $TASK_ARN"
+          echo "task_arn=$TASK_ARN" >> $GITHUB_ENV
+          
+          # Wait for task to complete (timeout after 6 hours for large ingestion)
+          echo "Waiting for task to complete (this may take hours)..."
+          TIMEOUT=21600  # 6 hours
+          ELAPSED=0
+          INTERVAL=60
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            STATUS=$(aws ecs describe-tasks \
+              --cluster ${{ env.CLUSTER }} \
+              --tasks "$TASK_ARN" \
+              --query 'tasks[0].lastStatus' --output text)
+            echo "[$ELAPSED s] Task status: $STATUS"
+            if [ "$STATUS" = "STOPPED" ]; then
+              break
+            fi
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+          
+          # Check task result
+          RESULT=$(aws ecs describe-tasks \
+            --cluster ${{ env.CLUSTER }} \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].{status:lastStatus,stopCode:stopCode,stopReason:stoppedReason,exitCode:containers[0].exitCode}' \
+            --output json)
+          echo "Task result: $RESULT"
+          
+          EXIT_CODE=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('exitCode',1))")
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "Task failed with exit code $EXIT_CODE"
+            exit 1
+          fi
