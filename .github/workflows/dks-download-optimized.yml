@@ -1,0 +1,131 @@
+name: "DKS: Optimized Download"
+
+on:
+  workflow_dispatch:
+    inputs:
+      stop_task_id:
+        description: "ECS task ID to stop first (leave empty to skip)"
+        required: false
+        default: ""
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER: forge-app-dev
+  PRIVATE_SUBNET: subnet-0cf05d1da402a138c
+  SECURITY_GROUP: sg-0871ce467d6c10739
+
+jobs:
+  download:
+    name: Optimized Fusion 360 download
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Stop old task
+        if: inputs.stop_task_id != ''
+        run: |
+          TASK_ARN="arn:aws:ecs:${{ env.AWS_REGION }}:266087050444:task/${{ env.CLUSTER }}/${{ inputs.stop_task_id }}"
+          echo "Stopping: $TASK_ARN"
+          aws ecs stop-task --cluster ${{ env.CLUSTER }} --task "$TASK_ARN" \
+            --reason "Relaunching with public subnet for faster download" 2>&1 || echo "Stop failed (may already be stopped)"
+          sleep 5
+
+      - name: Discover public subnet
+        id: network
+        run: |
+          # Get public subnets from CloudFormation export
+          PUBLIC_SUBNETS=$(aws cloudformation list-exports \
+            --query "Exports[?Name=='ForgePublicSubnetIds-dev'].Value" --output text 2>/dev/null || echo "")
+          
+          if [ -z "$PUBLIC_SUBNETS" ]; then
+            # Fallback: find public subnets in the VPC
+            VPC_ID=$(aws ec2 describe-subnets --subnet-ids ${{ env.PRIVATE_SUBNET }} \
+              --query 'Subnets[0].VpcId' --output text)
+            PUBLIC_SUBNETS=$(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=$VPC_ID" "Name=map-public-ip-on-launch,Values=true" \
+              --query 'Subnets[0].SubnetId' --output text)
+          else
+            # Take first subnet from comma-separated list
+            PUBLIC_SUBNETS=$(echo "$PUBLIC_SUBNETS" | cut -d',' -f1)
+          fi
+          
+          echo "Public subnet: $PUBLIC_SUBNETS"
+          echo "subnet=$PUBLIC_SUBNETS" >> $GITHUB_OUTPUT
+
+      - name: Launch download task (public subnet + public IP)
+        id: launch
+        run: |
+          TASK_DEF=$(aws ecs list-task-definitions --family-prefix dks-download --sort DESC \
+            --max-items 1 --query 'taskDefinitionArns[0]' --output text)
+          echo "Task definition: $TASK_DEF"
+          
+          PUBLIC_SUBNET="${{ steps.network.outputs.subnet }}"
+          echo "Using public subnet: $PUBLIC_SUBNET with assignPublicIp=ENABLED"
+          
+          # Optimized command:
+          # 1. Minimal apt install (quiet)
+          # 2. Check if data already exists on EFS
+          # 3. Download with retry and progress
+          # 4. Extract with 7z
+          TASK_ARN=$(aws ecs run-task \
+            --cluster ${{ env.CLUSTER }} \
+            --task-definition "$TASK_DEF" \
+            --launch-type FARGATE \
+            --platform-version LATEST \
+            --network-configuration "awsvpcConfiguration={subnets=[$PUBLIC_SUBNET],securityGroups=[${{ env.SECURITY_GROUP }}],assignPublicIp=ENABLED}" \
+            --overrides '{
+              "containerOverrides": [{
+                "name": "downloader",
+                "command": ["bash", "-c", "set -euo pipefail; echo \"=== DKS Fusion 360 Download (optimized) ===\"; echo \"Time: $(date -u)\"; apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl p7zip-full >/dev/null 2>&1; echo \"Tools installed.\"; mkdir -p /data/datasets/fusion360/j1.0.0; cd /data/datasets/fusion360/j1.0.0; if [ -d joint ] && [ $(find joint -name *.json 2>/dev/null | wc -l) -gt 100 ]; then echo \"Dataset already on EFS! Files:\"; find joint -name *.json | wc -l; exit 0; fi; echo \"Downloading j1.0.0.7z (2.8 GB)...\"; time curl -fSL --retry 3 --connect-timeout 30 -o j1.0.0.7z https://fusion-360-gallery-dataset.s3.us-west-2.amazonaws.com/assembly/j1.0.0/j1.0.0.7z; ls -lh j1.0.0.7z; echo \"Extracting...\"; time 7z x j1.0.0.7z -y; rm -f j1.0.0.7z; echo \"Done! JSON files:\"; find . -name *.json | wc -l; du -sh ."]
+              }]
+            }' \
+            --query 'tasks[0].taskArn' --output text)
+          
+          echo "Task started: $TASK_ARN"
+          TASK_ID=$(echo "$TASK_ARN" | rev | cut -d'/' -f1 | rev)
+          echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
+          echo "task_id=$TASK_ID" >> $GITHUB_OUTPUT
+          echo "::notice::New task ID: $TASK_ID"
+
+      - name: Wait for RUNNING
+        run: |
+          TASK_ARN="${{ steps.launch.outputs.task_arn }}"
+          for i in $(seq 1 30); do
+            STATUS=$(aws ecs describe-tasks --cluster ${{ env.CLUSTER }} --tasks "$TASK_ARN" \
+              --query 'tasks[0].lastStatus' --output text 2>/dev/null || echo "PENDING")
+            echo "[$((i*10))s] $STATUS"
+            [ "$STATUS" = "RUNNING" ] || [ "$STATUS" = "STOPPED" ] && break
+            sleep 10
+          done
+
+      - name: Monitor until complete
+        run: |
+          TASK_ARN="${{ steps.launch.outputs.task_arn }}"
+          TIMEOUT=7200
+          ELAPSED=0
+          
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            STATUS=$(aws ecs describe-tasks --cluster ${{ env.CLUSTER }} --tasks "$TASK_ARN" \
+              --query 'tasks[0].lastStatus' --output text 2>/dev/null || echo "UNKNOWN")
+            echo "[$((ELAPSED/60))m] $STATUS"
+            
+            if [ "$STATUS" = "STOPPED" ]; then
+              RESULT=$(aws ecs describe-tasks --cluster ${{ env.CLUSTER }} --tasks "$TASK_ARN" \
+                --query 'tasks[0].{exit:containers[0].exitCode,reason:stoppedReason}' --output json)
+              echo "Result: $RESULT"
+              EXIT=$(echo "$RESULT" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r.get('exit',1))")
+              [ "$EXIT" = "0" ] && echo "::notice::Download complete!" && exit 0
+              echo "::error::Failed with exit $EXIT"
+              exit 1
+            fi
+            
+            sleep 30
+            ELAPSED=$((ELAPSED + 30))
+          done
+          echo "::warning::Timeout reached. Task ID: ${{ steps.launch.outputs.task_id }}"
