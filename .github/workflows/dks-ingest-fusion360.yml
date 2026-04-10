@@ -1,0 +1,108 @@
+name: "DKS: Download + Ingest Fusion 360"
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER: forge-app-dev
+  SECURITY_GROUP: sg-0871ce467d6c10739
+
+jobs:
+  ingest:
+    name: Download & Ingest Fusion 360 Dataset
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Find public subnet
+        id: net
+        run: |
+          SUBNET=$(aws cloudformation list-exports \
+            --query "Exports[?Name=='ForgePublicSubnetIds-dev'].Value" --output text | cut -d',' -f1)
+          echo "subnet=$SUBNET" >> $GITHUB_OUTPUT
+          echo "Public subnet: $SUBNET"
+
+      - name: Launch combined download+ingest task
+        id: launch
+        run: |
+          TASK_DEF=$(aws ecs list-task-definitions --family-prefix dks-ingest --sort DESC \
+            --max-items 1 --query 'taskDefinitionArns[0]' --output text)
+          echo "Task definition: $TASK_DEF"
+
+          # Combined command:
+          # 1. Install download tools into miniconda container
+          # 2. Download 7z to /tmp (fast ephemeral storage, not EFS)
+          # 3. Extract to /tmp
+          # 4. Run DKS parser → writes directly to Supabase pgvector
+          TASK_ARN=$(aws ecs run-task \
+            --cluster ${{ env.CLUSTER }} \
+            --task-definition "$TASK_DEF" \
+            --launch-type FARGATE \
+            --platform-version LATEST \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ steps.net.outputs.subnet }}],securityGroups=[${{ env.SECURITY_GROUP }}],assignPublicIp=ENABLED}" \
+            --overrides '{
+              "containerOverrides": [{
+                "name": "dks-ingest",
+                "command": ["bash", "-c", "set -euo pipefail; echo \"=== FORGE DKS: Combined Download + Ingest ===\"; echo \"Started: $(date -u)\"; echo \"Step 1: Installing download tools...\"; apt-get update -qq 2>/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl p7zip-full >/dev/null 2>&1 || conda install -c conda-forge p7zip curl -y -q 2>/dev/null; echo \"Tools ready: $(date -u)\"; echo \"Step 2: Downloading j1.0.0.7z (2.8 GB) to /tmp...\"; cd /tmp; time curl -fSL --retry 3 --connect-timeout 30 -o j1.0.0.7z https://fusion-360-gallery-dataset.s3.us-west-2.amazonaws.com/assembly/j1.0.0/j1.0.0.7z; ls -lh j1.0.0.7z; echo \"Download done: $(date -u)\"; echo \"Step 3: Extracting to /tmp/fusion360...\"; mkdir -p /tmp/fusion360; cd /tmp/fusion360; time 7z x /tmp/j1.0.0.7z -y; rm -f /tmp/j1.0.0.7z; echo \"Extracted. JSON files:\"; JOINT_DIR=$(find /tmp/fusion360 -type d -name joint | head -1); if [ -z \"$JOINT_DIR\" ]; then JOINT_DIR=/tmp/fusion360; fi; find $JOINT_DIR -name *.json | wc -l; echo \"Extract done: $(date -u)\"; echo \"Step 4: Running DKS ingestion...\"; cd /app; python -m dks --fusion360 $JOINT_DIR --output /tmp/chunks --embed --pgvector --workers 4; echo \"=== INGESTION COMPLETE: $(date -u) ===\""]
+              }]
+            }' \
+            --query 'tasks[0].taskArn' --output text)
+
+          TASK_ID=$(echo "$TASK_ARN" | rev | cut -d'/' -f1 | rev)
+          echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
+          echo "task_id=$TASK_ID" >> $GITHUB_OUTPUT
+          echo "::notice::Task ID: $TASK_ID"
+          echo "Task started: $TASK_ARN"
+
+      - name: Wait for task to start
+        run: |
+          TASK_ARN="${{ steps.launch.outputs.task_arn }}"
+          for i in $(seq 1 30); do
+            STATUS=$(aws ecs describe-tasks --cluster ${{ env.CLUSTER }} --tasks "$TASK_ARN" \
+              --query 'tasks[0].lastStatus' --output text 2>/dev/null || echo "PENDING")
+            echo "[$((i*10))s] $STATUS"
+            [ "$STATUS" = "RUNNING" ] || [ "$STATUS" = "STOPPED" ] && break
+            sleep 10
+          done
+
+      - name: Monitor until complete (timeout 2h)
+        run: |
+          TASK_ARN="${{ steps.launch.outputs.task_arn }}"
+          TIMEOUT=7200
+          ELAPSED=0
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            STATUS=$(aws ecs describe-tasks --cluster ${{ env.CLUSTER }} --tasks "$TASK_ARN" \
+              --query 'tasks[0].lastStatus' --output text 2>/dev/null || echo "UNKNOWN")
+            echo "[$((ELAPSED/60))m] $STATUS"
+            if [ "$STATUS" = "STOPPED" ]; then
+              RESULT=$(aws ecs describe-tasks --cluster ${{ env.CLUSTER }} --tasks "$TASK_ARN" \
+                --query 'tasks[0].{exit:containers[0].exitCode,reason:stoppedReason}' --output json)
+              echo "Result: $RESULT"
+              EXIT=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('exit',1))")
+              [ "$EXIT" = "0" ] && echo "::notice::Ingestion complete!" && exit 0
+              echo "::error::Failed with exit $EXIT"
+              
+              # Try to get CloudWatch logs for debugging
+              echo "=== Recent logs ==="
+              LOG_GROUP="/forge/ecs/dks-ingest"
+              STREAMS=$(aws logs describe-log-streams --log-group-name "$LOG_GROUP" \
+                --order-by LastEventTime --descending --limit 1 \
+                --query 'logStreams[0].logStreamName' --output text 2>/dev/null || echo "")
+              if [ -n "$STREAMS" ] && [ "$STREAMS" != "None" ]; then
+                aws logs get-log-events --log-group-name "$LOG_GROUP" \
+                  --log-stream-name "$STREAMS" --limit 50 \
+                  --query 'events[*].message' --output text 2>/dev/null | tail -30
+              fi
+              exit 1
+            fi
+            sleep 30
+            ELAPSED=$((ELAPSED + 30))
+          done
+          echo "::warning::Timeout. Task: ${{ steps.launch.outputs.task_id }}"
