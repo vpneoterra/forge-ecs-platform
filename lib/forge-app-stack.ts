@@ -40,6 +40,7 @@ import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
 import * as efs from 'aws-cdk-lib/aws-efs';
+import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Construct } from 'constructs';
 
 export interface ForgeAppStackProps extends cdk.StackProps {
@@ -245,6 +246,21 @@ export class ForgeAppStack extends cdk.Stack {
 
     container.addPortMappings({ containerPort: 3000 });
 
+    // -- Monitoring sidecar -- polls internal endpoints, pushes custom metrics --
+    // essential: false so a sidecar crash does not kill the main task
+    taskDef.addContainer('forge-monitor-sidecar', {
+      image: ecs.ContainerImage.fromRegistry('amazon/cloudwatch-agent:latest'),
+      essential: false,
+      environment: {
+        FORGE_APP_URL: 'http://localhost:3000',
+      },
+      logging: ecs.LogDrivers.awsLogs({
+        logGroup,
+        streamPrefix: 'forge-monitor',
+      }),
+      memoryReservationMiB: 64,
+    });
+
     // -- ALB requires 2 AZs -- ensure we have enough public subnets -----------
     // Dev VPC may have only 1 AZ; create a second public subnet if needed.
     let albSubnets: ec2.ISubnet[] = [...props.publicSubnets];
@@ -275,6 +291,22 @@ export class ForgeAppStack extends cdk.Stack {
       vpcSubnets: { subnets: albSubnets },
       idleTimeout: cdk.Duration.seconds(600),  // I2D pipeline: 7 phases × solver steps
     });
+
+    // -- ALB Access Logs → S3 ------------------------------------------------
+    // Bucket lives here (in ForgeAppStack) because CDK's logAccessLogs() must
+    // be called on the same stack that created the ALB construct. The bucket
+    // name is exported so the monitoring stack and ops workflows can reference
+    // it without a cross-stack circular dependency.
+    const accessLogBucket = new s3.Bucket(this, 'AlbAccessLogs', {
+      bucketName: `forge-alb-access-logs-${this.account}-${this.region}`,
+      lifecycleRules: [{
+        expiration: cdk.Duration.days(90),
+      }],
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+    this.alb.logAccessLogs(accessLogBucket, 'forge-app');
 
     // -- ACM Certificate (DNS validated via Route 53 -- fully automatic) ------
     // Single certificate covers both forge.qrucible.ai and omni.qrucible.ai
@@ -737,6 +769,19 @@ export class ForgeAppStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'CertificateArn', {
       value: certificate.certificateArn,
       description: 'ACM certificate ARN (auto-validated via Route 53)',
+    });
+
+    // -- Exports for monitoring stack ----------------------------------------
+    new cdk.CfnOutput(this, 'AlbFullName', {
+      value: this.alb.loadBalancerFullName,
+      description: 'ALB full name for CloudWatch metrics (used by ForgeMonitoringStack)',
+      exportName: `ForgeTestAlbFullName-${props.forgeEnv}`,
+    });
+
+    new cdk.CfnOutput(this, 'AlbAccessLogBucketName', {
+      value: accessLogBucket.bucketName,
+      description: 'S3 bucket name for ALB access logs (90-day lifecycle)',
+      exportName: `ForgeAlbAccessLogBucket-${props.forgeEnv}`,
     });
   }
 }

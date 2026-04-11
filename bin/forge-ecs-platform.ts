@@ -41,13 +41,16 @@ import { ForgeOmniStack } from '../lib/forge-omni-stack';
 import { ForgeGemmaStack } from '../lib/forge-gemma-stack';
 import { ForgeOrchestrationStack } from '../lib/forge-orchestration-stack';
 import { ForgeGeometryStack } from '../lib/forge-geometry-stack';
+import { ForgeMonitoringStack } from '../lib/forge-monitoring-stack';
 
 const app = new cdk.App();
 
 // -- Resolve context ---------------------------------------------------------
 const env = (app.node.tryGetContext('env') as string | undefined) ?? 'dev';
 const alertEmail =
-  (app.node.tryGetContext('alertEmail') as string | undefined) ?? 'ops@forge.local';
+  (app.node.tryGetContext('alertEmail') as string | undefined) ?? 'vpacha@qrucible.ai';
+const alertEmail2 =
+  (app.node.tryGetContext('alertEmail2') as string | undefined);
 const skipRds =
   (app.node.tryGetContext('skipRds') as string | undefined) === 'true';
 const deployApp =
@@ -128,6 +131,20 @@ if (deployApp) {
   if (gemmaStack) {
     appStack.addDependency(gemmaStack);
   }
+
+  // -- Monitoring Stack (observability for the app stack) --------------------
+  const monitoringStack = new ForgeMonitoringStack(app, `ForgeMonitoring-${env}`, {
+    env: awsEnv,
+    description: 'FORGE Observability -- SNS alerts, CloudWatch 5xx alarm, EventBridge ECS events',
+    forgeEnv: env,
+    alb: appStack.alb,
+    ecsCluster: appStack.ecsCluster,
+    ecsServiceName: appStack.serviceName,
+    alertEmail,
+    alertEmail2,
+    tags: sharedTags,
+  });
+  monitoringStack.addDependency(appStack);
 }
 
 // -- OMNI PicoGK Fountain Pen Generator (Fargate) ----------------------------

@@ -1,0 +1,402 @@
+# ============================================================
+# deploy-app.yml — Deploy to ECS after image build succeeds
+# Chains: CI ✓ → Build Images ✓ → Deploy App
+# Also supports manual dispatch for rollback/re-deploy.
+# Target: 1–3 minutes (just task def + force-new-deployment).
+# ============================================================
+name: Deploy App
+
+on:
+  workflow_run:
+    workflows: [Build Images]
+    types: [completed]
+    branches: [main, test]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag (commit SHA) to deploy — leave blank for latest'
+        required: false
+        type: string
+
+concurrency:
+  group: deploy-app-test
+  cancel-in-progress: false          # don't cancel mid-deploy
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO: forge-app-test
+  ECS_CLUSTER: forge-app-dev
+  ECS_SERVICE: forge-app-test
+
+jobs:
+  deploy:
+    name: Deploy to ECS (test)
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    timeout-minutes: 30
+    environment: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve image tag
+        id: resolve
+        run: |
+          # Manual dispatch can override; otherwise use the build commit
+          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
+            TAG="${{ github.event.inputs.image_tag }}"
+          elif [ -n "${{ github.event.workflow_run.head_sha }}" ]; then
+            TAG="${{ github.event.workflow_run.head_sha }}"
+          else
+            TAG="${{ github.sha }}"
+          fi
+          REGISTRY="${{ steps.ecr-login.outputs.registry }}"
+          echo "image_uri=${REGISTRY}/${{ env.ECR_REPO }}:${TAG}" >> $GITHUB_OUTPUT
+          echo "omni_uri=${REGISTRY}/forge-omni:${TAG}" >> $GITHUB_OUTPUT
+          echo "image_tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "Deploying tag: ${TAG}"
+
+      # ── App service ─────────────────────────────────────────
+      - name: Update app ECS task definition
+        id: update-app-td
+        env:
+          CLUSTER: ${{ env.ECS_CLUSTER }}
+          IMAGE_URI: ${{ steps.resolve.outputs.image_uri }}
+          IMAGE_TAG: ${{ steps.resolve.outputs.image_tag }}
+        run: |
+          echo "Cluster: ${CLUSTER}"
+          echo "Service: ${{ env.ECS_SERVICE }}"
+          echo "Image:   ${IMAGE_URI}"
+
+          CURRENT_TD=$(aws ecs describe-services \
+            --cluster "${CLUSTER}" \
+            --services "${{ env.ECS_SERVICE }}" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          echo "Current task definition: ${CURRENT_TD}"
+
+          aws ecs describe-task-definition \
+            --task-definition "${CURRENT_TD}" \
+            --query 'taskDefinition' > /tmp/td.json
+
+          python3 -c "
+          import json, os
+          with open('/tmp/td.json') as f:
+            td = json.load(f)
+          td['containerDefinitions'][0]['image'] = os.environ['IMAGE_URI']
+          # Merge env vars from repo task-definition file
+          try:
+            with open('.aws/task-definition-test.json') as f:
+              repo_td = json.load(f)
+            repo_envs = {e['name']: e['value'] for e in repo_td.get('containerDefinitions', [{}])[0].get('environment', [])}
+            existing_envs = {e['name']: e for e in td['containerDefinitions'][0].get('environment', [])}
+            for name, value in repo_envs.items():
+              if name in existing_envs:
+                existing_envs[name]['value'] = value
+              else:
+                td['containerDefinitions'][0].setdefault('environment', []).append({'name': name, 'value': value})
+            print(f'Merged {len(repo_envs)} env vars from .aws/task-definition-test.json')
+            # Merge secrets from repo task-definition file
+            repo_secrets = {s['name']: s['valueFrom'] for s in repo_td.get('containerDefinitions', [{}])[0].get('secrets', [])}
+            existing_secrets = {s['name']: s for s in td['containerDefinitions'][0].get('secrets', [])}
+            for name, value_from in repo_secrets.items():
+              if name in existing_secrets:
+                existing_secrets[name]['valueFrom'] = value_from
+              else:
+                td['containerDefinitions'][0].setdefault('secrets', []).append({'name': name, 'valueFrom': value_from})
+            print(f'Merged {len(repo_secrets)} secrets from .aws/task-definition-test.json')
+          except Exception as e:
+            print(f'Warning: Could not merge repo task-definition: {e}')
+          # Inject IMAGE_TAG
+          image_tag = os.environ.get('IMAGE_TAG', '')
+          if image_tag:
+            env_list = td['containerDefinitions'][0].setdefault('environment', [])
+            existing = {e['name']: e for e in env_list}
+            if 'IMAGE_TAG' in existing:
+              existing['IMAGE_TAG']['value'] = image_tag
+            else:
+              env_list.append({'name': 'IMAGE_TAG', 'value': image_tag})
+            print(f'Injected IMAGE_TAG={image_tag}')
+          # Add forge-monitor-sidecar container (CloudWatch agent)
+          # Add monitoring sidecar container
+          sidecar = {
+            'name': 'forge-monitor-sidecar',
+            'image': 'amazon/cloudwatch-agent:latest',
+            'essential': False,
+            'environment': [
+              {'name': 'FORGE_APP_URL', 'value': 'http://localhost:3000'}
+            ],
+            'logConfiguration': {
+              'logDriver': 'awslogs',
+              'options': {
+                'awslogs-group': '/forge/ecs/forge-app-test',
+                'awslogs-region': 'us-east-1',
+                'awslogs-stream-prefix': 'forge-monitor'
+              }
+            }
+          }
+          # Replace existing sidecar if present, otherwise append
+          existing_names = [c['name'] for c in td['containerDefinitions']]
+          if 'forge-monitor-sidecar' in existing_names:
+            idx = existing_names.index('forge-monitor-sidecar')
+            td['containerDefinitions'][idx] = sidecar
+            print('Updated existing forge-monitor-sidecar container')
+          else:
+            td['containerDefinitions'].append(sidecar)
+            print('Added forge-monitor-sidecar container')
+          for key in ['taskDefinitionArn', 'revision', 'status', 'requiresAttributes', 'compatibilities', 'registeredAt', 'registeredBy']:
+            td.pop(key, None)
+          with open('/tmp/new-td.json', 'w') as f:
+            json.dump(td, f)
+          "
+
+          NEW_TD_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/new-td.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "New task definition: ${NEW_TD_ARN}"
+          echo "new_td_arn=${NEW_TD_ARN}" >> $GITHUB_OUTPUT
+
+          aws ecs update-service \
+            --cluster "${CLUSTER}" \
+            --service "${{ env.ECS_SERVICE }}" \
+            --task-definition "${NEW_TD_ARN}" \
+            --force-new-deployment
+
+          echo "App deployment triggered"
+
+      # ── OMNI service ────────────────────────────────────────
+      - name: Update OMNI ECS service
+        env:
+          CLUSTER: ${{ env.ECS_CLUSTER }}
+          OMNI_URI: ${{ steps.resolve.outputs.omni_uri }}
+        run: |
+          if [ -z "$OMNI_URI" ]; then
+            echo "No OMNI image — skipping"
+            exit 0
+          fi
+
+          CURRENT_TD=$(aws ecs describe-services \
+            --cluster "${CLUSTER}" \
+            --services "forge-omni" \
+            --query 'services[0].taskDefinition' \
+            --output text 2>/dev/null) || true
+
+          if [ -z "$CURRENT_TD" ] || [ "$CURRENT_TD" = "None" ]; then
+            echo "OMNI service not yet created by CDK — skipping"
+            exit 0
+          fi
+
+          aws ecs describe-task-definition \
+            --task-definition "${CURRENT_TD}" \
+            --query 'taskDefinition' > /tmp/omni-td.json
+
+          python3 -c "
+          import json, os
+          with open('/tmp/omni-td.json') as f:
+            td = json.load(f)
+          td['containerDefinitions'][0]['image'] = os.environ['OMNI_URI']
+          for key in ['taskDefinitionArn', 'revision', 'status', 'requiresAttributes', 'compatibilities', 'registeredAt', 'registeredBy']:
+            td.pop(key, None)
+          with open('/tmp/new-omni-td.json', 'w') as f:
+            json.dump(td, f)
+          "
+
+          NEW_TD_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/new-omni-td.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          aws ecs update-service \
+            --cluster "${CLUSTER}" \
+            --service "forge-omni" \
+            --task-definition "${NEW_TD_ARN}" \
+            --force-new-deployment
+
+          echo "OMNI deployment triggered"
+
+      # ── Wait & verify ───────────────────────────────────────
+      - name: Wait for service stability
+        run: |
+          echo "Waiting for ECS service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_SERVICE }}" || {
+            echo "Warning: Service may still be stabilizing"
+            aws ecs describe-services \
+              --cluster "${{ env.ECS_CLUSTER }}" \
+              --services "${{ env.ECS_SERVICE }}" \
+              --query 'services[0].events[:5]' \
+              --output table
+          }
+
+      - name: Verify deployment was not rolled back
+        env:
+          EXPECTED_TD: ${{ steps.update-app-td.outputs.new_td_arn }}
+        run: |
+          echo "Expected task definition: ${EXPECTED_TD}"
+
+          DEPLOY_INFO=$(aws ecs describe-services \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_SERVICE }}" \
+            --query 'services[0].deployments[?status==`PRIMARY`] | [0]' \
+            --output json)
+
+          PRIMARY_TD=$(echo "$DEPLOY_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin).get('taskDefinition',''))")
+          ROLLOUT_STATE=$(echo "$DEPLOY_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin).get('rolloutState','UNKNOWN'))")
+
+          echo "PRIMARY task definition: ${PRIMARY_TD}"
+          echo "Rollout state: ${ROLLOUT_STATE}"
+
+          if [ "$ROLLOUT_STATE" = "FAILED" ]; then
+            echo "::error::Deployment FAILED — ECS circuit breaker rolled back the deployment"
+            exit 1
+          fi
+
+          if [ "$PRIMARY_TD" != "$EXPECTED_TD" ]; then
+            echo "::error::Deployment rolled back — PRIMARY task def (${PRIMARY_TD}) does not match expected (${EXPECTED_TD})"
+            exit 1
+          fi
+
+          echo "Deployment verified: PRIMARY deployment is running the expected task definition"
+
+      - name: Health check & summary
+        if: always()
+        run: |
+          sleep 15
+
+          # Resolve ALB DNS from CloudFormation
+          ALB_DNS=$(aws cloudformation describe-stacks \
+            --stack-name ForgeApp-dev \
+            --query "Stacks[0].Outputs[?ExportName=='ForgeTestAlbDns-dev'].OutputValue" \
+            --output text 2>/dev/null || echo "pending")
+
+          if [ -n "$ALB_DNS" ] && [ "$ALB_DNS" != "None" ] && [ "$ALB_DNS" != "pending" ]; then
+            echo "Testing ALB endpoint: https://${ALB_DNS}/health"
+            curl --fail --silent --retry 5 --retry-delay 10 -L "https://${ALB_DNS}/health" || \
+              echo "Warning: Health check pending (service may still be starting)"
+          fi
+
+          {
+            echo "### Deployment Summary (test)"
+            echo "- Service: \`${{ env.ECS_SERVICE }}\`"
+            echo "- Image: \`${{ steps.resolve.outputs.image_uri }}\`"
+            echo "- OMNI: \`${{ steps.resolve.outputs.omni_uri }}\`"
+            echo "- ALB: \`${ALB_DNS}\`"
+            echo "- Domain: \`forge.qrucible.ai\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Post-deploy hooks ─────────────────────────────────────
+      - name: Enable ECS Exec for live debugging
+        if: success()
+        run: |
+          echo "Enabling ECS Exec on forge-app-test service..."
+          aws ecs update-service \
+            --cluster forge-app-dev \
+            --service forge-app-test \
+            --enable-execute-command \
+            --no-cli-pager || echo "ECS Exec enablement failed (non-fatal)"
+          echo "✅ ECS Exec enabled. Connect with:"
+          echo "  TASK_ID=\$(aws ecs list-tasks --cluster forge-app-dev --service-name forge-app-test --query 'taskArns[0]' --output text)"
+          echo "  aws ecs execute-command --cluster forge-app-dev --task \$TASK_ID --container forge-app --interactive --command /bin/sh"
+
+      - name: Create/update CloudWatch 5xx alarm
+        if: success()
+        run: |
+          echo "Configuring 5xx rate alarm..."
+          aws cloudwatch put-metric-alarm \
+            --alarm-name forge-app-5xx-rate \
+            --namespace AWS/ApplicationELB \
+            --metric-name HTTPCode_Target_5XX_Count \
+            --statistic Sum \
+            --period 60 \
+            --threshold 10 \
+            --comparison-operator GreaterThanThreshold \
+            --evaluation-periods 2 \
+            --alarm-actions "${{ secrets.SNS_TOPIC_ARN || 'arn:aws:sns:us-east-1:266087050444:forge-deploy-alerts' }}" \
+            --no-cli-pager || echo "Alarm creation failed (non-fatal)"
+          echo "✅ CloudWatch 5xx alarm configured"
+
+      - name: Post-deploy smoke tests
+        if: success()
+        run: |
+          echo "Running post-deploy smoke tests against forge.qrucible.ai..."
+          DOMAIN="https://forge.qrucible.ai"
+          FAILED=0
+
+          # Health check
+          echo -n "  /health ... "
+          if curl -sf "$DOMAIN/health" | jq -e '.status' > /dev/null 2>&1; then
+            echo "✅"
+          else
+            echo "❌"
+            FAILED=$((FAILED + 1))
+          fi
+
+          # Design Studio API
+          echo -n "  /api/design-studio/project-config/test ... "
+          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "$DOMAIN/api/design-studio/project-config/test" || echo "000")
+          if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 500 ]; then
+            echo "✅ ($STATUS)"
+          else
+            echo "❌ ($STATUS)"
+            FAILED=$((FAILED + 1))
+          fi
+
+          # Traces API
+          echo -n "  /api/traces ... "
+          if curl -sf "$DOMAIN/api/traces" | jq -e '.total' > /dev/null 2>&1; then
+            echo "✅"
+          else
+            echo "❌"
+            FAILED=$((FAILED + 1))
+          fi
+
+          # BomGen health
+          echo -n "  /api/bomgen/health ... "
+          if curl -sf "$DOMAIN/api/bomgen/health" | jq -e '.status' > /dev/null 2>&1; then
+            echo "✅"
+          else
+            echo "❌"
+            FAILED=$((FAILED + 1))
+          fi
+
+          # DKS health (non-blocking — may not be deployed yet)
+          echo -n "  /api/knowledge/health ... "
+          if curl -sf "$DOMAIN/api/knowledge/health" | jq -e '.status' > /dev/null 2>&1; then
+            echo "✅"
+          else
+            echo "⚠️ (DKS not available — non-blocking)"
+          fi
+
+          # Monitor hub
+          echo -n "  /api/monitor/hub/health ... "
+          if curl -sf "$DOMAIN/api/monitor/hub/health" | jq -e '.status' > /dev/null 2>&1; then
+            echo "✅"
+          else
+            echo "❌"
+            FAILED=$((FAILED + 1))
+          fi
+
+          echo ""
+          if [ $FAILED -gt 0 ]; then
+            echo "❌ $FAILED smoke test(s) failed"
+            exit 1
+          fi
+          echo "✅ All smoke tests passed"
