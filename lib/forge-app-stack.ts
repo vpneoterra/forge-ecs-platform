@@ -115,6 +115,23 @@ export class ForgeAppStack extends cdk.Stack {
       'database-url',
     ];
 
+    // DKS-specific secrets (separate Supabase project: forge-dks)
+    const dksSecretNames = [
+      'dks-database-url',
+      'dks-supabase-url',
+      'dks-supabase-service-key',
+    ];
+
+    const dksSecrets: Record<string, ecs.Secret> = {};
+    for (const name of dksSecretNames) {
+      const secret = new secretsmanager.Secret(this, `Secret${name.replace(/-/g, '')}`, {
+        secretName: `forge/test/${name}`,
+        description: `DKS (forge-dks Supabase) -- ${name}`,
+      });
+      const envName = name.replace(/-/g, '_').toUpperCase();
+      dksSecrets[envName] = ecs.Secret.fromSecretsManager(secret);
+    }
+
     const secrets: Record<string, ecs.Secret> = {};
     for (const name of secretNames) {
       const secret = new secretsmanager.Secret(this, `Secret${name.replace(/-/g, '')}`, {
@@ -230,7 +247,13 @@ export class ForgeAppStack extends cdk.Stack {
         FIELD_DRIVEN_MIN_THICKNESS_MM: '0.3',
         FIELD_DRIVEN_MAX_THICKNESS_MM: '5.0',
       },
-      secrets,
+      secrets: {
+        ...secrets,
+        // DKS uses a separate Supabase project (forge-dks)
+        DKS_DATABASE_URL: dksSecrets['DKS_DATABASE_URL'],
+        DKS_SUPABASE_URL: dksSecrets['DKS_SUPABASE_URL'],
+        DKS_SUPABASE_SERVICE_KEY: dksSecrets['DKS_SUPABASE_SERVICE_KEY'],
+      },
       logging: ecs.LogDrivers.awsLogs({
         logGroup,
         streamPrefix: 'forge-app',
@@ -547,7 +570,9 @@ export class ForgeAppStack extends cdk.Stack {
           DKS_EMBEDDING_MODEL: 'all-MiniLM-L6-v2',
         },
         secrets: {
-          DATABASE_URL: secrets['DATABASE_URL'],
+          DATABASE_URL: dksSecrets['DKS_DATABASE_URL'],
+          DKS_SUPABASE_URL: dksSecrets['DKS_SUPABASE_URL'],
+          DKS_SUPABASE_SERVICE_KEY: dksSecrets['DKS_SUPABASE_SERVICE_KEY'],
           ANTHROPIC_API_KEY: secrets['ANTHROPIC_API_KEY'],
         },
         logging: ecs.LogDrivers.awsLogs({
@@ -619,7 +644,7 @@ export class ForgeAppStack extends cdk.Stack {
           DKS_EMBEDDING_MODEL: 'all-MiniLM-L6-v2',
         },
         secrets: {
-          DATABASE_URL: secrets['DATABASE_URL'],
+          DATABASE_URL: dksSecrets['DKS_DATABASE_URL'],
         },
         logging: ecs.LogDrivers.awsLogs({
           logGroup: dksIngestLogGroup,
