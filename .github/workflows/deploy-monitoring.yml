@@ -1,0 +1,85 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# deploy-monitoring.yml — CloudWatch Unified Monitoring Setup
+# Creates/updates metric filters, alarms, dashboard, and saved queries.
+# Idempotent — safe to run repeatedly. All put-* calls are upserts.
+#
+# Trigger: Manual dispatch or changes to monitoring config files.
+# ═══════════════════════════════════════════════════════════════════════════════
+name: Deploy Monitoring
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (print commands only)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/forge-cloudwatch-setup.sh'
+      - '.github/workflows/deploy-monitoring.yml'
+
+concurrency:
+  group: deploy-monitoring
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  monitoring:
+    name: CloudWatch Setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run monitoring setup
+        run: |
+          chmod +x scripts/forge-cloudwatch-setup.sh
+
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ./scripts/forge-cloudwatch-setup.sh --dry-run
+          else
+            ./scripts/forge-cloudwatch-setup.sh --skip-sns
+          fi
+
+      - name: Verify deployment
+        run: |
+          echo "=== Metric Filters ==="
+          aws logs describe-metric-filters \
+            --log-group-name /forge/ecs/forge-app-test \
+            --query 'metricFilters[].filterName' \
+            --output table
+
+          echo "=== Alarms ==="
+          aws cloudwatch describe-alarms \
+            --alarm-name-prefix forge- \
+            --query 'MetricAlarms[].{Name:AlarmName,State:StateValue}' \
+            --output table
+
+          echo "=== Dashboard ==="
+          aws cloudwatch list-dashboards \
+            --dashboard-name-prefix FORGE \
+            --query 'DashboardEntries[].DashboardName' \
+            --output table
+
+          echo "=== Saved Queries ==="
+          aws logs describe-query-definitions \
+            --query-definition-name-prefix FORGE \
+            --query 'queryDefinitions[].name' \
+            --output table
