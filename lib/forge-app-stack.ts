@@ -113,6 +113,7 @@ export class ForgeAppStack extends cdk.Stack {
       'together-api-key',
       'lucid-token',
       'database-url',
+      'redis-url',              // Autonomous Pipeline v2: Upstash Redis for BullMQ
     ];
 
     // DKS-specific secrets (separate Supabase project: forge-dks)
@@ -182,10 +183,12 @@ export class ForgeAppStack extends cdk.Stack {
     }));
 
     // -- Fargate Task Definition ----------------------------------------------
+    // Pipeline v2: Upsized from 256/512 to 512/1024 for GLB buffer processing
+    // (~100-200 MB peak during ICP topology transfer + quality gate)
     const taskDef = new ecs.FargateTaskDefinition(this, 'ForgeAppTaskDef', {
       family: 'forge-app-test',
-      cpu: 256,
-      memoryLimitMiB: 512,
+      cpu: 512,
+      memoryLimitMiB: 1024,
       executionRole,
       taskRole,
       runtimePlatform: {
@@ -246,6 +249,12 @@ export class ForgeAppStack extends cdk.Stack {
         FIELD_DRIVEN_ENABLED: 'false',
         FIELD_DRIVEN_MIN_THICKNESS_MM: '0.3',
         FIELD_DRIVEN_MAX_THICKNESS_MM: '5.0',
+        // -- Autonomous Pipeline v2 configuration --
+        PIPELINE_MAX_VARIANTS: '3',
+        PIPELINE_MAX_RETRIES: '2',
+        PIPELINE_BUDGET_CAP_USD: '5.00',
+        PIPELINE_TRIPO_CONCURRENCY: '5',
+        PIPELINE_FLUX_CONCURRENCY: '10',
       },
       secrets: {
         ...secrets,
