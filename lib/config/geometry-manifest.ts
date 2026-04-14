@@ -1,7 +1,7 @@
 /**
  * FORGE Geometry Platform Manifest
  *
- * Five geometry capabilities mapped to ECS task definitions and feature flags.
+ * Six geometry capabilities mapped to ECS task definitions and feature flags.
  * Follows the same double-gate architecture as the existing solver manifest:
  *   Gate 1: ECS service desiredCount (0 = dormant, 1 = running)
  *   Gate 2: Feature flag env var (false = routing disabled even if container is up)
@@ -12,6 +12,7 @@
  *   Cap 3 (Neural SDF):         DORMANT (ready but not activated) — requires GPU + trained model
  *   Cap 4 (Visual ASG Editor):  READY TO ACTIVATE  — client-side only, zero cost
  *   Cap 5 (Field-Driven TPMS):  READY TO ACTIVATE  — uses existing FluxTK, zero new cost
+ *   Cap 6 (FluxTK / BRAIDE):    READY TO ACTIVATE  — CPU-only Fargate, conservation solver
  */
 
 export interface GeometryCapability {
@@ -209,15 +210,54 @@ export const CAP_FIELD_TPMS: GeometryCapability = {
   phase: 2,
 };
 
+// ─── Capability 6: FluxTK / BRAIDE Network Solver ───────────────────────────
+export const CAP_FLUXTK: GeometryCapability = {
+  id: 'fluxtk',
+  name: 'FluxTK / BRAIDE Network Solver',
+  featureFlag: 'FLUXTK_ENABLED',
+  defaultFlagValue: 'false',
+  requiresContainer: true,
+  requiresGpu: false,
+  taskName: 'forge-fluxtk',
+  ecrRepo: 'forge-fluxtk',
+  port: 8040,
+  healthCheckPath: '/health',
+  cpu: 1024,     // 1 vCPU — sparse Cholesky/LU solves are memory-bound, not CPU-bound
+  memory: 2048,  // 2 GB — handles 2000-node networks with headroom for CHOLMOD factorization
+  activateOnDeploy: false,  // DORMANT — operator flips flag after image is pushed
+  endpointEnvVar: 'FLUXTK_API_URL',
+  defaultEndpoint: 'http://forge-fluxtk.forge-geometry.local:8040',
+  appEnvVars: {
+    FLUXTK_ENABLED: 'false',
+    FLUXTK_API_URL: 'http://forge-fluxtk.forge-geometry.local:8040',
+  },
+  containerEnvVars: {
+    SERVICE_MODE: 'fluxtk',
+    LOG_LEVEL: 'INFO',
+    FORGE_PORT: '8040',
+    FORGE_TIMEOUT: '300',
+    FLUXTK_MAX_NODES: '2000',
+    FLUXTK_CONVERGENCE_TOL: '1e-10',
+    FLUXTK_MAX_COUPLING_ITERATIONS: '20',
+  },
+  costDescription: '~$0.05/hr active (Fargate 1vCPU/2GB), ~$5/month always-on. $0 when dormant.',
+  description: 'Conservation network solver (thermal, electrical, fluid, diffusion, mechanical). Sparse Cholesky on conductance matrices. Multi-physics coupling via iterative cascade. Sub-1ms for 200-node assemblies. CLASP topology optimization.',
+  efsSourcePath: '/geometry',
+  efsContainerPath: '/forge/workspace',
+  cloudMapName: 'forge-fluxtk',
+  phase: 2,  // Same phase as Field-Driven TPMS — FluxTK is a dependency for Cap 5
+};
+
 // ─── Aggregates ─────────────────────────────────────────────────────────────
 
-/** All five geometry capabilities */
+/** All six geometry capabilities */
 export const GEOMETRY_CAPABILITIES: GeometryCapability[] = [
   CAP_BREP,
   CAP_GPU_SDF,
   CAP_NEURAL_SDF,
   CAP_ASG_EDITOR,
   CAP_FIELD_TPMS,
+  CAP_FLUXTK,
 ];
 
 /** Capabilities that require an ECS container */

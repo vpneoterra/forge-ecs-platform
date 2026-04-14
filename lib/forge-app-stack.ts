@@ -249,6 +249,9 @@ export class ForgeAppStack extends cdk.Stack {
         FIELD_DRIVEN_ENABLED: 'false',
         FIELD_DRIVEN_MIN_THICKNESS_MM: '0.3',
         FIELD_DRIVEN_MAX_THICKNESS_MM: '5.0',
+        // Capability 6: FluxTK / BRAIDE Network Solver
+        FLUXTK_ENABLED: 'false',
+        FLUXTK_API_URL: 'http://forge-fluxtk.forge-geometry.local:8040',
         // -- Autonomous Pipeline v2 configuration --
         PIPELINE_MAX_VARIANTS: '3',
         PIPELINE_MAX_RETRIES: '2',

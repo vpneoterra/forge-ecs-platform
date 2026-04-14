@@ -1,12 +1,13 @@
 /**
  * ForgeGeometryStack -- Geometry Platform Infrastructure
  *
- * Deploys five geometry capabilities following the double-gate pattern:
+ * Deploys six geometry capabilities following the double-gate pattern:
  *   Gate 1: ECS service desiredCount (0 = dormant container exists but doesn't run)
  *   Gate 2: Feature flag env var in forge-app (false = no routing even if container is up)
  *
  * Architecture:
  *   - forge-brep: Fargate service (CPU-only, OpenCASCADE + CadQuery)
+ *   - forge-fluxtk: Fargate service (CPU-only, FastAPI + SciPy sparse solver)
  *   - forge-sdf-gpu: EC2 task on Provider C (GPU, libfive + NanoVDB) — desiredCount=0
  *   - forge-neural-sdf: EC2 task on Provider C (GPU, DeepSDF) — desiredCount=0
  *   - ASG Editor & Field-Driven TPMS: client-side only, no containers needed
@@ -17,6 +18,7 @@
  *
  * Cost when all flags OFF: $0/hr incremental.
  * Cost with B-Rep active (Fargate Spot): ~$10/month.
+ * Cost with FluxTK active (Fargate Spot): ~$5/month.
  * Cost with GPU active (g5.xlarge Spot): ~$220/month.
  */
 
@@ -34,6 +36,7 @@ import {
   CPU_CAPABILITIES,
   GeometryCapability,
   CAP_BREP,
+  CAP_FLUXTK,
   CAP_GPU_SDF,
   CAP_NEURAL_SDF,
 } from './config/geometry-manifest';
@@ -155,6 +158,16 @@ export class ForgeGeometryStack extends cdk.Stack {
       dnsNamespace,
     );
 
+    // ── Capability 6: FluxTK / BRAIDE Network Solver (Fargate, CPU-only) ─────
+    this.createFargateService(
+      CAP_FLUXTK,
+      props,
+      taskExecutionRole,
+      taskRole,
+      logGroups.get(CAP_FLUXTK.id)!,
+      dnsNamespace,
+    );
+
     // ── Capability 2: GPU SDF Engine (EC2 GPU, desiredCount=0) ────────────────
     this.createGpuTaskDefinition(
       CAP_GPU_SDF,
@@ -193,10 +206,11 @@ export class ForgeGeometryStack extends cdk.Stack {
       value: [
         'GEOMETRY PLATFORM — All capabilities deployed OFF.',
         'Cap 1 (B-Rep):        aws ecs update-service --cluster forge-geometry-' + props.forgeEnv + ' --service forge-brep --desired-count 1',
+        'Cap 6 (FluxTK):       aws ecs update-service --cluster forge-geometry-' + props.forgeEnv + ' --service forge-fluxtk --desired-count 1',
         'Cap 2 (GPU SDF):      Task definition ready. Create EC2 GPU service when needed.',
         'Cap 3 (Neural SDF):   Task definition ready. Create EC2 GPU service when needed.',
         'Cap 4 (ASG Editor):   Set ASG_EDITOR_ENABLED=true in forge-app env.',
-        'Cap 5 (Field TPMS):   Set FIELD_DRIVEN_ENABLED=true in forge-app env.',
+        'Cap 5 (Field TPMS):   Set FIELD_DRIVEN_ENABLED=true in forge-app env. Requires Cap 6 (FluxTK) active.',
         'Then set the corresponding feature flag in forge-app .env and restart.',
       ].join('\n'),
       description: 'Geometry capability activation guide',
