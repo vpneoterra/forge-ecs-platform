@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # FORGE Geometry — Hibernate Script
-# Stops the forge-brep service in the geometry cluster (forge-geometry-${FORGE_ENV}).
+# Stops the forge-brep and forge-fluxtk services in the geometry cluster
+# (forge-geometry-${FORGE_ENV}).
 #
 # GPU task definitions (e.g. mesh repair, tessellation) have no permanently running
 # services — they are launched on-demand — so no action is needed for those here.
@@ -38,16 +39,27 @@ aws ecs update-service \
   && success "Scaled down: forge-brep" \
   || warn "Service not found: forge-brep (may already be stopped)"
 
-# ── 2. GPU services — no action needed ────────────────────────────────────────
+# ── 2. Scale forge-fluxtk service to 0 ───────────────────────────────────────
+info "Scaling forge-fluxtk to desiredCount=0 in cluster ${CLUSTER}..."
+aws ecs update-service \
+  --cluster "${CLUSTER}" \
+  --service forge-fluxtk \
+  --desired-count 0 \
+  --region "${REGION}" \
+  --output text --query 'service.serviceName' 2>/dev/null \
+  && success "Scaled down: forge-fluxtk" \
+  || warn "Service not found: forge-fluxtk (may already be stopped)"
+
+# ── 3. GPU services — no action needed ────────────────────────────────────────
 info "GPU task definitions (mesh repair, tessellation, etc.) have no running services"
 info "by default — they are launched on-demand via SQS. No action needed."
 
-# ── 3. Client-side features — flag reminder ───────────────────────────────────
+# ── 4. Client-side features — flag reminder ───────────────────────────────────
 echo ""
 warn "ASG Editor and Field-Driven TPMS are client-side only."
 warn "To disable them, set the appropriate feature flags in the forge-app"
-warn "environment variables (e.g. BREP_ENGINE_ENABLED=false) and redeploy"
-warn "or restart the forge-app service."
+warn "environment variables (e.g. BREP_ENGINE_ENABLED=false, FLUXTK_ENABLED=false)"
+warn "and redeploy or restart the forge-app service."
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""

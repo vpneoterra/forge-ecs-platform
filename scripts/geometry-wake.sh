@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # FORGE Geometry — Wake Script
-# Brings the forge-brep service back online in the geometry cluster
-# (forge-geometry-${FORGE_ENV}) and waits for it to stabilize.
+# Brings the forge-brep and forge-fluxtk services back online in the geometry
+# cluster (forge-geometry-${FORGE_ENV}) and waits for them to stabilize.
 #
 # GPU capabilities (mesh repair, tessellation, etc.) run as on-demand tasks on
 # the solver cluster (Provider C). See the commented-out section at the bottom
@@ -37,14 +37,25 @@ aws ecs update-service \
   && success "Service resumed: forge-brep" \
   || warn "Service not found: forge-brep"
 
-# ── 2. Wait for forge-brep to stabilize ───────────────────────────────────────
-info "Waiting for forge-brep to stabilize (up to 10 minutes)..."
+# ── 2. Scale forge-fluxtk service to 1 ───────────────────────────────────────
+info "Scaling forge-fluxtk to desiredCount=1 in cluster ${CLUSTER}..."
+aws ecs update-service \
+  --cluster "${CLUSTER}" \
+  --service forge-fluxtk \
+  --desired-count 1 \
+  --region "${REGION}" \
+  --output text --query 'service.serviceName' 2>/dev/null \
+  && success "Service resumed: forge-fluxtk" \
+  || warn "Service not found: forge-fluxtk"
+
+# ── 3. Wait for services to stabilize ────────────────────────────────────────
+info "Waiting for forge-brep and forge-fluxtk to stabilize (up to 10 minutes)..."
 aws ecs wait services-stable \
   --cluster "${CLUSTER}" \
-  --services forge-brep \
+  --services forge-brep forge-fluxtk \
   --region "${REGION}" 2>/dev/null \
-  && success "forge-brep is stable" \
-  || warn "forge-brep not yet stable — check ECS console in a few minutes"
+  && success "forge-brep and forge-fluxtk are stable" \
+  || warn "Services not yet stable — check ECS console in a few minutes"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
@@ -52,10 +63,13 @@ echo -e "${GREEN}╔════════════════════
 echo -e "${GREEN}║   FORGE Geometry is awake!                       ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════════╝${NC}"
 echo ""
-warn "Remember to set BREP_ENGINE_ENABLED=true in forge-app env and restart"
+warn "Remember to set feature flags in forge-app env and restart:"
+warn "  BREP_ENGINE_ENABLED=true"
+warn "  FLUXTK_ENABLED=true"
 echo ""
 info "Services now running:"
-echo "  • forge-brep  — B-Rep geometry engine (OCCT / custom BREP solver)"
+echo "  • forge-brep    — B-Rep geometry engine (OCCT / custom BREP solver)"
+echo "  • forge-fluxtk  — FluxTK / BRAIDE conservation network solver"
 echo ""
 info "GPU capabilities (on-demand, Provider C): see commented section below"
 echo ""
