@@ -18,7 +18,7 @@
  * Cost breakdown:
  *   - ALB: ~$16/month (fixed, shared) + $0.008/LCU-hour
  *   - Fargate forge-app (256 CPU / 512 MB Spot): ~$6/month
- *   - Fargate forge-omni (4096 CPU / 8192 MB Spot): ~$36/month
+ *   - Fargate forge-omni (8192 CPU / 16384 MB Spot): ~$72/month
  *   - Secrets Manager: $0.40/secret/month x 6 = $2.40/month
  *   - CloudWatch Logs: ~$1/month (7-day retention, 2 log groups)
  *   - Route 53 hosted zone: $0.50/month + $0.40/million queries
@@ -435,8 +435,11 @@ export class ForgeAppStack extends cdk.Stack {
 
     const omniTaskDef = new ecs.FargateTaskDefinition(this, 'OmniTaskDef', {
       family: 'forge-omni',
-      cpu: 4096,
-      memoryLimitMiB: 8192,
+      // Bumped 4096/8192 -> 8192/16384 after Tier 3 Run 1 OOM at 3 concurrent
+      // heavy SDF renders (CylindricalVessel + HollowTube + IBeam). See
+      // FORGE_OMNI_MEMORY_MEMO.md. Pairs with substrate-side concurrency cap.
+      cpu: 8192,
+      memoryLimitMiB: 16384,
       executionRole,
       taskRole,
       runtimePlatform: {
