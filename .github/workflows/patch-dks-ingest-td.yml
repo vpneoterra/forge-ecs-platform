@@ -1,0 +1,141 @@
+# ================================================================
+# patch-dks-ingest-td.yml — Patch dks-ingest task definition in place
+#
+# ForgeApp-dev CFN is in a broken state (pre-existing secret drift),
+# so cdk deploy is unavailable. This workflow does the minimal change
+# needed for Phase 1: add Vertex env vars + GEMMA_VERTEX_SA_KEY_JSON
+# secret to the dks-ingest task definition by registering a new
+# revision via the AWS ECS API directly.
+#
+# Idempotent: re-running produces the same revision contents.
+# Safe: dks-ingest is launched via run-task only (no long-running
+# service), so new revisions take effect on next task launch.
+# ================================================================
+name: "DKS: Patch dks-ingest Task Def"
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "ECR image tag to pin (default: latest)"
+        required: false
+        default: "latest"
+
+env:
+  AWS_REGION: us-east-1
+  ACCOUNT_ID: "266087050444"
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve Vertex SA secret ARN
+        id: vertex
+        run: |
+          ARN=$(aws secretsmanager describe-secret \
+            --secret-id forge/test/vertex-sa-json \
+            --query ARN --output text)
+          echo "arn=$ARN" >> $GITHUB_OUTPUT
+          echo "Vertex SA secret ARN: $ARN"
+
+      - name: Resolve DKS DATABASE_URL secret ARN
+        id: dburl
+        run: |
+          ARN=$(aws secretsmanager describe-secret \
+            --secret-id forge/test/dks-database-url \
+            --query ARN --output text)
+          echo "arn=$ARN" >> $GITHUB_OUTPUT
+
+      - name: Pull current dks-ingest task definition
+        id: current
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition dks-ingest \
+            --query 'taskDefinition' > /tmp/current_td.json
+          echo "Current revision:"
+          jq '.revision' /tmp/current_td.json
+          jq '.containerDefinitions[0] | {image, environment, secrets}' /tmp/current_td.json
+
+      - name: Build patched task definition
+        id: build
+        env:
+          IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+          VERTEX_SA_ARN: ${{ steps.vertex.outputs.arn }}
+          DBURL_ARN: ${{ steps.dburl.outputs.arn }}
+          ACCOUNT_ID: ${{ env.ACCOUNT_ID }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          python3 <<'PYEOF'
+          import json, os
+
+          with open('/tmp/current_td.json') as f:
+              td = json.load(f)
+
+          # Strip server-owned fields before re-registering
+          for k in ('taskDefinitionArn', 'revision', 'status',
+                    'registeredAt', 'registeredBy', 'requiresAttributes',
+                    'compatibilities'):
+              td.pop(k, None)
+
+          cd = td['containerDefinitions'][0]
+
+          # Image pinned to latest (or user-supplied)
+          cd['image'] = f"{os.environ['ACCOUNT_ID']}.dkr.ecr.{os.environ['AWS_REGION']}.amazonaws.com/dks-ingest:{os.environ['IMAGE_TAG']}"
+
+          # Full Vertex env set (desired state, not delta)
+          vertex_env = {
+              'LLM_BACKEND':                 'vertex',
+              'GEMMA_VERTEX_PROJECT':        'mindful-vial-493123-a5',
+              'GEMMA_VERTEX_PROJECT_NUMBER': '945884688373',
+              'GEMMA_VERTEX_REGION':         'us-central1',
+              'GEMMA_VERTEX_ENDPOINT_ID':    'mg-endpoint-8f11b5ef-4cd2-414e-a238-0f3b4904d17f',
+              'GEMMA_VERTEX_MODEL':          'gemma-4-26b-a4b-mg-one-click-deploy',
+              'DKS_EMBEDDING_MODEL':         'all-MiniLM-L6-v2',
+          }
+
+          existing = {e['name']: e['value'] for e in cd.get('environment', [])}
+          existing.update(vertex_env)
+          cd['environment'] = [{'name': k, 'value': v} for k, v in sorted(existing.items())]
+
+          # Secrets (desired state). valueFrom must be a SecretsManager or SSM ARN.
+          desired_secrets = {
+              'DATABASE_URL':              os.environ['DBURL_ARN'],
+              'GEMMA_VERTEX_SA_KEY_JSON':  os.environ['VERTEX_SA_ARN'],
+          }
+          existing_secrets = {s['name']: s['valueFrom'] for s in cd.get('secrets', [])}
+          existing_secrets.update(desired_secrets)
+          cd['secrets'] = [{'name': k, 'valueFrom': v} for k, v in sorted(existing_secrets.items())]
+
+          with open('/tmp/new_td.json', 'w') as f:
+              json.dump(td, f, indent=2)
+
+          print("Patched container env:")
+          print(json.dumps([e['name'] for e in cd['environment']], indent=2))
+          print("Patched container secrets:")
+          print(json.dumps([s['name'] for s in cd['secrets']], indent=2))
+          print("Image:", cd['image'])
+          PYEOF
+
+      - name: Register new task definition revision
+        id: register
+        run: |
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/new_td.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "new_arn=$NEW_ARN" >> $GITHUB_OUTPUT
+          echo "Registered: $NEW_ARN"
+
+      - name: Verify new revision env + secrets
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition dks-ingest \
+            --query 'taskDefinition.{rev:revision,image:containerDefinitions[0].image,env:containerDefinitions[0].environment[*].name,secrets:containerDefinitions[0].secrets[*].name}' \
+            --output json
