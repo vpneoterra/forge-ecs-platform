@@ -1,15 +1,5 @@
 # ================================================================
 # run-dks-phase.yml — Execute DKS ingestion phases on Fargate
-#
-# Dispatches an ECS run-task against the dks-ingest task definition
-# with a command override per phase. Polls the task to completion
-# and surfaces the last CloudWatch log lines on failure.
-#
-# Phases:
-#   0a-schema   : apply sql/129_dks_knowledge_chunks.sql
-#   bq-dryrun   : BigQuery IAM + query plan validation (no cost)
-#   1a-bq       : BigQuery T1 export → /data/patents_t1/ (~$0.10)
-#   1b-harvest  : dks_harvest.py patents --backend vertex (~$1, ~1hr)
 # ================================================================
 name: "DKS: Run Phase"
 
@@ -54,25 +44,18 @@ jobs:
 
       - name: Resolve cluster + network config
         id: net
+        env:
+          TENV: ${{ inputs.env }}
         run: |
           set -euo pipefail
-          CLUSTER="forge-app-${{ inputs.env }}"
+          CLUSTER="forge-app-${TENV}"
           echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
 
-          # Subnet lookup — all private subnets in the default VPC for the cluster
           SUBNETS=$(aws ec2 describe-subnets \
-            --filters "Name=tag:aws:cloudformation:stack-name,Values=ForgeNetwork-${{ inputs.env }}" \
+            --filters "Name=tag:aws:cloudformation:stack-name,Values=ForgeNetwork-${TENV}" \
                       "Name=tag:aws-cdk:subnet-type,Values=Private" \
             --query 'Subnets[].SubnetId' --output text | tr '\t' ',' || true)
 
-          # Fallback: any private subnet tagged with the env
-          if [ -z "$SUBNETS" ]; then
-            SUBNETS=$(aws ec2 describe-subnets \
-              --filters "Name=tag:aws-cdk:subnet-type,Values=Private" \
-              --query "Subnets[?Tags[?Key=='env' && Value=='${{ inputs.env }}']].SubnetId" --output text | tr '\t' ',')
-          fi
-
-          # Second fallback: pick private subnets from any VPC that has the cluster
           if [ -z "$SUBNETS" ]; then
             SUBNETS=$(aws ec2 describe-subnets \
               --filters "Name=tag:aws-cdk:subnet-type,Values=Private" \
@@ -81,7 +64,7 @@ jobs:
 
           SG=$(aws ec2 describe-security-groups \
             --filters "Name=group-name,Values=*EcsSecurityGroup*" \
-                      "Name=tag:aws:cloudformation:stack-name,Values=ForgeApp-${{ inputs.env }}" \
+                      "Name=tag:aws:cloudformation:stack-name,Values=ForgeNetwork-${TENV}" \
             --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
           if [ -z "$SG" ] || [ "$SG" = "None" ]; then
             SG=$(aws ec2 describe-security-groups \
@@ -95,84 +78,115 @@ jobs:
           echo "Subnets : $SUBNETS"
           echo "SG      : $SG"
 
-      - name: Verify dks-ingest task definition exists
+      - name: Verify dks-ingest task definition
         run: |
           aws ecs describe-task-definition \
             --task-definition dks-ingest \
             --query 'taskDefinition.{family:family,rev:revision,image:containerDefinitions[0].image,env:containerDefinitions[0].environment[*].name,secrets:containerDefinitions[0].secrets[*].name}' \
             --output json
 
-      - name: Build command override for phase
+      - name: Write command script for phase
         id: cmd
+        env:
+          PHASE: ${{ inputs.phase }}
+        shell: bash
         run: |
-          case "${{ inputs.phase }}" in
+          set -euo pipefail
+          mkdir -p /tmp/phase
+          case "$PHASE" in
             0a-schema)
-              CMD='set -euo pipefail; echo ">>> applying sql/129_dks_knowledge_chunks.sql"; psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f /app/sql/129_dks_knowledge_chunks.sql; echo ">>> verify"; psql "$DATABASE_URL" -c "\dt design_knowledge_chunks"; psql "$DATABASE_URL" -c "select count(*) as baseline from design_knowledge_chunks;"; psql "$DATABASE_URL" -c "select indexname from pg_indexes where tablename='"'"'design_knowledge_chunks'"'"';"; echo ">>> Phase 0a complete"'
+              cat > /tmp/phase/cmd.sh <<'EOS'
+          set -euo pipefail
+          echo ">>> applying sql/129_dks_knowledge_chunks.sql"
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f /app/sql/129_dks_knowledge_chunks.sql
+          echo ">>> verify tables"
+          psql "$DATABASE_URL" -c "\dt design_knowledge_chunks"
+          psql "$DATABASE_URL" -c "\dt dks_runlog" || true
+          psql "$DATABASE_URL" -c "select count(*) as baseline from design_knowledge_chunks;"
+          psql "$DATABASE_URL" -c "select indexname from pg_indexes where tablename='design_knowledge_chunks';"
+          echo ">>> Phase 0a complete"
+          EOS
               ;;
             bq-dryrun)
-              CMD='set -euo pipefail; echo ">>> BigQuery dry-run T1"; python3 scripts/extract_bigquery.py --tier t1 --dry-run'
+              cat > /tmp/phase/cmd.sh <<'EOS'
+          set -euo pipefail
+          echo ">>> BigQuery dry-run T1"
+          python3 scripts/extract_bigquery.py --tier t1 --dry-run
+          EOS
               ;;
             1a-bq)
-              CMD='set -euo pipefail; mkdir -p /data/patents_t1; echo ">>> extract T1 1K patents"; python3 scripts/extract_bigquery.py --tier t1 --output /data/patents_t1/ --local --force; ls -la /data/patents_t1/; wc -l /data/patents_t1/*.jsonl 2>/dev/null || true'
+              cat > /tmp/phase/cmd.sh <<'EOS'
+          set -euo pipefail
+          mkdir -p /data/patents_t1
+          echo ">>> extract T1 1K patents"
+          python3 scripts/extract_bigquery.py --tier t1 --output /data/patents_t1/ --local --force
+          ls -la /data/patents_t1/
+          wc -l /data/patents_t1/*.jsonl 2>/dev/null || true
+          EOS
               ;;
             1b-harvest)
-              CMD='set -euo pipefail; mkdir -p /data/logs; LOG=/data/logs/phase1_$(date +%Y%m%d_%H%M%S).log; echo ">>> harvest patents via vertex"; python3 dks_harvest.py --source patents --patents-dir /data/patents_t1/ --backend vertex --validate 2>&1 | tee $LOG; echo ">>> post-ingest counts"; psql "$DATABASE_URL" -c "select count(*) filter (where source_type='"'"'patent'"'"') as patent_chunks, count(*) as total from design_knowledge_chunks;"; psql "$DATABASE_URL" -c "select phase, status, inserted, skipped, failed, started_at, finished_at from dks_runlog order by started_at desc limit 5;"'
+              cat > /tmp/phase/cmd.sh <<'EOS'
+          set -euo pipefail
+          mkdir -p /data/logs
+          LOG=/data/logs/phase1_$(date +%Y%m%d_%H%M%S).log
+          echo ">>> harvest patents via vertex"
+          python3 dks_harvest.py --source patents --patents-dir /data/patents_t1/ --backend vertex --validate 2>&1 | tee "$LOG"
+          echo ">>> post-ingest counts"
+          psql "$DATABASE_URL" -c "select count(*) filter (where source_type='patent') as patent_chunks, count(*) as total from design_knowledge_chunks;"
+          psql "$DATABASE_URL" -c "select phase, status, inserted, skipped, failed, started_at, finished_at from dks_runlog order by started_at desc limit 5;"
+          EOS
               ;;
+            *)
+              echo "unknown phase: $PHASE" >&2; exit 1 ;;
           esac
 
-          # Emit as JSON overrides (embed safely)
-          python3 -c "
-          import json, os, sys
-          cmd = os.environ['CMD']
-          overrides = {
-            'containerOverrides': [
-              {
-                'name': 'dks-ingest',
-                'entryPoint': ['bash', '-c'],
-                'command': [cmd]
-              }
-            ]
-          }
-          print(json.dumps(overrides))
-          " > /tmp/overrides.json
-          cat /tmp/overrides.json
-          echo "overrides_path=/tmp/overrides.json" >> $GITHUB_OUTPUT
-        env:
-          CMD_0A: placeholder
+          # Strip the 10-space YAML block indent that got prepended to every line
+          sed -i 's/^          //' /tmp/phase/cmd.sh
+
+          echo "---- cmd.sh ----"
+          cat /tmp/phase/cmd.sh
+          echo "----------------"
+
+          # Build overrides.json with jq (safely embeds multi-line cmd.sh as JSON string)
+          jq -n --rawfile cmd /tmp/phase/cmd.sh '{
+            containerOverrides: [{
+              name: "dks-ingest",
+              entryPoint: ["bash", "-c"],
+              command: [$cmd]
+            }]
+          }' > /tmp/phase/overrides.json
+          echo "overrides size: $(wc -c < /tmp/phase/overrides.json) bytes"
 
       - name: Run ECS task
         id: run
+        shell: bash
         run: |
           set -euo pipefail
-          SUBNETS_JSON=$(echo '${{ steps.net.outputs.subnets }}' | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip().split(',')))")
-          NETCFG=$(python3 -c "
-          import json
-          print(json.dumps({
-            'awsvpcConfiguration': {
-              'subnets': ${SUBNETS_JSON},
-              'securityGroups': ['${{ steps.net.outputs.sg }}'],
-              'assignPublicIp': 'DISABLED'
+          SUBNETS_CSV='${{ steps.net.outputs.subnets }}'
+          SG='${{ steps.net.outputs.sg }}'
+
+          # Build netcfg.json with jq — split comma-separated subnets into array
+          jq -n --arg subs "$SUBNETS_CSV" --arg sg "$SG" '{
+            awsvpcConfiguration: {
+              subnets: ($subs | split(",") | map(select(length>0))),
+              securityGroups: [$sg],
+              assignPublicIp: "DISABLED"
             }
-          }))
-          ")
-          echo "Network: $NETCFG"
+          }' > /tmp/phase/netcfg.json
+          echo "Network config:"
+          cat /tmp/phase/netcfg.json
+          echo
 
           TASK_ARN=$(aws ecs run-task \
             --cluster "${{ steps.net.outputs.cluster }}" \
             --launch-type FARGATE \
             --task-definition dks-ingest \
-            --network-configuration "$NETCFG" \
-            --overrides file:///tmp/overrides.json \
+            --network-configuration "$(cat /tmp/phase/netcfg.json)" \
+            --overrides file:///tmp/phase/overrides.json \
             --query 'tasks[0].taskArn' --output text)
 
           if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
-            echo "ERROR: run-task returned no ARN"
-            aws ecs run-task \
-              --cluster "${{ steps.net.outputs.cluster }}" \
-              --launch-type FARGATE \
-              --task-definition dks-ingest \
-              --network-configuration "$NETCFG" \
-              --overrides file:///tmp/overrides.json 2>&1 | head -30
+            echo "::error::run-task returned no ARN"
             exit 1
           fi
 
@@ -184,12 +198,12 @@ jobs:
 
       - name: Poll for completion
         id: poll
+        shell: bash
         run: |
           set -euo pipefail
           TASK_ARN="${{ steps.run.outputs.task_arn }}"
           CLUSTER="${{ steps.net.outputs.cluster }}"
 
-          # Timeout: harvest needs longest (90 min), everything else 10 min
           case "${{ inputs.phase }}" in
             1b-harvest) TIMEOUT=5400 ;;
             *)          TIMEOUT=600  ;;
@@ -197,12 +211,11 @@ jobs:
 
           ELAPSED=0
           INTERVAL=30
+          STATUS=""
           while [ $ELAPSED -lt $TIMEOUT ]; do
             STATUS=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
               --query 'tasks[0].lastStatus' --output text)
-            if [ "$STATUS" = "STOPPED" ]; then
-              break
-            fi
+            if [ "$STATUS" = "STOPPED" ]; then break; fi
             echo "[$((ELAPSED/60))m $((ELAPSED%60))s] status=$STATUS"
             sleep $INTERVAL
             ELAPSED=$((ELAPSED + INTERVAL))
@@ -220,20 +233,21 @@ jobs:
             --query 'tasks[0].stoppedReason' --output text)
           echo "exit=$EXIT reason=$REASON"
           echo "exit_code=$EXIT" >> $GITHUB_OUTPUT
-          echo "reason=$REASON"  >> $GITHUB_OUTPUT
 
       - name: Pull CloudWatch logs
         if: always() && steps.run.outputs.task_id != ''
+        shell: bash
         run: |
-          set -euo pipefail
+          set +e
           STREAM="dks-ingest/dks-ingest/${{ steps.run.outputs.task_id }}"
           echo "=== /forge/ecs/dks-ingest :: $STREAM ==="
           aws logs tail /forge/ecs/dks-ingest \
             --log-stream-names "$STREAM" \
-            --format short 2>&1 | tail -200 || echo "(logs unavailable or not yet flushed)"
+            --format short 2>&1 | tail -300 || echo "(logs unavailable)"
 
       - name: Fail if task exited non-zero
         if: always()
+        shell: bash
         run: |
           EXIT="${{ steps.poll.outputs.exit_code }}"
           if [ -z "$EXIT" ]; then EXIT="unknown"; fi
