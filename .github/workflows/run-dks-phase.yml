@@ -115,6 +115,11 @@ jobs:
             bq-dryrun)
               cat > /tmp/phase/cmd.sh <<'EOS'
           set -euo pipefail
+          # Materialize GCP SA key for ADC
+          mkdir -p /tmp/gcp
+          printf '%s' "$GEMMA_VERTEX_SA_KEY_JSON" > /tmp/gcp/sa.json
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp/sa.json
+          export GOOGLE_CLOUD_PROJECT="${GEMMA_VERTEX_PROJECT:-mindful-vial-493123-a5}"
           echo ">>> BigQuery dry-run T1"
           python3 scripts/extract_bigquery.py --tier t1 --dry-run
           EOS
@@ -122,6 +127,14 @@ jobs:
             1a-bq)
               cat > /tmp/phase/cmd.sh <<'EOS'
           set -euo pipefail
+          # Materialize GCP SA key for ADC (BigQuery client needs this)
+          mkdir -p /tmp/gcp
+          printf '%s' "$GEMMA_VERTEX_SA_KEY_JSON" > /tmp/gcp/sa.json
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp/sa.json
+          export GOOGLE_CLOUD_PROJECT="${GEMMA_VERTEX_PROJECT:-mindful-vial-493123-a5}"
+          echo ">>> /data mount info:"
+          df -T /data 2>&1 || echo "(df failed)"
+          mount | grep -E "/data|efs" || echo "(no efs mount)"
           mkdir -p /data/patents_t1
           echo ">>> extract T1 1K patents"
           python3 scripts/extract_bigquery.py --tier t1 --output /data/patents_t1/ --local --force
@@ -132,6 +145,11 @@ jobs:
             1b-harvest)
               cat > /tmp/phase/cmd.sh <<'EOS'
           set -euo pipefail
+          # Materialize GCP SA key for ADC (Vertex client needs this alongside env JSON fallback)
+          mkdir -p /tmp/gcp
+          printf '%s' "$GEMMA_VERTEX_SA_KEY_JSON" > /tmp/gcp/sa.json
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp/sa.json
+          export GOOGLE_CLOUD_PROJECT="${GEMMA_VERTEX_PROJECT:-mindful-vial-493123-a5}"
           mkdir -p /data/logs
           LOG=/data/logs/phase1_$(date +%Y%m%d_%H%M%S).log
           echo ">>> harvest patents via vertex"
