@@ -155,7 +155,8 @@ jobs:
           echo ">>> harvest patents via vertex"
           python3 dks_harvest.py --source patents --patents-dir /data/patents_t1/ --backend vertex --validate 2>&1 | tee "$LOG"
           echo ">>> post-ingest counts"
-          psql "$DATABASE_URL" -c "select count(*) filter (where source_type='patent') as patent_chunks, count(*) as total from design_knowledge_chunks;"
+          psql "$DATABASE_URL" -c "select count(*) as total_chunks from design_knowledge_chunks;"
+          psql "$DATABASE_URL" -c "select column_name, data_type from information_schema.columns where table_name='design_knowledge_chunks' order by ordinal_position;" || true
           psql "$DATABASE_URL" -c "select phase, status, inserted, skipped, failed, started_at, finished_at from dks_runlog order by started_at desc limit 5;"
           EOS
               ;;

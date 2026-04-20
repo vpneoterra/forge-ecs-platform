@@ -99,6 +99,10 @@ jobs:
               'GEMMA_VERTEX_ENDPOINT_ID':    'mg-endpoint-8f11b5ef-4cd2-414e-a238-0f3b4904d17f',
               'GEMMA_VERTEX_MODEL':          'gemma-4-26b-a4b-mg-one-click-deploy',
               'DKS_EMBEDDING_MODEL':         'all-MiniLM-L6-v2',
+              # Use regional aiplatform.googleapis.com instead of the per-endpoint
+              # prediction.vertexai.goog dedicated DNS (DNS for that subdomain was
+              # failing from our private subnet with ConnectError [Errno -2]).
+              'GEMMA_VERTEX_DEDICATED_DNS':  'false',
           }
 
           existing = {e['name']: e['value'] for e in cd.get('environment', [])}
