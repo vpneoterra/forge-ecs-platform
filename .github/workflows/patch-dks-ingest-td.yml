@@ -114,6 +114,12 @@ jobs:
           existing_secrets.update(desired_secrets)
           cd['secrets'] = [{'name': k, 'valueFrom': v} for k, v in sorted(existing_secrets.items())]
 
+          # Override image ENTRYPOINT (python3) with bash -c so that
+          # ECS containerOverrides.command = [script] runs as bash -c script.
+          # This lets run-dks-phase pass an arbitrary shell script per phase.
+          cd['entryPoint'] = ['/bin/bash', '-c']
+          cd['command'] = ['echo "no phase command provided"; exit 1']
+
           with open('/tmp/new_td.json', 'w') as f:
               json.dump(td, f, indent=2)
 

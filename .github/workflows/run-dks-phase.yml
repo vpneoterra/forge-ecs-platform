@@ -69,7 +69,12 @@ jobs:
           if [ -z "$SG" ] || [ "$SG" = "None" ]; then
             SG=$(aws ec2 describe-security-groups \
               --filters "Name=group-name,Values=*EcsSecurityGroup*" \
-              --query 'SecurityGroups[0].GroupId' --output text)
+              --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
+          fi
+          # Last-resort fallback to known-good SG for forge-app-dev
+          if [ -z "$SG" ] || [ "$SG" = "None" ]; then
+            SG="sg-0871ce467d6c10739"
+            echo "note: using hardcoded fallback SG $SG"
           fi
 
           echo "subnets=$SUBNETS" >> $GITHUB_OUTPUT
@@ -147,11 +152,11 @@ jobs:
           cat /tmp/phase/cmd.sh
           echo "----------------"
 
-          # Build overrides.json with jq (safely embeds multi-line cmd.sh as JSON string)
+          # Build overrides.json. The patched task def sets entryPoint=[/bin/bash,-c],
+          # so overrides.command=[$cmd] is executed as: /bin/bash -c "$cmd".
           jq -n --rawfile cmd /tmp/phase/cmd.sh '{
             containerOverrides: [{
               name: "dks-ingest",
-              entryPoint: ["bash", "-c"],
               command: [$cmd]
             }]
           }' > /tmp/phase/overrides.json
