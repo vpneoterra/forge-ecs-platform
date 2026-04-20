@@ -264,9 +264,26 @@ jobs:
           set +e
           STREAM="dks-ingest/dks-ingest/${{ steps.run.outputs.task_id }}"
           echo "=== /forge/ecs/dks-ingest :: $STREAM ==="
+          # Dump full stream to file for artifact upload
           aws logs tail /forge/ecs/dks-ingest \
             --log-stream-names "$STREAM" \
-            --format short 2>&1 | tail -300 || echo "(logs unavailable)"
+            --format short > /tmp/phase/full.log 2>&1 || echo "(logs unavailable)" > /tmp/phase/full.log
+          echo "--- first 200 lines ---"
+          head -200 /tmp/phase/full.log
+          echo
+          echo "--- errors/exceptions/warnings (first 100 unique) ---"
+          grep -iE "error|exception|traceback|403|401|unauth|permission|denied|fail" /tmp/phase/full.log | awk '!seen[$0]++' | head -100
+          echo
+          echo "--- last 200 lines ---"
+          tail -200 /tmp/phase/full.log
+
+      - name: Upload full log as artifact
+        if: always() && steps.run.outputs.task_id != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: dks-phase-log-${{ inputs.phase }}-${{ steps.run.outputs.task_id }}
+          path: /tmp/phase/full.log
+          retention-days: 7
 
       - name: Fail if task exited non-zero
         if: always()

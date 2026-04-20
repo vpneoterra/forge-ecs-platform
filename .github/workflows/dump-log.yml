@@ -1,0 +1,37 @@
+name: "Dump Log Stream"
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: "ECS task ID (32 hex chars)"
+        required: true
+      log_group:
+        description: "CloudWatch log group"
+        required: false
+        default: "/forge/ecs/dks-ingest"
+      stream_prefix:
+        description: "Stream prefix"
+        required: false
+        default: "dks-ingest/dks-ingest"
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      - name: Tail
+        run: |
+          STREAM="${{ inputs.stream_prefix }}/${{ inputs.task_id }}"
+          aws logs tail "${{ inputs.log_group }}" --log-stream-names "$STREAM" --format short > /tmp/full.log 2>&1
+          echo "--- first 400 lines ---"
+          head -400 /tmp/full.log
+          echo
+          echo "--- unique error/warn/except (first 150) ---"
+          grep -iE "error|exception|traceback|403|401|unauth|permission|denied|fail|warn" /tmp/full.log | awk '!seen[$0]++' | head -150
+      - uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ inputs.task_id }}
+          path: /tmp/full.log
