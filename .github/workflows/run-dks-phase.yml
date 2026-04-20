@@ -147,21 +147,15 @@ jobs:
           cat /tmp/phase/cmd.sh
           echo "----------------"
 
-          python3 <<'PYEOF'
-          import json
-          with open('/tmp/phase/cmd.sh') as f:
-              cmd = f.read()
-          overrides = {
-              'containerOverrides': [{
-                  'name': 'dks-ingest',
-                  'entryPoint': ['bash', '-c'],
-                  'command': [cmd],
-              }]
-          }
-          with open('/tmp/phase/overrides.json', 'w') as f:
-              json.dump(overrides, f)
-          print('overrides written, size=', len(json.dumps(overrides)))
-          PYEOF
+          # Build overrides.json with jq (safely embeds multi-line cmd.sh as JSON string)
+          jq -n --rawfile cmd /tmp/phase/cmd.sh '{
+            containerOverrides: [{
+              name: "dks-ingest",
+              entryPoint: ["bash", "-c"],
+              command: [$cmd]
+            }]
+          }' > /tmp/phase/overrides.json
+          echo "overrides size: $(wc -c < /tmp/phase/overrides.json) bytes"
 
       - name: Run ECS task
         id: run
@@ -171,15 +165,14 @@ jobs:
           SUBNETS_CSV='${{ steps.net.outputs.subnets }}'
           SG='${{ steps.net.outputs.sg }}'
 
-          env SUBS="$SUBNETS_CSV" SG="$SG" python3 - <<'PYEOF' > /tmp/phase/netcfg.json
-          import json, os
-          subs = [s for s in os.environ['SUBS'].split(',') if s]
-          print(json.dumps({'awsvpcConfiguration': {
-              'subnets': subs,
-              'securityGroups': [os.environ['SG']],
-              'assignPublicIp': 'DISABLED',
-          }}))
-          PYEOF
+          # Build netcfg.json with jq — split comma-separated subnets into array
+          jq -n --arg subs "$SUBNETS_CSV" --arg sg "$SG" '{
+            awsvpcConfiguration: {
+              subnets: ($subs | split(",") | map(select(length>0))),
+              securityGroups: [$sg],
+              assignPublicIp: "DISABLED"
+            }
+          }' > /tmp/phase/netcfg.json
           echo "Network config:"
           cat /tmp/phase/netcfg.json
           echo
