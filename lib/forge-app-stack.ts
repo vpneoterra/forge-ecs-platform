@@ -652,14 +652,36 @@ export class ForgeAppStack extends cdk.Stack {
         },
       });
 
+      // Vertex AI (Gemma) service-account JSON -- managed out-of-band in
+      // Secrets Manager at forge/test/vertex-sa-json. Imported by name so CDK
+      // does not try to create or mutate the secret; fromSecretNameV2 avoids
+      // the 6-char suffix requirement of fromSecretCompleteArn.
+      const vertexSaSecret = secretsmanager.Secret.fromSecretNameV2(
+        this,
+        'VertexSaSecret',
+        'forge/test/vertex-sa-json',
+      );
+      vertexSaSecret.grantRead(executionRole);
+
       const dksIngestContainer = dksIngestTaskDef.addContainer('dks-ingest', {
         image: ecs.ContainerImage.fromEcrRepository(dksIngestEcrRepo, 'latest'),
         essential: true,
         environment: {
           DKS_EMBEDDING_MODEL: 'all-MiniLM-L6-v2',
+          // Gemma on Vertex AI (dedicated endpoint). Values mirror the
+          // forge-test task definition so dks-ingest targets the same model.
+          LLM_BACKEND: 'vertex',
+          GEMMA_VERTEX_PROJECT: 'mindful-vial-493123-a5',
+          GEMMA_VERTEX_PROJECT_NUMBER: '945884688373',
+          GEMMA_VERTEX_REGION: 'us-central1',
+          GEMMA_VERTEX_ENDPOINT_ID: 'mg-endpoint-8f11b5ef-4cd2-414e-a238-0f3b4904d17f',
+          GEMMA_VERTEX_MODEL: 'gemma-4-26b-a4b-mg-one-click-deploy',
         },
         secrets: {
           DATABASE_URL: dksSecrets['DKS_DATABASE_URL'],
+          // Full SA JSON injected at task start; vertex_backend.py reads
+          // GEMMA_VERTEX_SA_KEY_JSON inline before falling back to ADC.
+          GEMMA_VERTEX_SA_KEY_JSON: ecs.Secret.fromSecretsManager(vertexSaSecret),
         },
         logging: ecs.LogDrivers.awsLogs({
           logGroup: dksIngestLogGroup,
