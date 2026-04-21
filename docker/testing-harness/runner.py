@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -49,6 +50,16 @@ OMNI_RENDER_PATH      = os.environ.get("OMNI_RENDER_PATH", "/api/sdf/render")
 OMNI_HEALTH_PATH      = os.environ.get("OMNI_HEALTH_PATH", "/api/health")
 PER_PART_TIMEOUT_SEC  = int(os.environ.get("PER_PART_TIMEOUT_SEC", "120"))
 DEFAULT_VOXEL_SIZE_MM = float(os.environ.get("DEFAULT_VOXEL_SIZE_MM", "0.5"))
+
+# Adaptive voxel sizing: when OMNI returns voxel_budget_exceeded with a
+# suggested minimum voxel size, the runner retries once with that suggestion
+# scaled by VOXEL_SIZE_SAFETY_MULT and capped at MAX_VOXEL_SIZE_MM. This keeps
+# the 1-3 chip smoke executable against live OMNI without blanket-relaxing the
+# default voxel size for parts that fit the budget. Set VOXEL_BUDGET_RETRY=0
+# to disable and surface voxel_budget_exceeded as a genuine render failure.
+VOXEL_BUDGET_RETRY    = os.environ.get("VOXEL_BUDGET_RETRY", "true").lower() in ("1", "true", "yes")
+VOXEL_SIZE_SAFETY_MULT = float(os.environ.get("VOXEL_SIZE_SAFETY_MULT", "1.10"))
+MAX_VOXEL_SIZE_MM     = float(os.environ.get("MAX_VOXEL_SIZE_MM", "5.0"))
 
 SHAPE_CORPUS_DIR      = pathlib.Path(os.environ.get("SHAPE_CORPUS_DIR", "/corpus/shapes"))
 FORGENEW_REPO         = os.environ.get("FORGENEW_REPO", "https://github.com/vpneoterra/forgenew.git")
@@ -200,12 +211,37 @@ def chip_to_bom_part(chip: dict) -> dict:
     return part
 
 
-def render_one(session: requests.Session, chip: dict) -> dict:
-    part = chip_to_bom_part(chip)
+# OMNI surfaces voxel_budget_exceeded with a concrete minimum voxel size in
+# the error string, e.g. "voxel_budget_exceeded ... suggested voxelSize >= 0.2693".
+# Match the numeric suggestion so the runner can retry once at that size.
+_VOXEL_SUGGESTION_RE = re.compile(
+    r"voxelSize\s*>=\s*([0-9]+(?:\.[0-9]+)?)",
+    re.IGNORECASE,
+)
+
+
+def _parse_voxel_suggestion(err: t.Optional[str]) -> t.Optional[float]:
+    if not err or "voxel_budget" not in err.lower():
+        return None
+    m = _VOXEL_SUGGESTION_RE.search(err)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _render_once(
+    session: requests.Session,
+    chip: dict,
+    part: dict,
+    voxel_size_mm: float,
+) -> dict:
     url = f"{OMNI_BASE_URL}{OMNI_RENDER_PATH}"
     body = {
         "part": part,
-        "voxel_size_mm": DEFAULT_VOXEL_SIZE_MM,
+        "voxel_size_mm": voxel_size_mm,
         "output_path": f"/output/{part['name']}.stl",
     }
     t0 = time.monotonic()
@@ -217,6 +253,7 @@ def render_one(session: requests.Session, chip: dict) -> dict:
             "name": part["name"],
             "ok": False,
             "error": f"transport: {e}",
+            "voxel_size_mm": voxel_size_mm,
             "elapsed_ms": int((time.monotonic() - t0) * 1000),
         }
     elapsed_ms = int((time.monotonic() - t0) * 1000)
@@ -226,6 +263,7 @@ def render_one(session: requests.Session, chip: dict) -> dict:
             "name": part["name"],
             "ok": False,
             "error": f"http {r.status_code}: {r.text[:300]}",
+            "voxel_size_mm": voxel_size_mm,
             "elapsed_ms": elapsed_ms,
         }
     try:
@@ -236,6 +274,7 @@ def render_one(session: requests.Session, chip: dict) -> dict:
             "name": part["name"],
             "ok": False,
             "error": "non-json response",
+            "voxel_size_mm": voxel_size_mm,
             "elapsed_ms": elapsed_ms,
         }
     success = bool(data.get("Success") or data.get("success"))
@@ -246,8 +285,45 @@ def render_one(session: requests.Session, chip: dict) -> dict:
         "strategy": data.get("Strategy") or data.get("strategy"),
         "is_fallback": data.get("IsFallback") or data.get("is_fallback"),
         "error": None if success else (data.get("Error") or data.get("error")),
+        "voxel_size_mm": voxel_size_mm,
         "elapsed_ms": elapsed_ms,
     }
+
+
+def render_one(session: requests.Session, chip: dict) -> dict:
+    part = chip_to_bom_part(chip)
+    result = _render_once(session, chip, part, DEFAULT_VOXEL_SIZE_MM)
+    if result["ok"] or not VOXEL_BUDGET_RETRY:
+        return result
+
+    suggested = _parse_voxel_suggestion(result.get("error"))
+    if suggested is None:
+        return result
+
+    retry_voxel = suggested * VOXEL_SIZE_SAFETY_MULT
+    if retry_voxel <= DEFAULT_VOXEL_SIZE_MM:
+        # Suggestion was lower than what we just tried; no point retrying.
+        return result
+    if retry_voxel > MAX_VOXEL_SIZE_MM:
+        _log(
+            f"  {part['name']}: voxel_budget_exceeded suggests voxelSize>={suggested} "
+            f"(retry={retry_voxel:.4f}) exceeds MAX_VOXEL_SIZE_MM={MAX_VOXEL_SIZE_MM}; "
+            f"not retrying."
+        )
+        return result
+
+    _log(
+        f"  {part['name']}: voxel_budget_exceeded at {DEFAULT_VOXEL_SIZE_MM}mm; "
+        f"retrying once at {retry_voxel:.4f}mm "
+        f"(suggested>={suggested}, mult={VOXEL_SIZE_SAFETY_MULT})"
+    )
+    retry_result = _render_once(session, chip, part, retry_voxel)
+    retry_result["voxel_retry"] = {
+        "initial_voxel_size_mm": DEFAULT_VOXEL_SIZE_MM,
+        "suggested_min_voxel_size_mm": suggested,
+        "retry_voxel_size_mm": retry_voxel,
+    }
+    return retry_result
 
 
 def main() -> int:
@@ -292,6 +368,11 @@ def main() -> int:
         "omni_base_url": OMNI_BASE_URL,
         "omni_render_path": OMNI_RENDER_PATH,
         "voxel_size_mm": DEFAULT_VOXEL_SIZE_MM,
+        "voxel_budget_retry": {
+            "enabled": VOXEL_BUDGET_RETRY,
+            "safety_mult": VOXEL_SIZE_SAFETY_MULT,
+            "max_voxel_size_mm": MAX_VOXEL_SIZE_MM,
+        },
         "results_file": str(results_path),
     }
     with summary_path.open("w") as f:
