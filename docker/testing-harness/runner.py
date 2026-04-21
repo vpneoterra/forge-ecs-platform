@@ -53,12 +53,15 @@ DEFAULT_VOXEL_SIZE_MM = float(os.environ.get("DEFAULT_VOXEL_SIZE_MM", "0.5"))
 
 # Adaptive voxel sizing: when OMNI returns voxel_budget_exceeded with a
 # suggested minimum voxel size, the runner retries once with that suggestion
-# scaled by VOXEL_SIZE_SAFETY_MULT and capped at MAX_VOXEL_SIZE_MM. This keeps
+# scaled by VOXEL_SIZE_SAFETY_MULT and capped at MAX_VOXEL_SIZE_MM. OMNI's
+# first suggestion can still be conservative after recalculating the actual
+# build envelope, so the default multiplier intentionally leaves a wider
+# margin while keeping one retry per chip.
 # the 1-3 chip smoke executable against live OMNI without blanket-relaxing the
 # default voxel size for parts that fit the budget. Set VOXEL_BUDGET_RETRY=0
 # to disable and surface voxel_budget_exceeded as a genuine render failure.
 VOXEL_BUDGET_RETRY    = os.environ.get("VOXEL_BUDGET_RETRY", "true").lower() in ("1", "true", "yes")
-VOXEL_SIZE_SAFETY_MULT = float(os.environ.get("VOXEL_SIZE_SAFETY_MULT", "1.10"))
+VOXEL_SIZE_SAFETY_MULT = float(os.environ.get("VOXEL_SIZE_SAFETY_MULT", "1.60"))
 MAX_VOXEL_SIZE_MM     = float(os.environ.get("MAX_VOXEL_SIZE_MM", "5.0"))
 
 SHAPE_CORPUS_DIR      = pathlib.Path(os.environ.get("SHAPE_CORPUS_DIR", "/corpus/shapes"))
