@@ -239,9 +239,16 @@ def _render_once(
     voxel_size_mm: float,
 ) -> dict:
     url = f"{OMNI_BASE_URL}{OMNI_RENDER_PATH}"
+    # OMNI's /api/sdf/render DTO is currently a C# Minimal API model with
+    # VoxelSizeMm / OutputPath properties, while earlier harness notes used
+    # snake_case names. Send both forms so the live endpoint receives the
+    # requested voxel size instead of silently falling back to its 0.2mm
+    # default, and keep compatibility if OMNI later adds snake_case aliases.
     body = {
         "part": part,
+        "voxelSizeMm": voxel_size_mm,
         "voxel_size_mm": voxel_size_mm,
+        "outputPath": f"/output/{part['name']}.stl",
         "output_path": f"/output/{part['name']}.stl",
     }
     t0 = time.monotonic()
