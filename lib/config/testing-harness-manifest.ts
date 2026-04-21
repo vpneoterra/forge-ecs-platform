@@ -100,3 +100,19 @@ export const HARNESS_COST_CENTER_TAG = {
   key: 'CostCenter',
   value: 'forge-testing-harness',
 } as const;
+
+/**
+ * Auto-pause Lambda default. When true (the default), deploying the
+ * harness stack also provisions a Lambda that is subscribed to the
+ * harness SNS alert topic and will:
+ *   - set the harness ECS service desiredCount to 0
+ *   - stop any RUNNING / PENDING tasks in the harness cluster
+ * as soon as AWS Budgets fires a threshold notification.
+ *
+ * The Lambda is scoped strictly to the harness cluster/service — it
+ * cannot touch OMNI, app, solver, or data stacks. The operator
+ * scripts/harness-pause.sh remains available as a manual override.
+ *
+ * Disable at synth time with `-c enableHarnessAutoPause=false`.
+ */
+export const HARNESS_AUTO_PAUSE_ENABLED_DEFAULT = true;

@@ -20,6 +20,7 @@
  *   deployGemma   "true" to deploy Gemma GPU inference stack (g6.2xlarge + NLB)
  *   deployGeometry "true" to deploy Geometry Platform stack (B-Rep, GPU SDF, Neural SDF)
  *   deployTestingHarness "true" to deploy the Tier-2 OMNI shape-chip harness (requires deployOmni=true)
+ *   enableHarnessAutoPause "false" to opt out of the auto-pause Lambda (defaults to true)
  *   deploySolvers "true" to deploy full Compute + Orchestration stacks
  *   skipRds       "true" to skip RDS (use external Supabase)
  *   appDomain     Domain for forge-app (default: forgetest.qrucible.ai)
@@ -71,6 +72,10 @@ const deployGeometry =
   (app.node.tryGetContext('deployGeometry') as string | undefined) === 'true';
 const deployTestingHarness =
   (app.node.tryGetContext('deployTestingHarness') as string | undefined) === 'true';
+// Auto-pause Lambda defaults on. Set -c enableHarnessAutoPause=false to
+// opt out and fall back to operator-only pause via scripts/harness-pause.sh.
+const enableHarnessAutoPause =
+  (app.node.tryGetContext('enableHarnessAutoPause') as string | undefined) !== 'false';
 const omniDomain =
   (app.node.tryGetContext('omniDomain') as string | undefined) ?? 'omni.qrucible.ai';
 
@@ -187,6 +192,7 @@ if (deployTestingHarness) {
     privateSubnets: networkStack.privateSubnets,
     omniAlbHost: omniDomain,
     alertEmail,
+    enableAutoPause: enableHarnessAutoPause,
     tags: sharedTags,
   });
   harnessStack.addDependency(networkStack);

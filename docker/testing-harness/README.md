@@ -47,3 +47,29 @@ docker run --rm \
 ## Production launch
 
 See `scripts/harness-run.sh` at repo root.
+
+## Budget auto-pause
+
+The harness stack deploys an AWS Budget (USD 50 / month, scoped to
+`CostCenter=forge-testing-harness`) with SNS notifications at 50/80/100%
+and a Lambda (`forge-harness-auto-pause-<env>`) that is subscribed to
+that SNS topic. When any threshold fires, the Lambda automatically:
+
+1. sets the harness ECS service `desiredCount` to 0
+2. stops any RUNNING / PENDING harness tasks
+
+The Lambda is scoped strictly to the harness cluster/service via IAM;
+it cannot touch OMNI, app, solver, or data stacks.
+
+To opt out of auto-pause at synth time:
+
+```
+cdk deploy ForgeTestingHarness-dev \
+  -c deployTestingHarness=true -c deployOmni=true \
+  -c enableHarnessAutoPause=false
+```
+
+To disable an already-deployed Lambda without redeploying, set its
+`AUTO_PAUSE_ENABLED` env var to `false` (it will log SNS events but
+take no action). `scripts/harness-pause.sh` remains available as an
+operator override in either case.

@@ -16,11 +16,12 @@
  * Cost ceiling:
  *   - USD 50 AWS Budget scoped to tag CostCenter=forge-testing-harness
  *   - SNS alarm topic for budget breaches
- *   - Pause is executed by scripts/harness-pause.sh (operator-run), wired
- *     to the SNS topic so operators receive the signal and can run the
- *     script out-of-band. (We do not auto-kill infra from a Lambda inside
- *     this stack -- budgets are lagging, and silent infra termination is
- *     surprising. The operator playbook lives in the script header.)
+ *   - Auto-pause Lambda subscribed to the SNS topic (enabled by default)
+ *     that scales the harness ECS service to 0 and stops any running
+ *     harness tasks the moment AWS Budgets fires. Strictly scoped to the
+ *     harness cluster/service -- it does not touch OMNI/app/solver stacks.
+ *     Disable with `-c enableHarnessAutoPause=false`.
+ *   - scripts/harness-pause.sh remains available for operator override.
  *
  * Resources created:
  *   - ECR repo `forge-testing-harness` for the runner image
@@ -28,6 +29,7 @@
  *   - Fargate task definition with desiredCount=0 service (manual launch)
  *   - AWS Budget (USD 50) scoped to CostCenter tag
  *   - SNS topic `forge-harness-alerts` for budget notifications
+ *   - Lambda `forge-harness-auto-pause-<env>` (when auto-pause enabled)
  *
  * Incremental monthly cost when idle:
  *   - ECR repo storage: < $0.10
@@ -38,6 +40,7 @@
  *   Fargate time, well under the USD 50 ceiling.
  */
 
+import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
@@ -47,12 +50,14 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as snsSubscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
 import * as budgets from 'aws-cdk-lib/aws-budgets';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
 import { Construct } from 'constructs';
 import {
   HARNESS_RUNNER,
   HARNESS_COST_CEILING_USD,
   HARNESS_BUDGET_THRESHOLDS_PERCENT,
   HARNESS_COST_CENTER_TAG,
+  HARNESS_AUTO_PAUSE_ENABLED_DEFAULT,
   SHAPE_CHIP_EXPECTED_COUNT,
 } from './config/testing-harness-manifest';
 
@@ -69,6 +74,15 @@ export interface ForgeTestingHarnessStackProps extends cdk.StackProps {
   omniAlbHost: string;
   /** Email for harness budget alerts */
   alertEmail: string;
+  /**
+   * Enable the auto-pause Lambda subscribed to the harness SNS alert
+   * topic. Defaults to HARNESS_AUTO_PAUSE_ENABLED_DEFAULT (true). When
+   * the Lambda is deployed it will scale the harness ECS service to 0
+   * and stop running tasks as soon as AWS Budgets fires a threshold
+   * notification. The manual scripts/harness-pause.sh remains available
+   * for operator overrides regardless of this setting.
+   */
+  enableAutoPause?: boolean;
   tags?: Record<string, string>;
 }
 
@@ -77,6 +91,7 @@ export class ForgeTestingHarnessStack extends cdk.Stack {
   public readonly cluster: ecs.Cluster;
   public readonly service: ecs.FargateService;
   public readonly alertTopic: sns.Topic;
+  public readonly autoPauseLambda?: lambda.Function;
 
   constructor(scope: Construct, id: string, props: ForgeTestingHarnessStackProps) {
     super(scope, id, props);
@@ -244,6 +259,91 @@ export class ForgeTestingHarnessStack extends cdk.Stack {
       actions: ['sns:Publish'],
       resources: [this.alertTopic.topicArn],
     }));
+
+    // ── Auto-pause Lambda (subscribed to the budget SNS topic) ────────────
+    // Strictly scoped to the harness cluster/service. When AWS Budgets
+    // fires a threshold notification this Lambda scales the harness
+    // ECS service to desiredCount=0 and stops any running harness tasks.
+    // IAM allows only ecs:UpdateService on the harness service ARN and
+    // ecs:StopTask on harness-cluster task ARNs. ListTasks/Describe*
+    // actions cannot be resource-scoped in IAM (AWS limitation) so they
+    // are condition-scoped to the harness cluster.
+    const autoPauseEnabled = props.enableAutoPause ?? HARNESS_AUTO_PAUSE_ENABLED_DEFAULT;
+    if (autoPauseEnabled) {
+      const region = cdk.Stack.of(this).region;
+      const account = cdk.Stack.of(this).account;
+      const clusterArn = `arn:aws:ecs:${region}:${account}:cluster/${this.cluster.clusterName}`;
+      const serviceArn = `arn:aws:ecs:${region}:${account}:service/${this.cluster.clusterName}/${this.service.serviceName}`;
+      const taskArnPattern = `arn:aws:ecs:${region}:${account}:task/${this.cluster.clusterName}/*`;
+
+      const autoPauseRole = new iam.Role(this, 'HarnessAutoPauseRole', {
+        assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+        managedPolicies: [
+          iam.ManagedPolicy.fromAwsManagedPolicyName(
+            'service-role/AWSLambdaBasicExecutionRole',
+          ),
+        ],
+      });
+      // Mutating actions: scoped to the harness service and harness-cluster tasks.
+      autoPauseRole.addToPolicy(new iam.PolicyStatement({
+        sid: 'HarnessServiceScaleDown',
+        actions: ['ecs:UpdateService'],
+        resources: [serviceArn],
+      }));
+      autoPauseRole.addToPolicy(new iam.PolicyStatement({
+        sid: 'HarnessTaskStop',
+        actions: ['ecs:StopTask'],
+        resources: [taskArnPattern],
+        conditions: {
+          ArnEquals: { 'ecs:cluster': clusterArn },
+        },
+      }));
+      // Read-only listing/describing of tasks+service; ListTasks/Describe* do
+      // not support resource-level ARNs so we condition-scope to the cluster.
+      autoPauseRole.addToPolicy(new iam.PolicyStatement({
+        sid: 'HarnessReadOnly',
+        actions: [
+          'ecs:ListTasks',
+          'ecs:DescribeTasks',
+          'ecs:DescribeServices',
+          'ecs:DescribeClusters',
+        ],
+        resources: ['*'],
+        conditions: {
+          ArnEquals: { 'ecs:cluster': clusterArn },
+        },
+      }));
+
+      this.autoPauseLambda = new lambda.Function(this, 'HarnessAutoPauseFn', {
+        functionName: `forge-harness-auto-pause-${env}`,
+        runtime: lambda.Runtime.PYTHON_3_12,
+        handler: 'index.handler',
+        code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda', 'harness-auto-pause')),
+        role: autoPauseRole,
+        timeout: cdk.Duration.seconds(60),
+        memorySize: 256,
+        logRetention: logs.RetentionDays.ONE_WEEK,
+        environment: {
+          HARNESS_CLUSTER_NAME: this.cluster.clusterName,
+          HARNESS_SERVICE_NAME: this.service.serviceName,
+          AUTO_PAUSE_ENABLED: 'true',
+        },
+        description:
+          'Auto-pauses the FORGE Tier-2 testing harness when the ' +
+          'USD 50 budget SNS alert fires. Scoped strictly to the ' +
+          'harness cluster/service.',
+      });
+
+      this.alertTopic.addSubscription(
+        new snsSubscriptions.LambdaSubscription(this.autoPauseLambda),
+      );
+
+      new cdk.CfnOutput(this, 'HarnessAutoPauseLambdaArn', {
+        value: this.autoPauseLambda.functionArn,
+        description: 'Lambda ARN that auto-pauses the harness on budget alerts',
+        exportName: `ForgeTestingHarnessAutoPauseLambda-${env}`,
+      });
+    }
 
     // ── Outputs ───────────────────────────────────────────────────────────
     new cdk.CfnOutput(this, 'HarnessEcrUri', {

@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# Pause/disable the tier-2 testing harness in response to a budget breach
+# MANUAL pause of the tier-2 testing harness in response to a budget breach
 # (USD 50 ceiling, see lib/forge-testing-harness-stack.ts).
+#
+# As of PR #15 the harness stack also deploys an auto-pause Lambda
+# (forge-harness-auto-pause-<env>) that is subscribed to the budget SNS
+# topic and performs the same action automatically. This script remains
+# available as an operator override — for example, when you want to pause
+# before a budget alert fires, or when AUTO_PAUSE_ENABLED has been set to
+# "false" on the Lambda.
 #
 # What this does, SCOPED STRICTLY TO HARNESS RESOURCES:
 #   1. Sets the harness ECS service desiredCount to 0 (already the default,
