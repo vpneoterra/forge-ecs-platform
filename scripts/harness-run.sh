@@ -130,21 +130,120 @@ if [[ "${WAIT_FOR_COMPLETION:-false}" == "true" ]]; then
     --cluster "${CLUSTER_NAME}" \
     --tasks "${TASK_ARN}" \
     --region "${REGION}"
-  EXIT_CODE=$(aws ecs describe-tasks \
+
+  # Full task description (best-effort, non-fatal).
+  DESCRIBE_JSON=$(aws ecs describe-tasks \
     --cluster "${CLUSTER_NAME}" \
     --tasks "${TASK_ARN}" \
     --region "${REGION}" \
-    --query 'tasks[0].containers[?name==`harness-runner`].exitCode | [0]' \
-    --output text)
-  STOP_REASON=$(aws ecs describe-tasks \
-    --cluster "${CLUSTER_NAME}" \
-    --tasks "${TASK_ARN}" \
-    --region "${REGION}" \
-    --query 'tasks[0].stoppedReason' \
-    --output text)
-  info "Task stopped: exitCode=${EXIT_CODE} stoppedReason=${STOP_REASON}"
+    --output json 2>/dev/null || echo '{}')
+
+  info "=== ECS task summary (${TASK_ID}) ==="
+  echo "${DESCRIBE_JSON}" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    t = (d.get('tasks') or [{}])[0]
+    print(f\"lastStatus    : {t.get('lastStatus')}\")
+    print(f\"stopCode      : {t.get('stopCode')}\")
+    print(f\"stoppedReason : {t.get('stoppedReason')}\")
+    print(f\"taskDefArn    : {t.get('taskDefinitionArn')}\")
+    for c in t.get('containers', []) or []:
+        print('---')
+        print(f\"  container   : {c.get('name')}\")
+        print(f\"  image       : {c.get('image')}\")
+        print(f\"  lastStatus  : {c.get('lastStatus')}\")
+        print(f\"  exitCode    : {c.get('exitCode')}\")
+        print(f\"  reason      : {c.get('reason')}\")
+except Exception as e:
+    print(f'(could not parse describe-tasks JSON: {e})')
+" || true
+
+  EXIT_CODE=$(echo "${DESCRIBE_JSON}" | python3 -c "
+import json, sys
+try:
+    t = (json.load(sys.stdin).get('tasks') or [{}])[0]
+    for c in t.get('containers', []) or []:
+        if c.get('name') == 'harness-runner':
+            ec = c.get('exitCode')
+            print('' if ec is None else ec); sys.exit(0)
+    print('')
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+  STOP_REASON=$(echo "${DESCRIBE_JSON}" | python3 -c "
+import json, sys
+try:
+    t = (json.load(sys.stdin).get('tasks') or [{}])[0]
+    print(t.get('stoppedReason') or '')
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+  info "Task stopped: exitCode=${EXIT_CODE:-<none>} stoppedReason=${STOP_REASON}"
+
+  # ── Best-effort log dump ────────────────────────────────────────────────
+  # Derive the awslogs group + stream prefix directly from the task
+  # definition's container logConfiguration so we never guess wrong.
+  info "Resolving awslogs config from task definition ..."
+  TASK_DEF_FULL_ARN=$(echo "${DESCRIBE_JSON}" | python3 -c "
+import json, sys
+try:
+    t = (json.load(sys.stdin).get('tasks') or [{}])[0]
+    print(t.get('taskDefinitionArn') or '')
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+
+  if [[ -n "${TASK_DEF_FULL_ARN}" ]]; then
+    TD_JSON=$(aws ecs describe-task-definition \
+      --task-definition "${TASK_DEF_FULL_ARN}" \
+      --region "${REGION}" \
+      --output json 2>/dev/null || echo '{}')
+    LOG_INFO=$(echo "${TD_JSON}" | python3 -c "
+import json, sys
+try:
+    td = json.load(sys.stdin).get('taskDefinition') or {}
+    for c in td.get('containerDefinitions', []) or []:
+        if c.get('name') == 'harness-runner':
+            lc = c.get('logConfiguration') or {}
+            if lc.get('logDriver') == 'awslogs':
+                opts = lc.get('options') or {}
+                print(opts.get('awslogs-group',''))
+                print(opts.get('awslogs-stream-prefix',''))
+            break
+except Exception:
+    pass
+" 2>/dev/null || echo "")
+    LOG_GROUP=$(echo "${LOG_INFO}" | sed -n '1p')
+    LOG_PREFIX=$(echo "${LOG_INFO}" | sed -n '2p')
+
+    if [[ -n "${LOG_GROUP}" && -n "${LOG_PREFIX}" ]]; then
+      LOG_STREAM="${LOG_PREFIX}/harness-runner/${TASK_ID}"
+      info "=== CloudWatch logs (group=${LOG_GROUP} stream=${LOG_STREAM}) ==="
+      aws logs get-log-events \
+        --log-group-name "${LOG_GROUP}" \
+        --log-stream-name "${LOG_STREAM}" \
+        --region "${REGION}" \
+        --limit 200 \
+        --no-start-from-head \
+        --output json 2>/dev/null \
+        | python3 -c "
+import json, sys
+try:
+    for e in json.load(sys.stdin).get('events', []) or []:
+        print(e.get('message',''))
+except Exception as e:
+    print(f'(could not read log events: {e})')
+" || warn "Log retrieval failed (non-fatal)."
+    else
+      warn "Could not resolve awslogs group/prefix from task definition (non-fatal)."
+    fi
+  else
+    warn "No taskDefinitionArn on stopped task; skipping log dump."
+  fi
+
   if [[ "${EXIT_CODE}" != "0" ]]; then
-    error "Harness task exited non-zero"
+    error "Harness task exited non-zero (exitCode=${EXIT_CODE:-<none>})"
     exit 1
   fi
   success "Harness task completed cleanly"
