@@ -102,8 +102,25 @@ export class ForgeAppStack extends cdk.Stack {
       this, 'OmniRepo', 'forge-omni',
     );
 
+    // -- Feature flags --------------------------------------------------------
+    // Runtime toggle for the autonomous pipeline (BullMQ on Redis). Disabling
+    // this flag omits the redis-url secret entirely from the container env
+    // so a quota-exhausted / misconfigured Redis provider cannot drive a
+    // command storm from inside the task.
+    //
+    // Usage:
+    //   cdk deploy ForgeAppStack                          # pipeline ENABLED (default)
+    //   cdk deploy ForgeAppStack -c pipelineEnabled=false # pipeline DISABLED
+    //
+    // Server-side, forgenew/server.js treats absent or empty REDIS_URL as
+    // "pipeline disabled" and serves /api/pipeline/* with 503.
+    const pipelineEnabledCtx = this.node.tryGetContext('pipelineEnabled');
+    const pipelineEnabled = pipelineEnabledCtx === undefined
+      ? true
+      : String(pipelineEnabledCtx).toLowerCase() !== 'false';
+
     // -- Secrets --------------------------------------------------------------
-    const secretNames = [
+    const baseSecretNames = [
       'supabase-url',
       'supabase-service-key',
       'supabase-anon-key',
@@ -113,8 +130,13 @@ export class ForgeAppStack extends cdk.Stack {
       'together-api-key',
       'lucid-token',
       'database-url',
-      'redis-url',              // Autonomous Pipeline v2: Upstash Redis for BullMQ
     ];
+    // Autonomous Pipeline v2: Upstash Redis for BullMQ. Only include when
+    // the pipeline is enabled, so disabling the flag is a clean CDK-only
+    // change with no surviving secret reference in the task definition.
+    const secretNames = pipelineEnabled
+      ? [...baseSecretNames, 'redis-url']
+      : baseSecretNames;
 
     // DKS-specific secrets (separate Supabase project: forge-dks)
     const dksSecretNames = [
@@ -253,6 +275,7 @@ export class ForgeAppStack extends cdk.Stack {
         FLUXTK_ENABLED: 'false',
         FLUXTK_API_URL: 'http://forge-fluxtk.forge-geometry.local:8040',
         // -- Autonomous Pipeline v2 configuration --
+        PIPELINE_ENABLED: pipelineEnabled ? 'true' : 'false',
         PIPELINE_MAX_VARIANTS: '3',
         PIPELINE_MAX_RETRIES: '2',
         PIPELINE_BUDGET_CAP_USD: '5.00',
@@ -785,6 +808,11 @@ export class ForgeAppStack extends cdk.Stack {
     }
 
     // -- Outputs ---------------------------------------------------------------
+    new cdk.CfnOutput(this, 'PipelineEnabled', {
+      value: pipelineEnabled ? 'true' : 'false',
+      description: 'Autonomous pipeline (BullMQ/Redis) injection state. Toggle with `-c pipelineEnabled=false`.',
+    });
+
     this.albDnsName = new cdk.CfnOutput(this, 'AlbDnsName', {
       value: this.alb.loadBalancerDnsName,
       description: 'ALB DNS name (Route 53 Alias handles this -- no manual CNAME needed)',
