@@ -6,11 +6,12 @@
 #
 # Optional env vars (useful for smoke testing):
 #   SMOKE_COUNT       If set to a positive integer, the run-task is submitted
-#                     with container overrides MAX_PARTS_PER_RUN=<SMOKE_COUNT>
-#                     and EXPECTED_SHAPE_CHIP_COUNT=<SMOKE_COUNT>. This lets
-#                     you run only N chips (e.g. SMOKE_COUNT=3) without
-#                     tripping the 313-chip count guardrail baked into the
-#                     task definition.
+#                     with a container override MAX_PARTS_PER_RUN=<SMOKE_COUNT>,
+#                     limiting execution to N chips (e.g. SMOKE_COUNT=3) while
+#                     still validating that the full baked corpus of 313 chips
+#                     is present. EXPECTED_SHAPE_CHIP_COUNT is intentionally
+#                     NOT overridden here: the count guardrail must continue
+#                     to assert the full corpus exists even during smoke runs.
 #   WAIT_FOR_COMPLETION  If "true", block until the task reaches STOPPED and
 #                     exit non-zero if the container exit code != 0.
 #
@@ -95,7 +96,10 @@ if [[ -n "${SMOKE_COUNT:-}" ]]; then
     error "SMOKE_COUNT must be a positive integer (got: ${SMOKE_COUNT})"
     exit 1
   fi
-  info "SMOKE_COUNT=${SMOKE_COUNT} -- adding container overrides for the runner"
+  info "SMOKE_COUNT=${SMOKE_COUNT} -- limiting run to ${SMOKE_COUNT} chips (corpus guard still expects 313)"
+  # Only override MAX_PARTS_PER_RUN. EXPECTED_SHAPE_CHIP_COUNT remains at the
+  # task-def default (313) so the runner's fail-closed count guardrail still
+  # verifies the full baked corpus is present before executing N parts.
   OVERRIDES=$(python3 -c "
 import json, sys
 n = sys.argv[1]
@@ -103,8 +107,7 @@ print(json.dumps({
     'containerOverrides': [{
         'name': 'harness-runner',
         'environment': [
-            {'name': 'MAX_PARTS_PER_RUN',        'value': n},
-            {'name': 'EXPECTED_SHAPE_CHIP_COUNT', 'value': n},
+            {'name': 'MAX_PARTS_PER_RUN', 'value': n},
         ],
     }],
 }))
