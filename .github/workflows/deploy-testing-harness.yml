@@ -89,30 +89,75 @@ jobs:
           echo "image_tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Resolved harness image tag: ${TAG}"
 
-      - name: CDK Synth (harness + omni)
+      # Preflight: if a prior ForgeOmni-<env> deploy left the stack in
+      # ROLLBACK_FAILED / *_FAILED (e.g. because the Route 53 A record
+      # omni.qrucible.ai already existed out-of-band), the CFN console is
+      # stuck and any stack operation in the same account can be blocked.
+      # We do NOT redeploy OMNI here and we must NOT delete the existing
+      # Route 53 record or ALB. Retain every stuck resource and let CFN
+      # remove only the stack metadata.
+      - name: Preflight ForgeOmni-${{ github.event.inputs.environment }} (only if stuck)
+        run: |
+          set +e
+          STACK="ForgeOmni-${{ github.event.inputs.environment }}"
+          STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+            --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+          echo "Current status of $STACK: $STATUS"
+
+          if [ "$STATUS" = "DOES_NOT_EXIST" ]; then
+            echo "No ForgeOmni stack in the account -- nothing to preflight."
+            exit 0
+          fi
+
+          case "$STATUS" in
+            *ROLLBACK_FAILED*|*DELETE_FAILED*|*CREATE_FAILED*|*UPDATE_ROLLBACK_FAILED*)
+              echo "Stack in stuck state ($STATUS). Retaining ALL resources to"
+              echo "avoid deleting the live Route 53 record / ALB / ECS cluster."
+              ALL_RESOURCES=$(aws cloudformation describe-stack-resources --stack-name "$STACK" \
+                --query "StackResources[*].LogicalResourceId" --output text 2>/dev/null || echo "")
+              if [ -z "$ALL_RESOURCES" ]; then
+                echo "Could not list resources -- skipping preflight without action."
+                exit 0
+              fi
+              echo "Retain list: $ALL_RESOURCES"
+              aws cloudformation delete-stack --stack-name "$STACK" --retain-resources $ALL_RESOURCES
+              echo "Waiting up to 5 min for CFN to drop the stuck stack..."
+              timeout 300 aws cloudformation wait stack-delete-complete --stack-name "$STACK" 2>/dev/null || true
+              FINAL=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+                --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+              echo "Final status: $FINAL"
+              ;;
+            *)
+              echo "Stack healthy or transitioning ($STATUS) -- leaving it alone."
+              ;;
+          esac
+          exit 0
+
+      # Harness only needs the OMNI ALB hostname (passed via -c omniDomain).
+      # We deliberately do NOT list ForgeOmni-<env> here: the harness stack
+      # does not cross-import OMNI constructs, and redeploying ForgeOmni
+      # against an existing `omni.qrucible.ai` A record triggers the exact
+      # "record set already exists" failure we just recovered from.
+      - name: CDK Synth (network + harness)
         run: |
           npx cdk synth \
             ForgeNetwork-${{ github.event.inputs.environment }} \
-            ForgeOmni-${{ github.event.inputs.environment }} \
             ForgeTestingHarness-${{ github.event.inputs.environment }} \
             -c env=${{ github.event.inputs.environment }} \
             -c deployTestingHarness=true \
-            -c deployOmni=true \
             -c deploySolvers=true \
             -c skipRds=true \
             -c alertEmail=${{ github.event.inputs.alertEmail }}
 
-      - name: CDK Deploy (harness stack and dependencies)
+      - name: CDK Deploy (network + harness only)
         run: |
           npx cdk deploy \
             ForgeNetwork-${{ github.event.inputs.environment }} \
-            ForgeOmni-${{ github.event.inputs.environment }} \
             ForgeTestingHarness-${{ github.event.inputs.environment }} \
             --require-approval never \
             --outputs-file harness-cdk-outputs.json \
             -c env=${{ github.event.inputs.environment }} \
             -c deployTestingHarness=true \
-            -c deployOmni=true \
             -c deploySolvers=true \
             -c skipRds=true \
             -c alertEmail=${{ github.event.inputs.alertEmail }}

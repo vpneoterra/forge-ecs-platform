@@ -19,7 +19,12 @@
  *   deployDks     "true" to deploy DKS (Design Knowledge System) in ForgeAppStack
  *   deployGemma   "true" to deploy Gemma GPU inference stack (g6.2xlarge + NLB)
  *   deployGeometry "true" to deploy Geometry Platform stack (B-Rep, GPU SDF, Neural SDF)
- *   deployTestingHarness "true" to deploy the Tier-2 OMNI shape-chip harness (requires deployOmni=true)
+ *   deployTestingHarness "true" to deploy the Tier-2 OMNI shape-chip harness. OMNI
+ *                        does NOT need to be redeployed -- the harness only needs the
+ *                        OMNI ALB hostname (`omniDomain`), which is assumed to already
+ *                        resolve (Route 53 record + ALB). Set `deployOmni=true` only
+ *                        if you actually intend to (re)deploy the OMNI stack in the
+ *                        same cdk invocation.
  *   enableHarnessAutoPause "false" to opt out of the auto-pause Lambda (defaults to true)
  *   deploySolvers "true" to deploy full Compute + Orchestration stacks
  *   skipRds       "true" to skip RDS (use external Supabase)
@@ -174,15 +179,14 @@ if (deployOmni) {
   omniStack.addDependency(networkStack);
 }
 
-// -- Tier-2 Testing Harness Stack (optional, requires deployOmni=true) -------
+// -- Tier-2 Testing Harness Stack (optional) ---------------------------------
+// The harness only consumes the OMNI ALB hostname (`omniDomain`) as a string;
+// it does NOT cross-import the OMNI stack's constructs. As long as the OMNI
+// ALB + Route 53 record already resolve in the account, the harness can be
+// (re)deployed on its own without touching ForgeOmni-<env>. Set
+// `-c deployOmni=true` alongside only when you actually intend to (re)deploy
+// the OMNI stack in the same cdk invocation.
 if (deployTestingHarness) {
-  if (!deployOmni) {
-    throw new Error(
-      'deployTestingHarness=true requires deployOmni=true: the tier-2 harness ' +
-      'targets the OMNI /api/sdf/render endpoint, so the OMNI stack must be ' +
-      'deployed in the same cdk invocation (or already present in the account).',
-    );
-  }
   const harnessStack = new ForgeTestingHarnessStack(app, `ForgeTestingHarness-${env}`, {
     env: awsEnv,
     description: 'FORGE Tier-2 Testing Harness -- drives 313 OMNI shape chips through /api/sdf/render',
