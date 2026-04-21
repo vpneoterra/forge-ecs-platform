@@ -150,6 +150,34 @@ jobs:
           printf '%s' "$GEMMA_VERTEX_SA_KEY_JSON" > /tmp/gcp/sa.json
           export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp/sa.json
           export GOOGLE_CLOUD_PROJECT="${GEMMA_VERTEX_PROJECT:-mindful-vial-493123-a5}"
+
+          # ---- Vertex dedicated-DNS preflight ----
+          # Fail fast (and cheaply) if the per-endpoint dedicated DNS host does
+          # not resolve or TCP/443 is unreachable from the Fargate subnet. This
+          # catches the prior "wrong project number baked into the host" class
+          # of bug before we spend compute running the harvester.
+          if [ "${GEMMA_VERTEX_DEDICATED_DNS:-false}" = "true" ]; then
+            DNS_PREFIX="${GEMMA_VERTEX_DEDICATED_DNS_PREFIX:-${GEMMA_VERTEX_ENDPOINT_ID:-}}"
+            PROJ_NUM="${GEMMA_VERTEX_PROJECT_NUMBER:-}"
+            REGION="${GEMMA_VERTEX_REGION:-us-central1}"
+            if [ -z "$DNS_PREFIX" ] || [ -z "$PROJ_NUM" ]; then
+              echo "::error::dedicated DNS preflight: missing DNS_PREFIX or PROJECT_NUMBER"
+              exit 3
+            fi
+            VERTEX_HOST="${DNS_PREFIX}.${REGION}-${PROJ_NUM}.prediction.vertexai.goog"
+            echo ">>> vertex dedicated DNS preflight: $VERTEX_HOST"
+            if ! getent hosts "$VERTEX_HOST" >/dev/null 2>&1; then
+              echo "::error::DNS resolution failed for $VERTEX_HOST"
+              exit 3
+            fi
+            # TCP 443 reachability via /dev/tcp (bash built-in, no extra deps)
+            if ! timeout 5 bash -c ">/dev/tcp/${VERTEX_HOST}/443" 2>/dev/null; then
+              echo "::error::TCP 443 unreachable for $VERTEX_HOST"
+              exit 3
+            fi
+            echo ">>> preflight ok: $VERTEX_HOST resolves and accepts TCP/443"
+          fi
+
           mkdir -p /data/logs
           LOG=/data/logs/phase1_$(date +%Y%m%d_%H%M%S).log
 

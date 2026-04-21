@@ -91,18 +91,21 @@ jobs:
           cd['image'] = f"{os.environ['ACCOUNT_ID']}.dkr.ecr.{os.environ['AWS_REGION']}.amazonaws.com/dks-ingest:{os.environ['IMAGE_TAG']}"
 
           # Full Vertex env set (desired state, not delta)
+          # Project number corrected to 141501991950 (recovered from GCP console);
+          # the previously configured 945884688373 produced a dedicated DNS host
+          # that did not resolve. Dedicated DNS is re-enabled and pinned to the
+          # endpoint prefix surfaced by the console:
+          #   mg-endpoint-8f11b5ef-4cd2-414e-a238-0f3b4904d17f.us-central1-141501991950.prediction.vertexai.goog
           vertex_env = {
-              'LLM_BACKEND':                 'vertex',
-              'GEMMA_VERTEX_PROJECT':        'mindful-vial-493123-a5',
-              'GEMMA_VERTEX_PROJECT_NUMBER': '945884688373',
-              'GEMMA_VERTEX_REGION':         'us-central1',
-              'GEMMA_VERTEX_ENDPOINT_ID':    'mg-endpoint-8f11b5ef-4cd2-414e-a238-0f3b4904d17f',
-              'GEMMA_VERTEX_MODEL':          'gemma-4-26b-a4b-mg-one-click-deploy',
-              'DKS_EMBEDDING_MODEL':         'all-MiniLM-L6-v2',
-              # Use regional aiplatform.googleapis.com instead of the per-endpoint
-              # prediction.vertexai.goog dedicated DNS (DNS for that subdomain was
-              # failing from our private subnet with ConnectError [Errno -2]).
-              'GEMMA_VERTEX_DEDICATED_DNS':  'false',
+              'LLM_BACKEND':                       'vertex',
+              'GEMMA_VERTEX_PROJECT':              'mindful-vial-493123-a5',
+              'GEMMA_VERTEX_PROJECT_NUMBER':       '141501991950',
+              'GEMMA_VERTEX_REGION':               'us-central1',
+              'GEMMA_VERTEX_ENDPOINT_ID':          'mg-endpoint-8f11b5ef-4cd2-414e-a238-0f3b4904d17f',
+              'GEMMA_VERTEX_MODEL':                'gemma-4-26b-a4b-mg-one-click-deploy',
+              'DKS_EMBEDDING_MODEL':               'all-MiniLM-L6-v2',
+              'GEMMA_VERTEX_DEDICATED_DNS':        'true',
+              'GEMMA_VERTEX_DEDICATED_DNS_PREFIX': 'mg-endpoint-8f11b5ef-4cd2-414e-a238-0f3b4904d17f',
           }
 
           existing = {e['name']: e['value'] for e in cd.get('environment', [])}
