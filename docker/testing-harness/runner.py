@@ -53,6 +53,10 @@ DEFAULT_VOXEL_SIZE_MM = float(os.environ.get("DEFAULT_VOXEL_SIZE_MM", "0.5"))
 SHAPE_CORPUS_DIR      = pathlib.Path(os.environ.get("SHAPE_CORPUS_DIR", "/corpus/shapes"))
 FORGENEW_REPO         = os.environ.get("FORGENEW_REPO", "https://github.com/vpneoterra/forgenew.git")
 FORGENEW_SUBPATH      = os.environ.get("FORGENEW_SUBPATH", "server/axiom/chips/shapes")
+# ECS tasks must not hold GitHub credentials, so runtime cloning is off
+# by default. Set ALLOW_RUNTIME_CLONE=true + a public/anonymous-readable
+# FORGENEW_REPO to re-enable the old fallback path.
+ALLOW_RUNTIME_CLONE   = os.environ.get("ALLOW_RUNTIME_CLONE", "false").lower() in ("1", "true", "yes")
 OUTPUT_DIR            = pathlib.Path(os.environ.get("OUTPUT_DIR", "/tmp/harness-output"))
 
 OMNI_API_KEY          = os.environ.get("OMNI_API_KEY")  # optional
@@ -63,15 +67,42 @@ def _log(msg: str) -> None:
     print(f"[harness] {msg}", flush=True)
 
 
+def _count_json(root: pathlib.Path) -> int:
+    return sum(1 for _ in root.rglob("*.json"))
+
+
 def ensure_corpus() -> pathlib.Path:
-    """Return the path to the shape-chip corpus, fetching it if absent."""
+    """Return the path to the shape-chip corpus.
+
+    Resolution order (fail-closed to avoid runtime GitHub creds):
+      1. SHAPE_CORPUS_DIR (default /corpus/shapes) baked into the image
+         or mounted in by the task definition.
+      2. If ALLOW_RUNTIME_CLONE=true, attempt an anonymous depth-1 clone
+         of FORGENEW_REPO. This branch is disabled by default because
+         vpneoterra/forgenew is private and ECS tasks must not carry a
+         GitHub token.
+    """
     if SHAPE_CORPUS_DIR.is_dir() and any(SHAPE_CORPUS_DIR.iterdir()):
-        _log(f"using pre-mounted corpus at {SHAPE_CORPUS_DIR}")
+        try:
+            n = _count_json(SHAPE_CORPUS_DIR)
+        except Exception:
+            n = -1
+        _log(f"corpus source: baked/mounted at {SHAPE_CORPUS_DIR} (json_count={n})")
         return SHAPE_CORPUS_DIR
+
+    if not ALLOW_RUNTIME_CLONE:
+        _log(
+            "FATAL: shape-chip corpus not found at "
+            f"{SHAPE_CORPUS_DIR} and ALLOW_RUNTIME_CLONE=false. The image "
+            "is expected to be built with the corpus staged under "
+            "docker/testing-harness/corpus/shapes (CI does this from "
+            "vpneoterra/forgenew using GH_PAT). Refusing to run."
+        )
+        sys.exit(2)
 
     clone_root = pathlib.Path("/tmp/forgenew-clone")
     if not clone_root.exists():
-        _log(f"cloning {FORGENEW_REPO} (depth 1) ...")
+        _log(f"ALLOW_RUNTIME_CLONE=true -- cloning {FORGENEW_REPO} (depth 1) ...")
         subprocess.run(
             ["git", "clone", "--depth", "1", FORGENEW_REPO, str(clone_root)],
             check=True,
@@ -79,6 +110,11 @@ def ensure_corpus() -> pathlib.Path:
     corpus = clone_root / FORGENEW_SUBPATH
     if not corpus.is_dir():
         raise RuntimeError(f"corpus subpath not found: {corpus}")
+    try:
+        n = _count_json(corpus)
+    except Exception:
+        n = -1
+    _log(f"corpus source: runtime clone at {corpus} (json_count={n})")
     return corpus
 
 

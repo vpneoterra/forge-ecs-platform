@@ -11,3 +11,10 @@ cdk.out
 *.key
 .DS_Store
 Thumbs.db
+
+# Testing-harness shape-chip corpus is staged at build time from a
+# private forgenew checkout (see scripts/harness-build.sh). Never commit
+# the staged contents. The empty directory + .gitkeep are tracked so
+# `COPY corpus/ /corpus/` in the Dockerfile always has a valid source.
+docker/testing-harness/corpus/*
+!docker/testing-harness/corpus/.gitkeep

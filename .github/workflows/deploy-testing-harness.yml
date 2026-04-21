@@ -57,6 +57,34 @@ jobs:
         with:
           ref: main
 
+      # Private -- uses the same GH_PAT pattern as build-images.yml /
+      # build-geometry-images.yml. The checkout happens on the GitHub
+      # Actions runner only; the token never lands in the Docker image
+      # or the ECS task environment. The runner image bakes in the
+      # resulting server/axiom/chips/shapes/ subtree (313 JSON chips)
+      # so the ECS task can read it from /corpus/shapes with no
+      # GitHub credentials at runtime.
+      - name: Checkout vpneoterra/forgenew (shape-chip corpus source)
+        uses: actions/checkout@v4
+        with:
+          repository: vpneoterra/forgenew
+          token: ${{ secrets.GH_PAT }}
+          ref: main
+          path: forgenew-src
+
+      - name: Verify forgenew corpus checkout
+        run: |
+          CORPUS="${GITHUB_WORKSPACE}/forgenew-src/server/axiom/chips/shapes"
+          if [ ! -d "${CORPUS}" ]; then
+            echo "::error::corpus subpath not found: ${CORPUS}"
+            exit 1
+          fi
+          COUNT=$(find "${CORPUS}" -type f -name '*.json' | wc -l | tr -d ' ')
+          echo "Discovered ${COUNT} shape-chip JSON files under ${CORPUS}"
+          if [ "${COUNT}" -ne 313 ]; then
+            echo "::warning::expected 313 shape-chip JSONs, found ${COUNT}"
+          fi
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -182,6 +210,12 @@ jobs:
           retention-days: 30
 
       - name: Build and push harness image
+        env:
+          # harness-build.sh stages this subtree into the Docker build
+          # context so the corpus is baked into the image. The ECS task
+          # never needs GitHub credentials.
+          FORGENEW_DIR: ${{ github.workspace }}/forgenew-src
+          FORGENEW_SUBPATH: server/axiom/chips/shapes
         run: |
           ./scripts/harness-build.sh \
             ${{ github.event.inputs.environment }} \
