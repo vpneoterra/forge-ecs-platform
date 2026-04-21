@@ -19,6 +19,8 @@
  *   deployDks     "true" to deploy DKS (Design Knowledge System) in ForgeAppStack
  *   deployGemma   "true" to deploy Gemma GPU inference stack (g6.2xlarge + NLB)
  *   deployGeometry "true" to deploy Geometry Platform stack (B-Rep, GPU SDF, Neural SDF)
+ *   deployTestingHarness "true" to deploy the Tier-2 OMNI shape-chip harness (requires deployOmni=true)
+ *   enableHarnessAutoPause "false" to opt out of the auto-pause Lambda (defaults to true)
  *   deploySolvers "true" to deploy full Compute + Orchestration stacks
  *   skipRds       "true" to skip RDS (use external Supabase)
  *   appDomain     Domain for forge-app (default: forgetest.qrucible.ai)
@@ -42,6 +44,7 @@ import { ForgeGemmaStack } from '../lib/forge-gemma-stack';
 import { ForgeOrchestrationStack } from '../lib/forge-orchestration-stack';
 import { ForgeGeometryStack } from '../lib/forge-geometry-stack';
 import { ForgeMonitoringStack } from '../lib/forge-monitoring-stack';
+import { ForgeTestingHarnessStack } from '../lib/forge-testing-harness-stack';
 
 const app = new cdk.App();
 
@@ -67,6 +70,12 @@ const deployGemma =
   (app.node.tryGetContext('deployGemma') as string | undefined) === 'true';
 const deployGeometry =
   (app.node.tryGetContext('deployGeometry') as string | undefined) === 'true';
+const deployTestingHarness =
+  (app.node.tryGetContext('deployTestingHarness') as string | undefined) === 'true';
+// Auto-pause Lambda defaults on. Set -c enableHarnessAutoPause=false to
+// opt out and fall back to operator-only pause via scripts/harness-pause.sh.
+const enableHarnessAutoPause =
+  (app.node.tryGetContext('enableHarnessAutoPause') as string | undefined) !== 'false';
 const omniDomain =
   (app.node.tryGetContext('omniDomain') as string | undefined) ?? 'omni.qrucible.ai';
 
@@ -163,6 +172,30 @@ if (deployOmni) {
     tags: sharedTags,
   });
   omniStack.addDependency(networkStack);
+}
+
+// -- Tier-2 Testing Harness Stack (optional, requires deployOmni=true) -------
+if (deployTestingHarness) {
+  if (!deployOmni) {
+    throw new Error(
+      'deployTestingHarness=true requires deployOmni=true: the tier-2 harness ' +
+      'targets the OMNI /api/sdf/render endpoint, so the OMNI stack must be ' +
+      'deployed in the same cdk invocation (or already present in the account).',
+    );
+  }
+  const harnessStack = new ForgeTestingHarnessStack(app, `ForgeTestingHarness-${env}`, {
+    env: awsEnv,
+    description: 'FORGE Tier-2 Testing Harness -- drives 313 OMNI shape chips through /api/sdf/render',
+    forgeEnv: env,
+    vpc: networkStack.vpc,
+    ecsSecurityGroup: networkStack.ecsSecurityGroup,
+    privateSubnets: networkStack.privateSubnets,
+    omniAlbHost: omniDomain,
+    alertEmail,
+    enableAutoPause: enableHarnessAutoPause,
+    tags: sharedTags,
+  });
+  harnessStack.addDependency(networkStack);
 }
 
 // -- Geometry Platform Stack (optional) ----------------------------------------
