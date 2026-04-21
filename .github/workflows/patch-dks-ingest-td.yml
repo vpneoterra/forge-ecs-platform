@@ -103,17 +103,26 @@ jobs:
           # prediction surface, NOT :rawPredict / :generateContent, so the
           # client must use :predict to avoid 404/"method not supported" from
           # the dedicated DNS host.
+          # GEMMA_VERTEX_SUPPRESS_PROMPT_ECHO pinned to "false": forgenew
+          # defaults this on, which makes the client send
+          # `return_full_text=false` to the Vertex serving container. The
+          # one-click-deploy Gemma container rejects that kwarg with HTTP 500
+          # ("Unexpected keyword argument 'return_full_text'") — observed in
+          # smoke run 24733280270 after forgenew PR #430. Disabling the
+          # suppression here lets the parser handle prompt-echo output
+          # instead of sending unsupported params to Vertex.
           vertex_env = {
-              'LLM_BACKEND':                       'vertex',
-              'GEMMA_VERTEX_PROJECT':              'mindful-vial-493123-a5',
-              'GEMMA_VERTEX_PROJECT_NUMBER':       '141501991950',
-              'GEMMA_VERTEX_REGION':               'us-central1',
-              'GEMMA_VERTEX_ENDPOINT_ID':          'mg-endpoint-8f11b5ef-4cd2-414e-a238-0f3b4904d17f',
-              'GEMMA_VERTEX_MODEL':                'gemma-4-26b-a4b-mg-one-click-deploy',
-              'GEMMA_VERTEX_API_MODE':             'predict',
-              'DKS_EMBEDDING_MODEL':               'all-MiniLM-L6-v2',
-              'GEMMA_VERTEX_DEDICATED_DNS':        'true',
-              'GEMMA_VERTEX_DEDICATED_DNS_PREFIX': 'mg-endpoint-8f11b5ef-4cd2-414e-a238-0f3b4904d17f',
+              'LLM_BACKEND':                         'vertex',
+              'GEMMA_VERTEX_PROJECT':                'mindful-vial-493123-a5',
+              'GEMMA_VERTEX_PROJECT_NUMBER':         '141501991950',
+              'GEMMA_VERTEX_REGION':                 'us-central1',
+              'GEMMA_VERTEX_ENDPOINT_ID':            'mg-endpoint-8f11b5ef-4cd2-414e-a238-0f3b4904d17f',
+              'GEMMA_VERTEX_MODEL':                  'gemma-4-26b-a4b-mg-one-click-deploy',
+              'GEMMA_VERTEX_API_MODE':               'predict',
+              'DKS_EMBEDDING_MODEL':                 'all-MiniLM-L6-v2',
+              'GEMMA_VERTEX_DEDICATED_DNS':          'true',
+              'GEMMA_VERTEX_DEDICATED_DNS_PREFIX':   'mg-endpoint-8f11b5ef-4cd2-414e-a238-0f3b4904d17f',
+              'GEMMA_VERTEX_SUPPRESS_PROMPT_ECHO':   'false',
           }
 
           existing = {e['name']: e['value'] for e in cd.get('environment', [])}
