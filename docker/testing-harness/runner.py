@@ -45,6 +45,8 @@ import requests
 # ── Config loaded from env (mirrors CDK task-def injections) ─────────────
 EXPECTED_COUNT        = int(os.environ.get("EXPECTED_SHAPE_CHIP_COUNT", "313"))
 MAX_PARTS_PER_RUN     = int(os.environ.get("MAX_PARTS_PER_RUN", str(EXPECTED_COUNT)))
+SHAPE_START_INDEX     = int(os.environ.get("SHAPE_START_INDEX", "0"))
+STOP_ON_FAILURE       = os.environ.get("STOP_ON_FAILURE", "false").lower() in ("1", "true", "yes")
 OMNI_BASE_URL         = os.environ.get("OMNI_BASE_URL", "").rstrip("/")
 OMNI_RENDER_PATH      = os.environ.get("OMNI_RENDER_PATH", "/api/sdf/render")
 OMNI_HEALTH_PATH      = os.environ.get("OMNI_HEALTH_PATH", "/api/health")
@@ -72,6 +74,8 @@ FORGENEW_SUBPATH      = os.environ.get("FORGENEW_SUBPATH", "server/axiom/chips/s
 # FORGENEW_REPO to re-enable the old fallback path.
 ALLOW_RUNTIME_CLONE   = os.environ.get("ALLOW_RUNTIME_CLONE", "false").lower() in ("1", "true", "yes")
 OUTPUT_DIR            = pathlib.Path(os.environ.get("OUTPUT_DIR", "/tmp/harness-output"))
+RESULT_LOG_PREFIX     = os.environ.get("RESULT_LOG_PREFIX", "HARNESS_RESULT_JSON")
+SUMMARY_LOG_PREFIX    = os.environ.get("SUMMARY_LOG_PREFIX", "HARNESS_SUMMARY_JSON")
 
 OMNI_API_KEY          = os.environ.get("OMNI_API_KEY")  # optional
 
@@ -79,6 +83,10 @@ OMNI_API_KEY          = os.environ.get("OMNI_API_KEY")  # optional
 # ── Helpers ───────────────────────────────────────────────────────────────
 def _log(msg: str) -> None:
     print(f"[harness] {msg}", flush=True)
+
+
+def _log_structured(prefix: str, payload: dict) -> None:
+    print(f"[harness] {prefix} {json.dumps(payload, sort_keys=True)}", flush=True)
 
 
 def _count_json(root: pathlib.Path) -> int:
@@ -235,6 +243,43 @@ def _parse_voxel_suggestion(err: t.Optional[str]) -> t.Optional[float]:
         return None
 
 
+def _failure_type(result: dict) -> t.Optional[str]:
+    if result.get("ok"):
+        return None
+    err = str(result.get("error") or "").lower()
+    if "voxel_budget" in err:
+        return "voxel_budget_exceeded"
+    if err.startswith("http 4"):
+        return "http_4xx"
+    if err.startswith("http 5"):
+        return "http_5xx"
+    if err.startswith("transport:"):
+        if "timeout" in err or "timed out" in err:
+            return "transport_timeout"
+        return "transport_error"
+    if "non-json" in err:
+        return "non_json_response"
+    if err:
+        return "render_error"
+    return "unknown"
+
+
+def _attempt_from_result(result: dict) -> dict:
+    return {
+        "ok": bool(result.get("ok")),
+        "voxel_size_mm": result.get("voxel_size_mm"),
+        "elapsed_ms": result.get("elapsed_ms"),
+        "failure_type": _failure_type(result),
+        "error": result.get("error"),
+    }
+
+
+def _with_attempts(result: dict, attempts: list[dict]) -> dict:
+    result["attempts"] = attempts
+    result["failure_type"] = _failure_type(result)
+    return result
+
+
 def _render_once(
     session: requests.Session,
     chip: dict,
@@ -303,24 +348,25 @@ def _render_once(
 def render_one(session: requests.Session, chip: dict) -> dict:
     part = chip_to_bom_part(chip)
     result = _render_once(session, chip, part, DEFAULT_VOXEL_SIZE_MM)
+    attempts = [_attempt_from_result(result)]
     if result["ok"] or not VOXEL_BUDGET_RETRY:
-        return result
+        return _with_attempts(result, attempts)
 
     suggested = _parse_voxel_suggestion(result.get("error"))
     if suggested is None:
-        return result
+        return _with_attempts(result, attempts)
 
     retry_voxel = suggested * VOXEL_SIZE_SAFETY_MULT
     if retry_voxel <= DEFAULT_VOXEL_SIZE_MM:
         # Suggestion was lower than what we just tried; no point retrying.
-        return result
+        return _with_attempts(result, attempts)
     if retry_voxel > MAX_VOXEL_SIZE_MM:
         _log(
             f"  {part['name']}: voxel_budget_exceeded suggests voxelSize>={suggested} "
             f"(retry={retry_voxel:.4f}) exceeds MAX_VOXEL_SIZE_MM={MAX_VOXEL_SIZE_MM}; "
             f"not retrying."
         )
-        return result
+        return _with_attempts(result, attempts)
 
     _log(
         f"  {part['name']}: voxel_budget_exceeded at {DEFAULT_VOXEL_SIZE_MM}mm; "
@@ -328,12 +374,13 @@ def render_one(session: requests.Session, chip: dict) -> dict:
         f"(suggested>={suggested}, mult={VOXEL_SIZE_SAFETY_MULT})"
     )
     retry_result = _render_once(session, chip, part, retry_voxel)
+    attempts.append(_attempt_from_result(retry_result))
     retry_result["voxel_retry"] = {
         "initial_voxel_size_mm": DEFAULT_VOXEL_SIZE_MM,
         "suggested_min_voxel_size_mm": suggested,
         "retry_voxel_size_mm": retry_voxel,
     }
-    return retry_result
+    return _with_attempts(retry_result, attempts)
 
 
 def main() -> int:
@@ -352,22 +399,37 @@ def main() -> int:
     if OMNI_API_KEY:
         session.headers["X-API-Key"] = OMNI_API_KEY
 
-    chips_to_run = chips[:MAX_PARTS_PER_RUN]
-    _log(f"running {len(chips_to_run)} chips against {OMNI_BASE_URL}{OMNI_RENDER_PATH}")
+    if SHAPE_START_INDEX < 0:
+        _log(f"FATAL: SHAPE_START_INDEX must be >= 0 (got {SHAPE_START_INDEX})")
+        return 5
+
+    chips_to_run = chips[SHAPE_START_INDEX:SHAPE_START_INDEX + MAX_PARTS_PER_RUN]
+    _log(
+        f"running {len(chips_to_run)} chips against {OMNI_BASE_URL}{OMNI_RENDER_PATH} "
+        f"(start_index={SHAPE_START_INDEX}, limit={MAX_PARTS_PER_RUN}, stop_on_failure={STOP_ON_FAILURE})"
+    )
 
     ok = 0
     failed = 0
     with results_path.open("w") as out:
         for i, path in enumerate(chips_to_run, start=1):
+            shape_index = SHAPE_START_INDEX + i - 1
             chip = load_chip(path)
             result = render_one(session, chip)
+            result["shape_index"] = shape_index
+            result["run_index"] = i
             result["source_path"] = str(path.relative_to(corpus))
-            out.write(json.dumps(result) + "\n")
+            out.write(json.dumps(result, sort_keys=True) + "\n")
+            out.flush()
+            _log_structured(RESULT_LOG_PREFIX, result)
             if result["ok"]:
                 ok += 1
             else:
                 failed += 1
                 _log(f"  [{i}/{len(chips_to_run)}] FAIL {result['name']}: {result['error']}")
+                if STOP_ON_FAILURE:
+                    _log("STOP_ON_FAILURE=true -- stopping after first failed chip")
+                    break
             if i % 25 == 0:
                 _log(f"  progress {i}/{len(chips_to_run)} (ok={ok} failed={failed})")
 
@@ -375,6 +437,9 @@ def main() -> int:
         "total": len(chips_to_run),
         "ok": ok,
         "failed": failed,
+        "start_index": SHAPE_START_INDEX,
+        "limit": MAX_PARTS_PER_RUN,
+        "stop_on_failure": STOP_ON_FAILURE,
         "omni_base_url": OMNI_BASE_URL,
         "omni_render_path": OMNI_RENDER_PATH,
         "voxel_size_mm": DEFAULT_VOXEL_SIZE_MM,
@@ -387,6 +452,7 @@ def main() -> int:
     }
     with summary_path.open("w") as f:
         json.dump(summary, f, indent=2)
+    _log_structured(SUMMARY_LOG_PREFIX, summary)
 
     _log(f"DONE: ok={ok} failed={failed} total={len(chips_to_run)}")
     _log(f"summary: {summary_path}")

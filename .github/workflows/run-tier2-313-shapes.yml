@@ -1,0 +1,284 @@
+name: Run Tier-2 OMNI 313 Shapes
+
+# Executes the full 313-shape tier-2 harness in AWS ECS, one shape at a time
+# inside a single Fargate task. GitHub Actions only deploys/builds/starts the
+# task and then captures CloudWatch diagnostics/artifacts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+      start_index:
+        description: 'Zero-based corpus index to start from'
+        required: false
+        default: '0'
+        type: string
+      limit:
+        description: 'Number of shapes to run'
+        required: false
+        default: '313'
+        type: string
+      stop_on_failure:
+        description: 'Stop after first failed shape'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      voxel_size_safety_mult:
+        description: 'Multiplier for OMNI suggested voxel size on one retry'
+        required: false
+        default: '2.25'
+        type: string
+      max_voxel_size_mm:
+        description: 'Cap for adaptive retry voxel size'
+        required: false
+        default: '5.0'
+        type: string
+      image_tag:
+        description: 'Extra ECR tag to apply to the harness image (default: github.sha)'
+        required: false
+        default: ''
+        type: string
+      alertEmail:
+        description: 'Email for harness budget / CloudWatch alerts'
+        required: false
+        default: 'notifications@neoterra.partners'
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  NODE_VERSION: '20'
+
+jobs:
+  run-313:
+    name: Run tier-2 313 shapes (${{ github.event.inputs.environment }})
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    concurrency:
+      group: testing-harness-full-${{ github.event.inputs.environment }}
+      cancel-in-progress: false
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Checkout vpneoterra/forgenew (shape-chip corpus source)
+        uses: actions/checkout@v4
+        with:
+          repository: vpneoterra/forgenew
+          token: ${{ secrets.GH_PAT }}
+          ref: main
+          path: forgenew-src
+
+      - name: Verify inputs and corpus
+        run: |
+          set -euo pipefail
+          START_INDEX="${{ github.event.inputs.start_index }}"
+          LIMIT="${{ github.event.inputs.limit }}"
+          MULT="${{ github.event.inputs.voxel_size_safety_mult }}"
+          MAX_VOXEL="${{ github.event.inputs.max_voxel_size_mm }}"
+
+          for value_name in START_INDEX LIMIT; do
+            value="${!value_name}"
+            if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
+              echo "::error::${value_name} must be a non-negative integer, got ${value}"
+              exit 1
+            fi
+          done
+          if [[ "${LIMIT}" -lt 1 || "${LIMIT}" -gt 313 ]]; then
+            echo "::error::limit must be 1..313, got ${LIMIT}"
+            exit 1
+          fi
+          python3 - <<'PY' "${MULT}" "${MAX_VOXEL}"
+          import sys
+          mult = float(sys.argv[1])
+          max_voxel = float(sys.argv[2])
+          if mult <= 0:
+              raise SystemExit("voxel_size_safety_mult must be > 0")
+          if max_voxel <= 0:
+              raise SystemExit("max_voxel_size_mm must be > 0")
+          PY
+
+          CORPUS="${GITHUB_WORKSPACE}/forgenew-src/server/axiom/chips/shapes"
+          if [ ! -d "${CORPUS}" ]; then
+            echo "::error::corpus subpath not found: ${CORPUS}"
+            exit 1
+          fi
+          COUNT=$(find "${CORPUS}" -type f -name '*.json' | wc -l | tr -d ' ')
+          echo "Discovered ${COUNT} shape-chip JSON files under ${CORPUS}"
+          if [ "${COUNT}" -ne 313 ]; then
+            echo "::error::expected 313 shape-chip JSONs, found ${COUNT}"
+            exit 1
+          fi
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.image_tag }}"
+          if [[ -z "${TAG}" ]]; then
+            TAG="${GITHUB_SHA::12}"
+          fi
+          echo "image_tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved harness image tag: ${TAG}"
+
+      - name: CDK Synth (harness, with network for ref resolution)
+        run: |
+          npx cdk synth \
+            ForgeNetwork-${{ github.event.inputs.environment }} \
+            ForgeTestingHarness-${{ github.event.inputs.environment }} \
+            -c env=${{ github.event.inputs.environment }} \
+            -c deployTestingHarness=true \
+            -c deploySolvers=true \
+            -c skipRds=true \
+            -c alertEmail=${{ github.event.inputs.alertEmail }}
+
+      - name: CDK Deploy (harness only -- do NOT touch ForgeNetwork)
+        run: |
+          npx cdk deploy \
+            ForgeTestingHarness-${{ github.event.inputs.environment }} \
+            --exclusively \
+            --require-approval never \
+            --outputs-file harness-cdk-outputs.json \
+            -c env=${{ github.event.inputs.environment }} \
+            -c deployTestingHarness=true \
+            -c deploySolvers=true \
+            -c skipRds=true \
+            -c alertEmail=${{ github.event.inputs.alertEmail }}
+
+      - name: Build and push harness image
+        env:
+          FORGENEW_DIR: ${{ github.workspace }}/forgenew-src
+          FORGENEW_SUBPATH: server/axiom/chips/shapes
+        run: |
+          ./scripts/harness-build.sh \
+            ${{ github.event.inputs.environment }} \
+            ${{ steps.tag.outputs.image_tag }}
+
+      - name: Run 313-shape harness in AWS ECS
+        env:
+          RUN_LIMIT: ${{ github.event.inputs.limit }}
+          SHAPE_START_INDEX: ${{ github.event.inputs.start_index }}
+          STOP_ON_FAILURE: ${{ github.event.inputs.stop_on_failure }}
+          VOXEL_SIZE_SAFETY_MULT: ${{ github.event.inputs.voxel_size_safety_mult }}
+          MAX_VOXEL_SIZE_MM: ${{ github.event.inputs.max_voxel_size_mm }}
+          LOG_EVENT_LIMIT: '10000'
+          WAIT_FOR_COMPLETION: 'true'
+        run: |
+          set -o pipefail
+          ./scripts/harness-run.sh ${{ github.event.inputs.environment }} | tee tier2-313-cloudwatch.txt
+
+      - name: Build structured artifacts from CloudWatch dump
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          log_path = pathlib.Path("tier2-313-cloudwatch.txt")
+          out_dir = pathlib.Path("tier2-313-artifacts")
+          out_dir.mkdir(exist_ok=True)
+          results = []
+          summary = None
+          raw = log_path.read_text(errors="replace") if log_path.exists() else ""
+
+          for line in raw.splitlines():
+              marker = "HARNESS_RESULT_JSON "
+              if marker in line:
+                  try:
+                      results.append(json.loads(line.split(marker, 1)[1]))
+                  except Exception as exc:
+                      results.append({"ok": False, "failure_type": "artifact_parse_error", "error": str(exc), "raw_line": line})
+              marker = "HARNESS_SUMMARY_JSON "
+              if marker in line:
+                  try:
+                      summary = json.loads(line.split(marker, 1)[1])
+                  except Exception:
+                      pass
+
+          failures = [r for r in results if not r.get("ok")]
+          if summary is None:
+              summary = {
+                  "total": len(results),
+                  "ok": sum(1 for r in results if r.get("ok")),
+                  "failed": len(failures),
+                  "failure_type": "summary_missing" if not results else None,
+              }
+
+          (out_dir / "tier2-results.jsonl").write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in results))
+          (out_dir / "tier2-summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+          (out_dir / "tier2-failures.json").write_text(json.dumps(failures, indent=2, sort_keys=True) + "\n")
+          (out_dir / "cloudwatch-tail.txt").write_text(raw)
+
+          lines = [
+              "# Tier-2 OMNI 313 Shape Run",
+              "",
+              f"- Total structured results: {len(results)}",
+              f"- Passed: {sum(1 for r in results if r.get('ok'))}",
+              f"- Failed: {len(failures)}",
+              f"- Summary total: {summary.get('total')}",
+              f"- Summary ok: {summary.get('ok')}",
+              f"- Summary failed: {summary.get('failed')}",
+              "",
+              "## Failures",
+              "",
+              "| Index | Shape | Failure Type | Reason |",
+              "|---:|---|---|---|",
+          ]
+          for r in failures[:100]:
+              reason = str(r.get("error") or "").replace("|", "\\|")[:500]
+              lines.append(f"| {r.get('shape_index')} | {r.get('name')} | {r.get('failure_type')} | {reason} |")
+          if len(failures) > 100:
+              lines.append(f"| | | | Truncated: {len(failures) - 100} additional failures in tier2-failures.json |")
+          (out_dir / "tier2-313-summary.md").write_text("\n".join(lines) + "\n")
+          PY
+
+      - name: Upload structured run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier2-313-results-${{ github.event.inputs.environment }}
+          path: tier2-313-artifacts/
+          retention-days: 30
+
+      - name: Pause harness (always, even on failure)
+        if: always()
+        run: |
+          ./scripts/harness-pause.sh ${{ github.event.inputs.environment }}

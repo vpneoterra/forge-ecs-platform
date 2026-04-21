@@ -5,13 +5,20 @@
 #   env:  'dev' (default) | 'prod'
 #
 # Optional env vars (useful for smoke testing):
-#   SMOKE_COUNT       If set to a positive integer, the run-task is submitted
-#                     with a container override MAX_PARTS_PER_RUN=<SMOKE_COUNT>,
-#                     limiting execution to N chips (e.g. SMOKE_COUNT=3) while
+#   SMOKE_COUNT       If set to a positive integer and RUN_LIMIT is unset,
+#                     the run-task is submitted with a container override
+#                     MAX_PARTS_PER_RUN=<SMOKE_COUNT>, limiting execution to N
+#                     chips (e.g. SMOKE_COUNT=3) while
 #                     still validating that the full baked corpus of 313 chips
 #                     is present. EXPECTED_SHAPE_CHIP_COUNT is intentionally
 #                     NOT overridden here: the count guardrail must continue
 #                     to assert the full corpus exists even during smoke runs.
+#   RUN_LIMIT         If set to a positive integer, override MAX_PARTS_PER_RUN.
+#                     Use RUN_LIMIT=313 for the full sequential run.
+#   SHAPE_START_INDEX Zero-based index into the deterministic corpus order.
+#   STOP_ON_FAILURE   If true, the runner stops after the first failed chip.
+#   LOG_EVENT_LIMIT   Number of CloudWatch log events to dump after STOPPED
+#                     when WAIT_FOR_COMPLETION=true (default: 200).
 #   WAIT_FOR_COMPLETION  If "true", block until the task reaches STOPPED and
 #                     exit non-zero if the container exit code != 0.
 #
@@ -91,27 +98,51 @@ RUN_ARGS=(
   --output json
 )
 
-if [[ -n "${SMOKE_COUNT:-}" ]]; then
-  if ! [[ "${SMOKE_COUNT}" =~ ^[0-9]+$ ]] || [[ "${SMOKE_COUNT}" -lt 1 ]]; then
-    error "SMOKE_COUNT must be a positive integer (got: ${SMOKE_COUNT})"
+RUN_MAX="${RUN_LIMIT:-${SMOKE_COUNT:-}}"
+if [[ -n "${RUN_MAX}" ]]; then
+  if ! [[ "${RUN_MAX}" =~ ^[0-9]+$ ]] || [[ "${RUN_MAX}" -lt 1 ]]; then
+    error "RUN_LIMIT/SMOKE_COUNT must be a positive integer (got: ${RUN_MAX})"
     exit 1
   fi
-  info "SMOKE_COUNT=${SMOKE_COUNT} -- limiting run to ${SMOKE_COUNT} chips (corpus guard still expects 313)"
+  if [[ -n "${RUN_LIMIT:-}" ]]; then
+    info "RUN_LIMIT=${RUN_LIMIT} -- limiting run to ${RUN_LIMIT} chips (corpus guard still expects 313)"
+  else
+    info "SMOKE_COUNT=${SMOKE_COUNT} -- limiting run to ${SMOKE_COUNT} chips (corpus guard still expects 313)"
+  fi
+fi
+
+if [[ -n "${SHAPE_START_INDEX:-}" ]]; then
+  if ! [[ "${SHAPE_START_INDEX}" =~ ^[0-9]+$ ]]; then
+    error "SHAPE_START_INDEX must be a non-negative integer (got: ${SHAPE_START_INDEX})"
+    exit 1
+  fi
+fi
+
+if [[ -n "${RUN_MAX}" || -n "${SHAPE_START_INDEX:-}" || -n "${STOP_ON_FAILURE:-}" || -n "${VOXEL_SIZE_SAFETY_MULT:-}" || -n "${MAX_VOXEL_SIZE_MM:-}" ]]; then
   # Only override MAX_PARTS_PER_RUN. EXPECTED_SHAPE_CHIP_COUNT remains at the
   # task-def default (313) so the runner's fail-closed count guardrail still
   # verifies the full baked corpus is present before executing N parts.
   OVERRIDES=$(python3 -c "
-import json, sys
-n = sys.argv[1]
-print(json.dumps({
-    'containerOverrides': [{
-        'name': 'harness-runner',
-        'environment': [
-            {'name': 'MAX_PARTS_PER_RUN', 'value': n},
-        ],
-    }],
-}))
-" "${SMOKE_COUNT}")
+	import json, sys
+	limit, start, stop, mult, max_voxel = sys.argv[1:]
+	env = []
+	if limit:
+	    env.append({'name': 'MAX_PARTS_PER_RUN', 'value': limit})
+	if start:
+	    env.append({'name': 'SHAPE_START_INDEX', 'value': start})
+	if stop:
+	    env.append({'name': 'STOP_ON_FAILURE', 'value': stop})
+	if mult:
+	    env.append({'name': 'VOXEL_SIZE_SAFETY_MULT', 'value': mult})
+	if max_voxel:
+	    env.append({'name': 'MAX_VOXEL_SIZE_MM', 'value': max_voxel})
+	print(json.dumps({
+	    'containerOverrides': [{
+	        'name': 'harness-runner',
+	        'environment': env,
+	    }],
+	}))
+	" "${RUN_MAX}" "${SHAPE_START_INDEX:-}" "${STOP_ON_FAILURE:-}" "${VOXEL_SIZE_SAFETY_MULT:-}" "${MAX_VOXEL_SIZE_MM:-}")
   RUN_ARGS+=(--overrides "${OVERRIDES}")
 fi
 
@@ -227,7 +258,7 @@ except Exception:
         --log-group-name "${LOG_GROUP}" \
         --log-stream-name "${LOG_STREAM}" \
         --region "${REGION}" \
-        --limit 200 \
+        --limit "${LOG_EVENT_LIMIT:-200}" \
         --no-start-from-head \
         --output json 2>/dev/null \
         | python3 -c "
