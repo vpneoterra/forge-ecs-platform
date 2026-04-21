@@ -15,8 +15,16 @@
 #                     to assert the full corpus exists even during smoke runs.
 #   RUN_LIMIT         If set to a positive integer, override MAX_PARTS_PER_RUN.
 #                     Use RUN_LIMIT=313 for the full sequential run.
+#   EXPECTED_SHAPE_CHIP_COUNT
+#                     If set to a positive integer, override the corpus count
+#                     guard. Shape Check sets this dynamically so the same
+#                     harness image/process can validate 313 now and 1000+
+#                     later without code changes.
 #   SHAPE_START_INDEX Zero-based index into the deterministic corpus order.
 #   STOP_ON_FAILURE   If true, the runner stops after the first failed chip.
+#   DEFAULT_VOXEL_SIZE_MM, PER_PART_TIMEOUT_SEC, VOXEL_BUDGET_RETRY,
+#   VOXEL_SIZE_SAFETY_MULT, MAX_VOXEL_SIZE_MM
+#                     Optional runner tuning overrides.
 #   LOG_EVENT_LIMIT   Number of CloudWatch log events to dump after STOPPED
 #                     when WAIT_FOR_COMPLETION=true (default: 200).
 #   WAIT_FOR_COMPLETION  If "true", block until the task reaches STOPPED and
@@ -118,19 +126,27 @@ if [[ -n "${SHAPE_START_INDEX:-}" ]]; then
   fi
 fi
 
-if [[ -n "${RUN_MAX}" || -n "${SHAPE_START_INDEX:-}" || -n "${STOP_ON_FAILURE:-}" || -n "${VOXEL_SIZE_SAFETY_MULT:-}" || -n "${MAX_VOXEL_SIZE_MM:-}" ]]; then
+if [[ -n "${RUN_MAX}" || -n "${EXPECTED_SHAPE_CHIP_COUNT:-}" || -n "${SHAPE_START_INDEX:-}" || -n "${STOP_ON_FAILURE:-}" || -n "${DEFAULT_VOXEL_SIZE_MM:-}" || -n "${PER_PART_TIMEOUT_SEC:-}" || -n "${VOXEL_BUDGET_RETRY:-}" || -n "${VOXEL_SIZE_SAFETY_MULT:-}" || -n "${MAX_VOXEL_SIZE_MM:-}" ]]; then
   # Only override MAX_PARTS_PER_RUN. EXPECTED_SHAPE_CHIP_COUNT remains at the
   # task-def default (313) so the runner's fail-closed count guardrail still
   # verifies the full baked corpus is present before executing N parts.
   OVERRIDES=$(python3 -c "import json, sys
-limit, start, stop, mult, max_voxel = sys.argv[1:]
+limit, expected_count, start, stop, default_voxel, timeout_sec, voxel_retry, mult, max_voxel = sys.argv[1:]
 env = []
 if limit:
     env.append({'name': 'MAX_PARTS_PER_RUN', 'value': limit})
+if expected_count:
+    env.append({'name': 'EXPECTED_SHAPE_CHIP_COUNT', 'value': expected_count})
 if start:
     env.append({'name': 'SHAPE_START_INDEX', 'value': start})
 if stop:
     env.append({'name': 'STOP_ON_FAILURE', 'value': stop})
+if default_voxel:
+    env.append({'name': 'DEFAULT_VOXEL_SIZE_MM', 'value': default_voxel})
+if timeout_sec:
+    env.append({'name': 'PER_PART_TIMEOUT_SEC', 'value': timeout_sec})
+if voxel_retry:
+    env.append({'name': 'VOXEL_BUDGET_RETRY', 'value': voxel_retry})
 if mult:
     env.append({'name': 'VOXEL_SIZE_SAFETY_MULT', 'value': mult})
 if max_voxel:
@@ -140,7 +156,7 @@ print(json.dumps({
         'name': 'harness-runner',
         'environment': env,
     }],
-}))" "${RUN_MAX}" "${SHAPE_START_INDEX:-}" "${STOP_ON_FAILURE:-}" "${VOXEL_SIZE_SAFETY_MULT:-}" "${MAX_VOXEL_SIZE_MM:-}")
+}))" "${RUN_MAX}" "${EXPECTED_SHAPE_CHIP_COUNT:-}" "${SHAPE_START_INDEX:-}" "${STOP_ON_FAILURE:-}" "${DEFAULT_VOXEL_SIZE_MM:-}" "${PER_PART_TIMEOUT_SEC:-}" "${VOXEL_BUDGET_RETRY:-}" "${VOXEL_SIZE_SAFETY_MULT:-}" "${MAX_VOXEL_SIZE_MM:-}")
   RUN_ARGS+=(--overrides "${OVERRIDES}")
 fi
 

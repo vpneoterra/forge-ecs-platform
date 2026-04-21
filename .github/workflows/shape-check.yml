@@ -1,0 +1,231 @@
+name: Shape Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+      start_index:
+        description: 'Zero-based corpus index to start from'
+        required: false
+        default: '0'
+        type: string
+      limit:
+        description: "Number of shapes to evaluate, or 'all'"
+        required: false
+        default: 'all'
+        type: string
+      default_voxel_size_mm:
+        description: 'Initial voxel size for preview evaluation'
+        required: false
+        default: '0.5'
+        type: string
+      per_part_timeout_sec:
+        description: 'HTTP timeout per shape render attempt'
+        required: false
+        default: '150'
+        type: string
+      max_renderer_blockers:
+        description: 'Stop after N renderer blockers; 0 means evaluate the full requested window'
+        required: false
+        default: '0'
+        type: string
+      voxel_size_safety_mult:
+        description: 'Multiplier for OMNI suggested voxel size on one retry'
+        required: false
+        default: '2.25'
+        type: string
+      max_voxel_size_mm:
+        description: 'Cap for adaptive retry voxel size'
+        required: false
+        default: '5.0'
+        type: string
+      image_tag:
+        description: 'Extra ECR tag to apply to the harness image (default: github.sha)'
+        required: false
+        default: ''
+        type: string
+      alertEmail:
+        description: 'Email for harness budget / CloudWatch alerts'
+        required: false
+        default: 'notifications@neoterra.partners'
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  NODE_VERSION: '20'
+
+jobs:
+  shape-check:
+    name: Shape Check (${{ github.event.inputs.environment }})
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: shape-check-${{ github.event.inputs.environment }}
+      cancel-in-progress: false
+    timeout-minutes: 720
+
+    steps:
+      - name: Checkout forge-ecs-platform
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Checkout vpneoterra/forgenew shape corpus
+        uses: actions/checkout@v4
+        with:
+          repository: vpneoterra/forgenew
+          token: ${{ secrets.GH_PAT }}
+          ref: main
+          path: forgenew-src
+
+      - name: Verify shape-check inputs and corpus
+        run: |
+          set -euo pipefail
+          START_INDEX="${{ github.event.inputs.start_index }}"
+          LIMIT="${{ github.event.inputs.limit }}"
+          MAX_RENDERER_BLOCKERS="${{ github.event.inputs.max_renderer_blockers }}"
+          for name in START_INDEX MAX_RENDERER_BLOCKERS; do
+            value="${!name}"
+            if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
+              echo "::error::${name} must be a non-negative integer, got ${value}"
+              exit 1
+            fi
+          done
+          if [[ "${LIMIT}" != "all" ]] && ! [[ "${LIMIT}" =~ ^[0-9]+$ ]]; then
+            echo "::error::limit must be a positive integer or 'all', got ${LIMIT}"
+            exit 1
+          fi
+          python3 - <<'PY' "${{ github.event.inputs.default_voxel_size_mm }}" "${{ github.event.inputs.per_part_timeout_sec }}" "${{ github.event.inputs.voxel_size_safety_mult }}" "${{ github.event.inputs.max_voxel_size_mm }}"
+          import sys
+          default_voxel = float(sys.argv[1])
+          timeout = int(sys.argv[2])
+          mult = float(sys.argv[3])
+          max_voxel = float(sys.argv[4])
+          if default_voxel <= 0:
+              raise SystemExit("default_voxel_size_mm must be > 0")
+          if timeout < 1:
+              raise SystemExit("per_part_timeout_sec must be >= 1")
+          if mult <= 0:
+              raise SystemExit("voxel_size_safety_mult must be > 0")
+          if max_voxel <= 0:
+              raise SystemExit("max_voxel_size_mm must be > 0")
+          PY
+          CORPUS="${GITHUB_WORKSPACE}/forgenew-src/server/axiom/chips/shapes"
+          if [ ! -d "${CORPUS}" ]; then
+            echo "::error::corpus subpath not found: ${CORPUS}"
+            exit 1
+          fi
+          COUNT=$(find "${CORPUS}" -type f -name '*.json' | wc -l | tr -d ' ')
+          echo "Discovered ${COUNT} shape-chip JSON files under ${CORPUS}"
+          if [[ "${COUNT}" -lt 1 ]]; then
+            echo "::error::shape corpus is empty"
+            exit 1
+          fi
+          echo "corpus_count=${COUNT}" >> "$GITHUB_ENV"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.image_tag }}"
+          if [[ -z "${TAG}" ]]; then
+            TAG="${GITHUB_SHA::12}"
+          fi
+          echo "image_tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved harness image tag: ${TAG}"
+
+      - name: CDK Synth (harness, with network for ref resolution)
+        run: |
+          npx cdk synth \
+            ForgeNetwork-${{ github.event.inputs.environment }} \
+            ForgeTestingHarness-${{ github.event.inputs.environment }} \
+            -c env=${{ github.event.inputs.environment }} \
+            -c deployTestingHarness=true \
+            -c deploySolvers=true \
+            -c skipRds=true \
+            -c alertEmail=${{ github.event.inputs.alertEmail }}
+
+      - name: CDK Deploy (harness only)
+        run: |
+          npx cdk deploy \
+            ForgeTestingHarness-${{ github.event.inputs.environment }} \
+            --exclusively \
+            --require-approval never \
+            --outputs-file harness-cdk-outputs.json \
+            -c env=${{ github.event.inputs.environment }} \
+            -c deployTestingHarness=true \
+            -c deploySolvers=true \
+            -c skipRds=true \
+            -c alertEmail=${{ github.event.inputs.alertEmail }}
+
+      - name: Build and push harness image
+        env:
+          FORGENEW_DIR: ${{ github.workspace }}/forgenew-src
+          FORGENEW_SUBPATH: server/axiom/chips/shapes
+        run: |
+          ./scripts/harness-build.sh \
+            ${{ github.event.inputs.environment }} \
+            ${{ steps.tag.outputs.image_tag }}
+
+      - name: Run Shape Check in isolated ECS tasks
+        env:
+          FORGENEW_DIR: ${{ github.workspace }}/forgenew-src
+          FORGENEW_SUBPATH: server/axiom/chips/shapes
+          EXPECTED_SHAPE_CHIP_COUNT: ${{ env.corpus_count }}
+          START_INDEX: ${{ github.event.inputs.start_index }}
+          LIMIT: ${{ github.event.inputs.limit }}
+          DEFAULT_VOXEL_SIZE_MM: ${{ github.event.inputs.default_voxel_size_mm }}
+          PER_PART_TIMEOUT_SEC: ${{ github.event.inputs.per_part_timeout_sec }}
+          VOXEL_BUDGET_RETRY: 'true'
+          VOXEL_SIZE_SAFETY_MULT: ${{ github.event.inputs.voxel_size_safety_mult }}
+          MAX_VOXEL_SIZE_MM: ${{ github.event.inputs.max_voxel_size_mm }}
+          MAX_RENDERER_BLOCKERS: ${{ github.event.inputs.max_renderer_blockers }}
+          OMNI_HEALTH_WAIT_SEC: '360'
+          LOG_EVENT_LIMIT: '1200'
+        run: |
+          ./scripts/shape-check.sh ${{ github.event.inputs.environment }}
+
+      - name: Upload Shape Check artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shape-check-${{ github.event.inputs.environment }}
+          path: shape-check-artifacts/
+          retention-days: 30
+
+      - name: Pause harness (always)
+        if: always()
+        run: |
+          ./scripts/harness-pause.sh ${{ github.event.inputs.environment }}
