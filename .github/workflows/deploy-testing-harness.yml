@@ -136,9 +136,21 @@ jobs:
       # Harness only needs the OMNI ALB hostname (passed via -c omniDomain).
       # We deliberately do NOT list ForgeOmni-<env> here: the harness stack
       # does not cross-import OMNI constructs, and redeploying ForgeOmni
-      # against an existing `omni.qrucible.ai` A record triggers the exact
-      # "record set already exists" failure we just recovered from.
-      - name: CDK Synth (network + harness)
+      # against an existing `omni.qrucible.ai` A record triggers the
+      # "record set already exists" failure.
+      #
+      # We also do NOT redeploy ForgeNetwork-<env>: the harness cross-imports
+      # VPC / subnets / SGs from the already-running network stack via CFN
+      # exports. Re-synthing network without the other consumer stacks
+      # (ForgeApp, ForgeOmni) in the app would prune exports those stacks
+      # still import, which CloudFormation rejects (e.g. "Cannot delete
+      # export ForgeNetwork-dev:ExportsOutputRefForgeVpcIGW...").
+      # --exclusively pins the deploy to ForgeTestingHarness-<env> only, so
+      # the live ForgeNetwork-<env> exports are read as-is and never mutated.
+      # Synth still includes ForgeNetwork-<env> so CDK can resolve the
+      # VPC/subnet/SG references at synth time, but the command line only
+      # targets the harness stack for deployment.
+      - name: CDK Synth (harness, with network for ref resolution)
         run: |
           npx cdk synth \
             ForgeNetwork-${{ github.event.inputs.environment }} \
@@ -149,11 +161,11 @@ jobs:
             -c skipRds=true \
             -c alertEmail=${{ github.event.inputs.alertEmail }}
 
-      - name: CDK Deploy (network + harness only)
+      - name: CDK Deploy (harness only -- do NOT touch ForgeNetwork)
         run: |
           npx cdk deploy \
-            ForgeNetwork-${{ github.event.inputs.environment }} \
             ForgeTestingHarness-${{ github.event.inputs.environment }} \
+            --exclusively \
             --require-approval never \
             --outputs-file harness-cdk-outputs.json \
             -c env=${{ github.event.inputs.environment }} \
