@@ -122,27 +122,25 @@ if [[ -n "${RUN_MAX}" || -n "${SHAPE_START_INDEX:-}" || -n "${STOP_ON_FAILURE:-}
   # Only override MAX_PARTS_PER_RUN. EXPECTED_SHAPE_CHIP_COUNT remains at the
   # task-def default (313) so the runner's fail-closed count guardrail still
   # verifies the full baked corpus is present before executing N parts.
-  OVERRIDES=$(python3 -c "
-	import json, sys
-	limit, start, stop, mult, max_voxel = sys.argv[1:]
-	env = []
-	if limit:
-	    env.append({'name': 'MAX_PARTS_PER_RUN', 'value': limit})
-	if start:
-	    env.append({'name': 'SHAPE_START_INDEX', 'value': start})
-	if stop:
-	    env.append({'name': 'STOP_ON_FAILURE', 'value': stop})
-	if mult:
-	    env.append({'name': 'VOXEL_SIZE_SAFETY_MULT', 'value': mult})
-	if max_voxel:
-	    env.append({'name': 'MAX_VOXEL_SIZE_MM', 'value': max_voxel})
-	print(json.dumps({
-	    'containerOverrides': [{
-	        'name': 'harness-runner',
-	        'environment': env,
-	    }],
-	}))
-	" "${RUN_MAX}" "${SHAPE_START_INDEX:-}" "${STOP_ON_FAILURE:-}" "${VOXEL_SIZE_SAFETY_MULT:-}" "${MAX_VOXEL_SIZE_MM:-}")
+  OVERRIDES=$(python3 -c "import json, sys
+limit, start, stop, mult, max_voxel = sys.argv[1:]
+env = []
+if limit:
+    env.append({'name': 'MAX_PARTS_PER_RUN', 'value': limit})
+if start:
+    env.append({'name': 'SHAPE_START_INDEX', 'value': start})
+if stop:
+    env.append({'name': 'STOP_ON_FAILURE', 'value': stop})
+if mult:
+    env.append({'name': 'VOXEL_SIZE_SAFETY_MULT', 'value': mult})
+if max_voxel:
+    env.append({'name': 'MAX_VOXEL_SIZE_MM', 'value': max_voxel})
+print(json.dumps({
+    'containerOverrides': [{
+        'name': 'harness-runner',
+        'environment': env,
+    }],
+}))" "${RUN_MAX}" "${SHAPE_START_INDEX:-}" "${STOP_ON_FAILURE:-}" "${VOXEL_SIZE_SAFETY_MULT:-}" "${MAX_VOXEL_SIZE_MM:-}")
   RUN_ARGS+=(--overrides "${OVERRIDES}")
 fi
 
