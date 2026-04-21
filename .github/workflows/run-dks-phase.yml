@@ -152,14 +152,72 @@ jobs:
           export GOOGLE_CLOUD_PROJECT="${GEMMA_VERTEX_PROJECT:-mindful-vial-493123-a5}"
           mkdir -p /data/logs
           LOG=/data/logs/phase1_$(date +%Y%m%d_%H%M%S).log
+
+          # Baseline patent chunk count BEFORE harvest so we can diff after.
+          BASELINE_PATENT_CHUNKS=$(psql "$DATABASE_URL" -At -c \
+            "select coalesce(count(*),0) from design_knowledge_chunks where source_dataset='patents';")
+          BASELINE_TOTAL_CHUNKS=$(psql "$DATABASE_URL" -At -c \
+            "select coalesce(count(*),0) from design_knowledge_chunks;")
+          echo ">>> baseline patent chunks : $BASELINE_PATENT_CHUNKS"
+          echo ">>> baseline total chunks  : $BASELINE_TOTAL_CHUNKS"
+
           echo ">>> harvest patents via vertex"
           python3 dks_harvest.py --source patents --patents-dir /data/patents_t1/ --backend vertex --validate 2>&1 | tee "$LOG"
+
           echo ">>> post-ingest counts"
           psql "$DATABASE_URL" -c "select count(*) as total_chunks from design_knowledge_chunks;"
           psql "$DATABASE_URL" -c "select chunk_type, count(*) from design_knowledge_chunks group by chunk_type order by 2 desc;"
           psql "$DATABASE_URL" -c "select source_dataset, count(*) from design_knowledge_chunks group by source_dataset order by 2 desc limit 10;"
           psql "$DATABASE_URL" -c "select column_name, data_type from information_schema.columns where table_name='design_knowledge_chunks' order by ordinal_position;" || true
           psql "$DATABASE_URL" -c "select phase, source, status, backend, row_count_delta, duration_ms, cost_estimate_usd, created_at from dks_runlog order by created_at desc limit 5;"
+
+          # ---- Zero-output guardrail ----
+          # Fail the task if the harvest inserted zero patent chunks, even when
+          # dks_harvest.py reported success. Checks two independent signals:
+          #   1) design_knowledge_chunks row count for source_dataset='patents'
+          #      must have grown vs. the pre-run baseline.
+          #   2) The latest dks_runlog row for phase1b_harvest / patents must
+          #      have status='success' AND row_count_delta > 0.
+          echo ">>> validating row_count_delta and chunk growth"
+          POST_PATENT_CHUNKS=$(psql "$DATABASE_URL" -At -c \
+            "select coalesce(count(*),0) from design_knowledge_chunks where source_dataset='patents';")
+          PATENT_DELTA=$(( POST_PATENT_CHUNKS - BASELINE_PATENT_CHUNKS ))
+          echo "post patent chunks  : $POST_PATENT_CHUNKS"
+          echo "patent chunk delta  : $PATENT_DELTA"
+
+          RUNLOG_ROW=$(psql "$DATABASE_URL" -At -F '|' -c \
+            "select coalesce(status,''), coalesce(row_count_delta,0)
+               from dks_runlog
+              where phase='phase1b_harvest' and source='patents'
+              order by created_at desc
+              limit 1;")
+          RUNLOG_STATUS="${RUNLOG_ROW%%|*}"
+          RUNLOG_DELTA="${RUNLOG_ROW##*|}"
+          if [ -z "$RUNLOG_ROW" ]; then
+            RUNLOG_STATUS="missing"; RUNLOG_DELTA="0"
+          fi
+          echo "runlog status       : $RUNLOG_STATUS"
+          echo "runlog row_count_delta: $RUNLOG_DELTA"
+
+          FAIL=0
+          if [ "$PATENT_DELTA" -le 0 ]; then
+            echo "::error::phase1b_harvest produced zero new patent chunks (delta=$PATENT_DELTA)"
+            FAIL=1
+          fi
+          if [ "$RUNLOG_STATUS" != "success" ]; then
+            echo "::error::latest dks_runlog row is not success (status=$RUNLOG_STATUS)"
+            FAIL=1
+          fi
+          # Treat non-positive delta as failure even if runlog claims success.
+          if ! [ "$RUNLOG_DELTA" -gt 0 ] 2>/dev/null; then
+            echo "::error::latest dks_runlog row_count_delta is not > 0 (row_count_delta=$RUNLOG_DELTA)"
+            FAIL=1
+          fi
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::Phase 1b-harvest zero-output guardrail tripped; failing task."
+            exit 2
+          fi
+          echo ">>> Phase 1b-harvest guardrail passed (patent_delta=$PATENT_DELTA, runlog_delta=$RUNLOG_DELTA)"
           EOS
               ;;
             *)
