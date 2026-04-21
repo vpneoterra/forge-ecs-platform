@@ -6,6 +6,7 @@ const root = path.join(__dirname, '..');
 describe('Shape Check workflow', () => {
   const workflow = fs.readFileSync(path.join(root, '.github/workflows/shape-check.yml'), 'utf8');
   const script = fs.readFileSync(path.join(root, 'scripts/shape-check.sh'), 'utf8');
+  const syncScript = fs.readFileSync(path.join(root, 'scripts/sync-shape-check-to-axiom.mjs'), 'utf8');
   const harnessRun = fs.readFileSync(path.join(root, 'scripts/harness-run.sh'), 'utf8');
 
   test('is a reusable workflow_dispatch process, not a hard-coded 313 run', () => {
@@ -37,5 +38,14 @@ describe('Shape Check workflow', () => {
     expect(harnessRun).toContain('EXPECTED_SHAPE_CHIP_COUNT');
     expect(workflow).toContain('EXPECTED_SHAPE_CHIP_COUNT: ${{ env.corpus_count }}');
     expect(script).toContain('corpus_count');
+  });
+
+  test('can sync latest Shape Check status into AXIOM chip metadata via PR', () => {
+    expect(workflow).toContain('sync_axiom_shape_metadata');
+    expect(workflow).toContain('scripts/sync-shape-check-to-axiom.mjs');
+    expect(workflow).toContain('gh pr create');
+    expect(syncScript).toContain('chip.shape_check =');
+    expect(syncScript).toContain('telemetry.render_metrics');
+    expect(syncScript).toContain('weaknesses');
   });
 });

@@ -56,6 +56,11 @@ on:
         required: false
         default: 'notifications@neoterra.partners'
         type: string
+      sync_axiom_shape_metadata:
+        description: 'Open a vpneoterra/forgenew PR that syncs Shape Check status into AXIOM shape chips'
+        required: false
+        default: true
+        type: boolean
 
 env:
   AWS_REGION: us-east-1
@@ -216,6 +221,44 @@ jobs:
           LOG_EVENT_LIMIT: '1200'
         run: |
           ./scripts/shape-check.sh ${{ github.event.inputs.environment }}
+
+      - name: Sync Shape Check status into AXIOM chips
+        if: ${{ success() && github.event.inputs.sync_axiom_shape_metadata == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          CHECKED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          node scripts/sync-shape-check-to-axiom.mjs \
+            --results shape-check-artifacts/shape-check-results.jsonl \
+            --chips-root forgenew-src/server/axiom/chips/shapes \
+            --run-id "${{ github.run_id }}" \
+            --workflow-url "${RUN_URL}" \
+            --checked-at "${CHECKED_AT}" \
+            --environment "${{ github.event.inputs.environment }}" \
+            --summary-out shape-check-artifacts/shape-check-axiom-sync-summary.json
+
+          cd forgenew-src
+          git config user.name "Perplexity Computer"
+          git config user.email "notifications@neoterra.partners"
+          BRANCH="chore/shape-check-sync-${{ github.event.inputs.environment }}-${{ github.run_id }}"
+          git checkout -b "${BRANCH}"
+          git add server/axiom/chips/shapes
+          if git diff --cached --quiet; then
+            echo "No AXIOM shape-chip metadata changes to sync."
+            exit 0
+          fi
+          git commit -m "chore(axiom): sync shape check status (${{ github.event.inputs.environment }})"
+          git push origin "${BRANCH}"
+          gh pr create \
+            --repo vpneoterra/forgenew \
+            --base main \
+            --head "${BRANCH}" \
+            --title "chore(axiom): sync Shape Check status (${{ github.event.inputs.environment }})" \
+            --body "Syncs Shape Check validation status into AXIOM shape-chip metadata from ${RUN_URL}.
+
+            This updates root-level shape_check metadata, render telemetry counters, and shape_check-sourced weaknesses while leaving full evidence in the GitHub Actions artifact."
 
       - name: Upload Shape Check artifacts
         if: always()
