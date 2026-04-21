@@ -323,12 +323,23 @@ jobs:
           # so overrides.command=[$cmd] is executed as: /bin/bash -c "$cmd".
           # When MAX_DOCS is set, pass it as DKS_MAX_DOCS env override so the
           # in-container corpus-cap block engages.
+          # For 1b-smoke we also flip GEMMA_VERTEX_LOG_SAMPLES=1 so the extractor
+          # dumps the raw :predict body on failure — full 1b-harvest leaves this
+          # off by default to keep logs quiet.
+          ENV_JSON='[]'
           if [ -n "$MAX_DOCS" ]; then
-            jq -n --rawfile cmd /tmp/phase/cmd.sh --arg max "$MAX_DOCS" '{
+            ENV_JSON=$(jq -c --arg max "$MAX_DOCS" '. + [{name:"DKS_MAX_DOCS",value:$max}]' <<<"$ENV_JSON")
+          fi
+          if [ "$PHASE" = "1b-smoke" ]; then
+            ENV_JSON=$(jq -c '. + [{name:"GEMMA_VERTEX_LOG_SAMPLES",value:"1"}]' <<<"$ENV_JSON")
+          fi
+
+          if [ "$(jq 'length' <<<"$ENV_JSON")" -gt 0 ]; then
+            jq -n --rawfile cmd /tmp/phase/cmd.sh --argjson env "$ENV_JSON" '{
               containerOverrides: [{
                 name: "dks-ingest",
                 command: [$cmd],
-                environment: [{name: "DKS_MAX_DOCS", value: $max}]
+                environment: $env
               }]
             }' > /tmp/phase/overrides.json
           else
