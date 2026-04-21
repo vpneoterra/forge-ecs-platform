@@ -15,6 +15,7 @@ on:
           - bq-dryrun
           - 1a-bq
           - 1b-harvest
+          - 1b-smoke
       env:
         description: "Target environment (cluster suffix)"
         required: true
@@ -24,6 +25,16 @@ on:
           - dev
           - test
           - prod
+      max_docs:
+        description: "Cap patent docs processed (blank = phase default; 1b-smoke defaults to 8)"
+        required: false
+        type: string
+        default: ""
+      timeout_minutes:
+        description: "Override poll timeout in minutes (blank = phase default: 1b-harvest=90, 1b-smoke=20, others=10)"
+        required: false
+        type: string
+        default: ""
 
 env:
   AWS_REGION: us-east-1
@@ -94,10 +105,21 @@ jobs:
         id: cmd
         env:
           PHASE: ${{ inputs.phase }}
+          INPUT_MAX_DOCS: ${{ inputs.max_docs }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p /tmp/phase
+
+          # Resolve DKS_MAX_DOCS: explicit input wins; otherwise 1b-smoke defaults to 8.
+          MAX_DOCS=""
+          if [ -n "${INPUT_MAX_DOCS:-}" ]; then
+            MAX_DOCS="$INPUT_MAX_DOCS"
+          elif [ "$PHASE" = "1b-smoke" ]; then
+            MAX_DOCS="8"
+          fi
+          echo "max_docs=$MAX_DOCS" >> $GITHUB_OUTPUT
+          echo "Resolved DKS_MAX_DOCS: '${MAX_DOCS:-<unset>}'"
           case "$PHASE" in
             0a-schema)
               cat > /tmp/phase/cmd.sh <<'EOS'
@@ -142,7 +164,7 @@ jobs:
           wc -l /data/patents_t1/*.jsonl 2>/dev/null || true
           EOS
               ;;
-            1b-harvest)
+            1b-harvest|1b-smoke)
               cat > /tmp/phase/cmd.sh <<'EOS'
           set -euo pipefail
           # Materialize GCP SA key for ADC (Vertex client needs this alongside env JSON fallback)
@@ -181,6 +203,44 @@ jobs:
           mkdir -p /data/logs
           LOG=/data/logs/phase1_$(date +%Y%m%d_%H%M%S).log
 
+          # ---- Optional corpus cap for smoke runs ----
+          # When DKS_MAX_DOCS is set, materialize a capped copy of the T1 corpus
+          # at /data/patents_t1_capped/ so dks_harvest.py only sees the first N
+          # JSON documents. JSONL shards are truncated to N lines across files
+          # in lexical order; plain .json files are copied in order until the
+          # per-file docs sum hits N. This keeps smoke runs bounded without
+          # modifying the harvester.
+          PATENTS_DIR=/data/patents_t1/
+          if [ -n "${DKS_MAX_DOCS:-}" ] && [ "${DKS_MAX_DOCS}" -gt 0 ] 2>/dev/null; then
+            CAP_DIR=/data/patents_t1_capped
+            echo ">>> capping corpus to DKS_MAX_DOCS=$DKS_MAX_DOCS at $CAP_DIR"
+            rm -rf "$CAP_DIR"
+            mkdir -p "$CAP_DIR"
+            REMAINING="$DKS_MAX_DOCS"
+            # Prefer .jsonl shards (one doc per line) — truncate across files.
+            for f in $(ls -1 /data/patents_t1/*.jsonl 2>/dev/null | sort); do
+              [ "$REMAINING" -le 0 ] && break
+              base=$(basename "$f")
+              head -n "$REMAINING" "$f" > "$CAP_DIR/$base"
+              taken=$(wc -l < "$CAP_DIR/$base" | tr -d ' ')
+              REMAINING=$(( REMAINING - taken ))
+              echo "  + $base took $taken (remaining=$REMAINING)"
+            done
+            # Fallback: copy whole .json files in order (1 doc/file assumption).
+            if [ "$REMAINING" -gt 0 ]; then
+              for f in $(ls -1 /data/patents_t1/*.json 2>/dev/null | sort); do
+                [ "$REMAINING" -le 0 ] && break
+                base=$(basename "$f")
+                cp "$f" "$CAP_DIR/$base"
+                REMAINING=$(( REMAINING - 1 ))
+              done
+            fi
+            echo ">>> capped corpus contents:"
+            ls -la "$CAP_DIR/" || true
+            wc -l "$CAP_DIR"/*.jsonl 2>/dev/null || true
+            PATENTS_DIR="$CAP_DIR/"
+          fi
+
           # Baseline patent chunk count BEFORE harvest so we can diff after.
           BASELINE_PATENT_CHUNKS=$(psql "$DATABASE_URL" -At -c \
             "select coalesce(count(*),0) from design_knowledge_chunks where source_dataset='patents';")
@@ -189,8 +249,8 @@ jobs:
           echo ">>> baseline patent chunks : $BASELINE_PATENT_CHUNKS"
           echo ">>> baseline total chunks  : $BASELINE_TOTAL_CHUNKS"
 
-          echo ">>> harvest patents via vertex"
-          python3 dks_harvest.py --source patents --patents-dir /data/patents_t1/ --backend vertex --validate 2>&1 | tee "$LOG"
+          echo ">>> harvest patents via vertex (patents-dir=$PATENTS_DIR)"
+          python3 dks_harvest.py --source patents --patents-dir "$PATENTS_DIR" --backend vertex --validate 2>&1 | tee "$LOG"
 
           echo ">>> post-ingest counts"
           psql "$DATABASE_URL" -c "select count(*) as total_chunks from design_knowledge_chunks;"
@@ -261,12 +321,24 @@ jobs:
 
           # Build overrides.json. The patched task def sets entryPoint=[/bin/bash,-c],
           # so overrides.command=[$cmd] is executed as: /bin/bash -c "$cmd".
-          jq -n --rawfile cmd /tmp/phase/cmd.sh '{
-            containerOverrides: [{
-              name: "dks-ingest",
-              command: [$cmd]
-            }]
-          }' > /tmp/phase/overrides.json
+          # When MAX_DOCS is set, pass it as DKS_MAX_DOCS env override so the
+          # in-container corpus-cap block engages.
+          if [ -n "$MAX_DOCS" ]; then
+            jq -n --rawfile cmd /tmp/phase/cmd.sh --arg max "$MAX_DOCS" '{
+              containerOverrides: [{
+                name: "dks-ingest",
+                command: [$cmd],
+                environment: [{name: "DKS_MAX_DOCS", value: $max}]
+              }]
+            }' > /tmp/phase/overrides.json
+          else
+            jq -n --rawfile cmd /tmp/phase/cmd.sh '{
+              containerOverrides: [{
+                name: "dks-ingest",
+                command: [$cmd]
+              }]
+            }' > /tmp/phase/overrides.json
+          fi
           echo "overrides size: $(wc -c < /tmp/phase/overrides.json) bytes"
 
       - name: Run ECS task
@@ -311,15 +383,28 @@ jobs:
       - name: Poll for completion
         id: poll
         shell: bash
+        env:
+          INPUT_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
         run: |
           set -euo pipefail
           TASK_ARN="${{ steps.run.outputs.task_arn }}"
+          TASK_ID="${{ steps.run.outputs.task_id }}"
           CLUSTER="${{ steps.net.outputs.cluster }}"
 
+          # Phase-specific defaults (seconds). 1b-smoke is a bounded 8-doc run,
+          # so 1200s (20m) is the ceiling; 1b-harvest keeps the full 90m budget.
           case "${{ inputs.phase }}" in
             1b-harvest) TIMEOUT=5400 ;;
+            1b-smoke)   TIMEOUT=1200 ;;
             *)          TIMEOUT=600  ;;
           esac
+          # Optional user override via timeout_minutes input.
+          if [ -n "${INPUT_TIMEOUT_MINUTES:-}" ] && [ "${INPUT_TIMEOUT_MINUTES}" -gt 0 ] 2>/dev/null; then
+            TIMEOUT=$(( INPUT_TIMEOUT_MINUTES * 60 ))
+            echo "Poll timeout overridden via input: ${TIMEOUT}s (${INPUT_TIMEOUT_MINUTES}m)"
+          else
+            echo "Poll timeout: ${TIMEOUT}s"
+          fi
 
           ELAPSED=0
           INTERVAL=30
@@ -334,8 +419,22 @@ jobs:
           done
 
           if [ "$STATUS" != "STOPPED" ]; then
-            echo "::error::Task did not stop within ${TIMEOUT}s"
-            aws ecs stop-task --cluster "$CLUSTER" --task "$TASK_ARN" --reason "workflow timeout" || true
+            echo "::error::TIMED OUT: ECS task still ${STATUS} after ${TIMEOUT}s (phase=${{ inputs.phase }})"
+            echo ""
+            echo "=== describe-tasks (pre stop-task) ==="
+            aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+              --query 'tasks[0].{lastStatus:lastStatus,desiredStatus:desiredStatus,stoppedReason:stoppedReason,startedAt:startedAt,connectivity:connectivity,pullStartedAt:pullStartedAt,pullStoppedAt:pullStoppedAt,containers:containers[].{name:name,lastStatus:lastStatus,exitCode:exitCode,reason:reason}}' \
+              --output json || true
+            echo ""
+            echo "=== CloudWatch tail (last 400 lines, pre stop-task) ==="
+            STREAM="dks-ingest/dks-ingest/${TASK_ID}"
+            aws logs tail /forge/ecs/dks-ingest \
+              --log-stream-names "$STREAM" \
+              --format short 2>&1 | tail -400 || echo "(logs unavailable pre-stop)"
+            echo ""
+            echo ">>> issuing stop-task after diagnostics capture"
+            aws ecs stop-task --cluster "$CLUSTER" --task "$TASK_ARN" --reason "workflow timeout after ${TIMEOUT}s" || true
+            echo "exit_code=timeout" >> $GITHUB_OUTPUT
             exit 1
           fi
 
