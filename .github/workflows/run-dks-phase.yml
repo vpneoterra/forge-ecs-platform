@@ -25,8 +25,17 @@ on:
           - dev
           - test
           - prod
+      source:
+        description: "Objective/source for 1b phases (1a-bq is patents-only)"
+        required: false
+        default: "patents"
+        type: choice
+        options:
+          - patents
+          - arxiv
+          - materials
       max_docs:
-        description: "Cap patent docs processed (blank = phase default; 1b-smoke defaults to 8)"
+        description: "Cap docs processed (blank = phase default; 1b-smoke defaults to 8)"
         required: false
         type: string
         default: ""
@@ -42,7 +51,7 @@ env:
 
 jobs:
   run-phase:
-    name: "Phase ${{ inputs.phase }} (${{ inputs.env }})"
+    name: "Phase ${{ inputs.phase }} (${{ inputs.env }}, ${{ inputs.source }})"
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -105,11 +114,51 @@ jobs:
         id: cmd
         env:
           PHASE: ${{ inputs.phase }}
+          SOURCE: ${{ inputs.source }}
           INPUT_MAX_DOCS: ${{ inputs.max_docs }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p /tmp/phase
+
+          # ---- Source routing (1b phases) --------------------------------
+          # Map workflow input `source` to:
+          #   - CORPUS_DIR      : EFS path holding the input corpus
+          #   - SOURCE_DIR_FLAG : CLI flag dks_harvest.py expects for that dir
+          #   - DATASET_CANON   : canonical source_dataset value written by the
+          #                       harvester (for the zero-output guardrail)
+          #   - DATASET_ALT     : legacy/alt value also accepted by the guardrail
+          #                       via coalesce(source_dataset, source_file).
+          # 1a-bq is patents-only (BigQuery extract script is patents-specific);
+          # for arxiv/materials the corpus must already exist on EFS before a
+          # 1b-harvest/1b-smoke run is dispatched — this is documented in the
+          # in-container preflight log below.
+          case "$SOURCE" in
+            patents)
+              CORPUS_DIR="/data/patents_t1/"
+              SOURCE_DIR_FLAG="--patents-dir"
+              DATASET_CANON="uspto_patents"
+              DATASET_ALT="patents"
+              ;;
+            arxiv)
+              CORPUS_DIR="/data/arxiv_t1/"
+              SOURCE_DIR_FLAG="--arxiv-dir"
+              DATASET_CANON="arxiv_papers"
+              DATASET_ALT="arxiv"
+              ;;
+            materials)
+              CORPUS_DIR="/data/materials_t1/"
+              SOURCE_DIR_FLAG="--materials-dir"
+              DATASET_CANON="materials_catalog"
+              DATASET_ALT="materials"
+              ;;
+            *)
+              echo "::error::unknown source: $SOURCE"; exit 1 ;;
+          esac
+          echo "source=$SOURCE" >> $GITHUB_OUTPUT
+          echo "corpus_dir=$CORPUS_DIR" >> $GITHUB_OUTPUT
+          echo "dataset_canon=$DATASET_CANON" >> $GITHUB_OUTPUT
+          echo "Resolved source=$SOURCE corpus_dir=$CORPUS_DIR dir_flag=$SOURCE_DIR_FLAG dataset=$DATASET_CANON|$DATASET_ALT"
 
           # Resolve DKS_MAX_DOCS: explicit input wins; otherwise 1b-smoke defaults to 8.
           MAX_DOCS=""
@@ -120,6 +169,7 @@ jobs:
           fi
           echo "max_docs=$MAX_DOCS" >> $GITHUB_OUTPUT
           echo "Resolved DKS_MAX_DOCS: '${MAX_DOCS:-<unset>}'"
+
           case "$PHASE" in
             0a-schema)
               cat > /tmp/phase/cmd.sh <<'EOS'
@@ -147,6 +197,15 @@ jobs:
           EOS
               ;;
             1a-bq)
+              # 1a-bq is patents-only. If the user selected a non-patents
+              # source, fail fast rather than silently running the patents
+              # extract — arxiv/materials corpora are produced by a different
+              # pipeline documented in the 1b preflight.
+              if [ "$SOURCE" != "patents" ]; then
+                echo "::error::Phase 1a-bq is patents-only (got source=$SOURCE)."
+                echo "::error::For arxiv/materials, stage the corpus on EFS first, then run 1b-harvest/1b-smoke."
+                exit 1
+              fi
               cat > /tmp/phase/cmd.sh <<'EOS'
           set -euo pipefail
           # Materialize GCP SA key for ADC (BigQuery client needs this)
@@ -165,6 +224,10 @@ jobs:
           EOS
               ;;
             1b-harvest|1b-smoke)
+              # Template vars expanded into the heredoc by envsubst-style
+              # bash substitution. __SRC__ etc. are placeholders replaced
+              # below so the body stays quoted-heredoc-safe for everything
+              # else (preserves $VARS meant for in-container eval).
               cat > /tmp/phase/cmd.sh <<'EOS'
           set -euo pipefail
           # Materialize GCP SA key for ADC (Vertex client needs this alongside env JSON fallback)
@@ -173,11 +236,32 @@ jobs:
           export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp/sa.json
           export GOOGLE_CLOUD_PROJECT="${GEMMA_VERTEX_PROJECT:-mindful-vial-493123-a5}"
 
+          # ---- Source routing (baked in at dispatch time) ----
+          SRC="__SRC__"
+          CORPUS_DIR="__CORPUS_DIR__"
+          SRC_FLAG="__SRC_FLAG__"
+          DATASET_CANON="__DATASET_CANON__"
+          DATASET_ALT="__DATASET_ALT__"
+          echo ">>> running for source=$SRC"
+          echo ">>> corpus dir: $CORPUS_DIR (flag $SRC_FLAG)"
+          echo ">>> expected source_dataset values: $DATASET_CANON | $DATASET_ALT"
+
+          # Preflight: corpus must exist on EFS. For arxiv/materials this
+          # means the out-of-band stager has run; 1a-bq only produces the
+          # patents corpus.
+          if [ ! -d "$CORPUS_DIR" ]; then
+            echo "::error::corpus dir $CORPUS_DIR not present on EFS"
+            if [ "$SRC" != "patents" ]; then
+              echo "::error::$SRC corpus must be staged on EFS before running 1b (1a-bq is patents-only)."
+            fi
+            exit 1
+          fi
+          echo ">>> corpus dir listing (top 20):"
+          ls -la "$CORPUS_DIR" 2>/dev/null | head -20 || true
+
           # ---- Vertex dedicated-DNS preflight ----
           # Fail fast (and cheaply) if the per-endpoint dedicated DNS host does
-          # not resolve or TCP/443 is unreachable from the Fargate subnet. This
-          # catches the prior "wrong project number baked into the host" class
-          # of bug before we spend compute running the harvester.
+          # not resolve or TCP/443 is unreachable from the Fargate subnet.
           if [ "${GEMMA_VERTEX_DEDICATED_DNS:-false}" = "true" ]; then
             DNS_PREFIX="${GEMMA_VERTEX_DEDICATED_DNS_PREFIX:-${GEMMA_VERTEX_ENDPOINT_ID:-}}"
             PROJ_NUM="${GEMMA_VERTEX_PROJECT_NUMBER:-}"
@@ -192,7 +276,6 @@ jobs:
               echo "::error::DNS resolution failed for $VERTEX_HOST"
               exit 3
             fi
-            # TCP 443 reachability via /dev/tcp (bash built-in, no extra deps)
             if ! timeout 5 bash -c ">/dev/tcp/${VERTEX_HOST}/443" 2>/dev/null; then
               echo "::error::TCP 443 unreachable for $VERTEX_HOST"
               exit 3
@@ -201,24 +284,22 @@ jobs:
           fi
 
           mkdir -p /data/logs
-          LOG=/data/logs/phase1_$(date +%Y%m%d_%H%M%S).log
+          LOG=/data/logs/phase1_${SRC}_$(date +%Y%m%d_%H%M%S).log
 
           # ---- Optional corpus cap for smoke runs ----
-          # When DKS_MAX_DOCS is set, materialize a capped copy of the T1 corpus
-          # at /data/patents_t1_capped/ so dks_harvest.py only sees the first N
-          # JSON documents. JSONL shards are truncated to N lines across files
-          # in lexical order; plain .json files are copied in order until the
-          # per-file docs sum hits N. This keeps smoke runs bounded without
-          # modifying the harvester.
-          PATENTS_DIR=/data/patents_t1/
+          # When DKS_MAX_DOCS is set, materialize a capped copy of the source
+          # corpus at /data/<src>_t1_capped/ so dks_harvest.py only sees the
+          # first N JSON documents. JSONL shards are truncated to N lines
+          # across files in lexical order; plain .json files are copied in
+          # order until the per-file docs sum hits N.
+          USE_DIR="$CORPUS_DIR"
           if [ -n "${DKS_MAX_DOCS:-}" ] && [ "${DKS_MAX_DOCS}" -gt 0 ] 2>/dev/null; then
-            CAP_DIR=/data/patents_t1_capped
-            echo ">>> capping corpus to DKS_MAX_DOCS=$DKS_MAX_DOCS at $CAP_DIR"
+            CAP_DIR="/data/${SRC}_t1_capped"
+            echo ">>> capping $SRC corpus to DKS_MAX_DOCS=$DKS_MAX_DOCS at $CAP_DIR"
             rm -rf "$CAP_DIR"
             mkdir -p "$CAP_DIR"
             REMAINING="$DKS_MAX_DOCS"
-            # Prefer .jsonl shards (one doc per line) — truncate across files.
-            for f in $(ls -1 /data/patents_t1/*.jsonl 2>/dev/null | sort); do
+            for f in $(ls -1 "$CORPUS_DIR"*.jsonl 2>/dev/null | sort); do
               [ "$REMAINING" -le 0 ] && break
               base=$(basename "$f")
               head -n "$REMAINING" "$f" > "$CAP_DIR/$base"
@@ -226,9 +307,8 @@ jobs:
               REMAINING=$(( REMAINING - taken ))
               echo "  + $base took $taken (remaining=$REMAINING)"
             done
-            # Fallback: copy whole .json files in order (1 doc/file assumption).
             if [ "$REMAINING" -gt 0 ]; then
-              for f in $(ls -1 /data/patents_t1/*.json 2>/dev/null | sort); do
+              for f in $(ls -1 "$CORPUS_DIR"*.json 2>/dev/null | sort); do
                 [ "$REMAINING" -le 0 ] && break
                 base=$(basename "$f")
                 cp "$f" "$CAP_DIR/$base"
@@ -238,63 +318,57 @@ jobs:
             echo ">>> capped corpus contents:"
             ls -la "$CAP_DIR/" || true
             wc -l "$CAP_DIR"/*.jsonl 2>/dev/null || true
-            PATENTS_DIR="$CAP_DIR/"
+            USE_DIR="$CAP_DIR/"
           fi
 
-          # Baseline patent chunk count BEFORE harvest so we can diff after.
-          # Use COALESCE(source_dataset, source_file) so legacy smoke rows that
-          # populated only source_file='uspto_patents' (source_dataset NULL) are
-          # still counted as patents for the guardrail.
-          BASELINE_PATENT_CHUNKS=$(psql "$DATABASE_URL" -At -c \
-            "select coalesce(count(*),0) from design_knowledge_chunks where coalesce(source_dataset, source_file) = 'uspto_patents';")
+          # Baseline chunk count BEFORE harvest so we can diff after.
+          # Uses coalesce(source_dataset, source_file) so legacy rows that only
+          # populated source_file are still counted for the guardrail.
+          BASELINE_SRC_CHUNKS=$(psql "$DATABASE_URL" -At -c \
+            "select coalesce(count(*),0) from design_knowledge_chunks where coalesce(source_dataset, source_file) in ('$DATASET_CANON','$DATASET_ALT');")
           BASELINE_TOTAL_CHUNKS=$(psql "$DATABASE_URL" -At -c \
             "select coalesce(count(*),0) from design_knowledge_chunks;")
-          BASELINE_LEGACY_PATENT_CHUNKS=$(psql "$DATABASE_URL" -At -c \
-            "select coalesce(count(*),0) from design_knowledge_chunks where source_dataset is null and source_file='uspto_patents';")
-          echo ">>> baseline patent chunks        : $BASELINE_PATENT_CHUNKS"
-          echo ">>> baseline legacy patent chunks : $BASELINE_LEGACY_PATENT_CHUNKS (source_dataset IS NULL, source_file='uspto_patents')"
-          echo ">>> baseline total chunks         : $BASELINE_TOTAL_CHUNKS"
+          BASELINE_LEGACY_SRC_CHUNKS=$(psql "$DATABASE_URL" -At -c \
+            "select coalesce(count(*),0) from design_knowledge_chunks where source_dataset is null and source_file in ('$DATASET_CANON','$DATASET_ALT');")
+          echo ">>> baseline $SRC chunks         : $BASELINE_SRC_CHUNKS"
+          echo ">>> baseline legacy $SRC chunks  : $BASELINE_LEGACY_SRC_CHUNKS (source_dataset IS NULL, source_file in ($DATASET_CANON|$DATASET_ALT))"
+          echo ">>> baseline total chunks        : $BASELINE_TOTAL_CHUNKS"
 
-          echo ">>> harvest patents via vertex (patents-dir=$PATENTS_DIR)"
-          python3 dks_harvest.py --source patents --patents-dir "$PATENTS_DIR" --backend vertex --validate 2>&1 | tee "$LOG"
+          echo ">>> harvest $SRC via vertex (dir=$USE_DIR flag=$SRC_FLAG)"
+          python3 dks_harvest.py --source "$SRC" "$SRC_FLAG" "$USE_DIR" --backend vertex --validate 2>&1 | tee "$LOG"
 
           echo ">>> post-ingest counts"
           psql "$DATABASE_URL" -c "select count(*) as total_chunks from design_knowledge_chunks;"
           psql "$DATABASE_URL" -c "select chunk_type, count(*) from design_knowledge_chunks group by chunk_type order by 2 desc;"
           psql "$DATABASE_URL" -c "select source_dataset, count(*) from design_knowledge_chunks group by source_dataset order by 2 desc limit 10;"
-          # Provenance diagnostic: surface legacy smoke rows where source_dataset
-          # is NULL but source_file='uspto_patents' so regressions stay visible.
-          psql "$DATABASE_URL" -c "select 'legacy_patents_null_dataset' as bucket, count(*) from design_knowledge_chunks where source_dataset is null and source_file='uspto_patents';"
+          psql "$DATABASE_URL" -c "select 'legacy_${SRC}_null_dataset' as bucket, count(*) from design_knowledge_chunks where source_dataset is null and source_file in ('$DATASET_CANON','$DATASET_ALT');"
           psql "$DATABASE_URL" -c "select coalesce(source_dataset, source_file) as provenance, count(*) from design_knowledge_chunks group by coalesce(source_dataset, source_file) order by 2 desc limit 10;"
           psql "$DATABASE_URL" -c "select column_name, data_type from information_schema.columns where table_name='design_knowledge_chunks' order by ordinal_position;" || true
           psql "$DATABASE_URL" -c "select phase, source, status, backend, row_count_delta, duration_ms, cost_estimate_usd, created_at from dks_runlog order by created_at desc limit 5;"
 
           # ---- Zero-output guardrail ----
-          # Fail the task if the harvest inserted zero patent chunks, even when
-          # dks_harvest.py reported success. Checks two independent signals:
-          #   1) design_knowledge_chunks row count for
-          #      coalesce(source_dataset, source_file)='uspto_patents' must have
-          #      grown vs. the pre-run baseline. COALESCE is used so legacy
-          #      smoke rows (source_dataset NULL, source_file='uspto_patents')
-          #      are counted as patents.
-          #   2) The latest dks_runlog row for phase1b_harvest / patents must
+          # Fail the task if the harvest inserted zero new chunks for this
+          # source, even when dks_harvest.py reported success. Checks:
+          #   1) design_knowledge_chunks row count for coalesce(source_dataset,
+          #      source_file) in (canonical, alt) must have grown vs baseline.
+          #   2) The latest dks_runlog row for phase1b_harvest / <source> must
           #      have status='success' AND row_count_delta > 0.
           echo ">>> validating row_count_delta and chunk growth"
-          POST_PATENT_CHUNKS=$(psql "$DATABASE_URL" -At -c \
-            "select coalesce(count(*),0) from design_knowledge_chunks where coalesce(source_dataset, source_file) = 'uspto_patents';")
-          POST_LEGACY_PATENT_CHUNKS=$(psql "$DATABASE_URL" -At -c \
-            "select coalesce(count(*),0) from design_knowledge_chunks where source_dataset is null and source_file='uspto_patents';")
-          PATENT_DELTA=$(( POST_PATENT_CHUNKS - BASELINE_PATENT_CHUNKS ))
-          LEGACY_PATENT_DELTA=$(( POST_LEGACY_PATENT_CHUNKS - BASELINE_LEGACY_PATENT_CHUNKS ))
-          echo "post patent chunks         : $POST_PATENT_CHUNKS"
-          echo "post legacy patent chunks  : $POST_LEGACY_PATENT_CHUNKS"
-          echo "patent chunk delta         : $PATENT_DELTA"
-          echo "legacy patent chunk delta  : $LEGACY_PATENT_DELTA"
+          POST_SRC_CHUNKS=$(psql "$DATABASE_URL" -At -c \
+            "select coalesce(count(*),0) from design_knowledge_chunks where coalesce(source_dataset, source_file) in ('$DATASET_CANON','$DATASET_ALT');")
+          POST_LEGACY_SRC_CHUNKS=$(psql "$DATABASE_URL" -At -c \
+            "select coalesce(count(*),0) from design_knowledge_chunks where source_dataset is null and source_file in ('$DATASET_CANON','$DATASET_ALT');")
+          SRC_DELTA=$(( POST_SRC_CHUNKS - BASELINE_SRC_CHUNKS ))
+          LEGACY_SRC_DELTA=$(( POST_LEGACY_SRC_CHUNKS - BASELINE_LEGACY_SRC_CHUNKS ))
+          echo "post $SRC chunks        : $POST_SRC_CHUNKS"
+          echo "post legacy $SRC chunks : $POST_LEGACY_SRC_CHUNKS"
+          echo "$SRC chunk delta        : $SRC_DELTA"
+          echo "legacy $SRC chunk delta : $LEGACY_SRC_DELTA"
 
           RUNLOG_ROW=$(psql "$DATABASE_URL" -At -F '|' -c \
             "select coalesce(status,''), coalesce(row_count_delta,0)
                from dks_runlog
-              where phase='phase1b_harvest' and source='patents'
+              where phase='phase1b_harvest' and source='$SRC'
               order by created_at desc
               limit 1;")
           RUNLOG_STATUS="${RUNLOG_ROW%%|*}"
@@ -302,28 +376,27 @@ jobs:
           if [ -z "$RUNLOG_ROW" ]; then
             RUNLOG_STATUS="missing"; RUNLOG_DELTA="0"
           fi
-          echo "runlog status       : $RUNLOG_STATUS"
+          echo "runlog status         : $RUNLOG_STATUS"
           echo "runlog row_count_delta: $RUNLOG_DELTA"
 
           FAIL=0
-          if [ "$PATENT_DELTA" -le 0 ]; then
-            echo "::error::phase1b_harvest produced zero new patent chunks (delta=$PATENT_DELTA)"
+          if [ "$SRC_DELTA" -le 0 ]; then
+            echo "::error::phase1b_harvest produced zero new $SRC chunks (delta=$SRC_DELTA)"
             FAIL=1
           fi
           if [ "$RUNLOG_STATUS" != "success" ]; then
             echo "::error::latest dks_runlog row is not success (status=$RUNLOG_STATUS)"
             FAIL=1
           fi
-          # Treat non-positive delta as failure even if runlog claims success.
           if ! [ "$RUNLOG_DELTA" -gt 0 ] 2>/dev/null; then
             echo "::error::latest dks_runlog row_count_delta is not > 0 (row_count_delta=$RUNLOG_DELTA)"
             FAIL=1
           fi
           if [ "$FAIL" -ne 0 ]; then
-            echo "::error::Phase 1b-harvest zero-output guardrail tripped; failing task."
+            echo "::error::Phase 1b-harvest zero-output guardrail tripped for $SRC; failing task."
             exit 2
           fi
-          echo ">>> Phase 1b-harvest guardrail passed (patent_delta=$PATENT_DELTA, runlog_delta=$RUNLOG_DELTA)"
+          echo ">>> Phase 1b-harvest guardrail passed for $SRC (delta=$SRC_DELTA, runlog_delta=$RUNLOG_DELTA)"
           EOS
               ;;
             *)
@@ -333,28 +406,40 @@ jobs:
           # Strip the 10-space YAML block indent that got prepended to every line
           sed -i 's/^          //' /tmp/phase/cmd.sh
 
+          # Expand source-routing placeholders for 1b phases. Using a
+          # delimiter unlikely to appear in the values (|) and escaping any
+          # stray '|' defensively.
+          if [ "$PHASE" = "1b-harvest" ] || [ "$PHASE" = "1b-smoke" ]; then
+            esc() { printf '%s' "$1" | sed 's/[\/&|]/\\&/g'; }
+            sed -i \
+              -e "s|__SRC__|$(esc "$SOURCE")|g" \
+              -e "s|__CORPUS_DIR__|$(esc "$CORPUS_DIR")|g" \
+              -e "s|__SRC_FLAG__|$(esc "$SOURCE_DIR_FLAG")|g" \
+              -e "s|__DATASET_CANON__|$(esc "$DATASET_CANON")|g" \
+              -e "s|__DATASET_ALT__|$(esc "$DATASET_ALT")|g" \
+              /tmp/phase/cmd.sh
+          fi
+
           echo "---- cmd.sh ----"
           cat /tmp/phase/cmd.sh
           echo "----------------"
+
+          # Syntax check the generated script before shipping it to ECS.
+          bash -n /tmp/phase/cmd.sh
 
           # Build overrides.json. The patched task def sets entryPoint=[/bin/bash,-c],
           # so overrides.command=[$cmd] is executed as: /bin/bash -c "$cmd".
           #
           # AWS ECS caps containerOverrides at 8192 bytes total (JSON-encoded).
-          # The 1b-harvest/1b-smoke script alone is ~8KB after guardrail + diag
-          # additions, which pushes the override past the limit and causes
-          # RunTask to fail before the task starts. To stay safely under the
-          # cap we gzip+base64 the phase script and pass a tiny bootstrap that
-          # decodes and execs it in the container. base64/gunzip/bash are all
-          # present in the dks-ingest image (standard coreutils + gzip).
+          # To stay under the cap we gzip+base64 the phase script and pass a
+          # tiny bootstrap that decodes and execs it in the container.
           CMD_B64=$(gzip -9 -c /tmp/phase/cmd.sh | base64 -w0)
           BOOTSTRAP="set -euo pipefail; printf %s \"$CMD_B64\" | base64 -d | gunzip | bash"
 
           # When MAX_DOCS is set, pass it as DKS_MAX_DOCS env override so the
           # in-container corpus-cap block engages.
           # For 1b-smoke we also flip GEMMA_VERTEX_LOG_SAMPLES=1 so the extractor
-          # dumps the raw :predict body on failure — full 1b-harvest leaves this
-          # off by default to keep logs quiet.
+          # dumps the raw :predict body on failure.
           ENV_JSON='[]'
           if [ -n "$MAX_DOCS" ]; then
             ENV_JSON=$(jq -c --arg max "$MAX_DOCS" '. + [{name:"DKS_MAX_DOCS",value:$max}]' <<<"$ENV_JSON")
@@ -443,7 +528,6 @@ jobs:
             1b-smoke)   TIMEOUT=1200 ;;
             *)          TIMEOUT=600  ;;
           esac
-          # Optional user override via timeout_minutes input.
           if [ -n "${INPUT_TIMEOUT_MINUTES:-}" ] && [ "${INPUT_TIMEOUT_MINUTES}" -gt 0 ] 2>/dev/null; then
             TIMEOUT=$(( INPUT_TIMEOUT_MINUTES * 60 ))
             echo "Poll timeout overridden via input: ${TIMEOUT}s (${INPUT_TIMEOUT_MINUTES}m)"
@@ -514,7 +598,7 @@ jobs:
         if: always() && steps.run.outputs.task_id != ''
         uses: actions/upload-artifact@v4
         with:
-          name: dks-phase-log-${{ inputs.phase }}-${{ steps.run.outputs.task_id }}
+          name: dks-phase-log-${{ inputs.phase }}-${{ inputs.source }}-${{ steps.run.outputs.task_id }}
           path: /tmp/phase/full.log
           retention-days: 7
 
@@ -524,8 +608,8 @@ jobs:
         run: |
           EXIT="${{ steps.poll.outputs.exit_code }}"
           if [ -z "$EXIT" ]; then EXIT="unknown"; fi
-          echo "Phase ${{ inputs.phase }} exit code: $EXIT"
+          echo "Phase ${{ inputs.phase }} (source=${{ inputs.source }}) exit code: $EXIT"
           if [ "$EXIT" != "0" ]; then
-            echo "::error::Phase ${{ inputs.phase }} failed (exit $EXIT)"
+            echo "::error::Phase ${{ inputs.phase }} (source=${{ inputs.source }}) failed (exit $EXIT)"
             exit 1
           fi
