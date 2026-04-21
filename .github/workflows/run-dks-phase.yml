@@ -339,6 +339,17 @@ jobs:
 
           # Build overrides.json. The patched task def sets entryPoint=[/bin/bash,-c],
           # so overrides.command=[$cmd] is executed as: /bin/bash -c "$cmd".
+          #
+          # AWS ECS caps containerOverrides at 8192 bytes total (JSON-encoded).
+          # The 1b-harvest/1b-smoke script alone is ~8KB after guardrail + diag
+          # additions, which pushes the override past the limit and causes
+          # RunTask to fail before the task starts. To stay safely under the
+          # cap we gzip+base64 the phase script and pass a tiny bootstrap that
+          # decodes and execs it in the container. base64/gunzip/bash are all
+          # present in the dks-ingest image (standard coreutils + gzip).
+          CMD_B64=$(gzip -9 -c /tmp/phase/cmd.sh | base64 -w0)
+          BOOTSTRAP="set -euo pipefail; printf %s \"$CMD_B64\" | base64 -d | gunzip | bash"
+
           # When MAX_DOCS is set, pass it as DKS_MAX_DOCS env override so the
           # in-container corpus-cap block engages.
           # For 1b-smoke we also flip GEMMA_VERTEX_LOG_SAMPLES=1 so the extractor
@@ -353,7 +364,7 @@ jobs:
           fi
 
           if [ "$(jq 'length' <<<"$ENV_JSON")" -gt 0 ]; then
-            jq -n --rawfile cmd /tmp/phase/cmd.sh --argjson env "$ENV_JSON" '{
+            jq -n --arg cmd "$BOOTSTRAP" --argjson env "$ENV_JSON" '{
               containerOverrides: [{
                 name: "dks-ingest",
                 command: [$cmd],
@@ -361,14 +372,19 @@ jobs:
               }]
             }' > /tmp/phase/overrides.json
           else
-            jq -n --rawfile cmd /tmp/phase/cmd.sh '{
+            jq -n --arg cmd "$BOOTSTRAP" '{
               containerOverrides: [{
                 name: "dks-ingest",
                 command: [$cmd]
               }]
             }' > /tmp/phase/overrides.json
           fi
-          echo "overrides size: $(wc -c < /tmp/phase/overrides.json) bytes"
+          OVERRIDE_BYTES=$(wc -c < /tmp/phase/overrides.json)
+          echo "overrides size: ${OVERRIDE_BYTES} bytes (AWS limit: 8192)"
+          if [ "$OVERRIDE_BYTES" -gt 8192 ]; then
+            echo "::error::containerOverrides exceeds 8192 bytes (${OVERRIDE_BYTES}); ECS RunTask will fail"
+            exit 1
+          fi
 
       - name: Run ECS task
         id: run
