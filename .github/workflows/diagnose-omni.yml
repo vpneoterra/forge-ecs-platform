@@ -1,0 +1,240 @@
+name: Diagnose OMNI Service
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+      minutes:
+        description: 'How many recent minutes of OMNI logs to capture'
+        required: false
+        default: '90'
+        type: string
+      log_limit:
+        description: 'Maximum CloudWatch events to capture'
+        required: false
+        default: '1000'
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  ECS_CLUSTER: forge-app-${{ github.event.inputs.environment }}
+  OMNI_SERVICE: forge-omni
+  OMNI_LOG_GROUP: /forge/ecs/forge-omni
+  OMNI_STREAM_PREFIX: omni/omni-api
+
+jobs:
+  diagnose:
+    name: Diagnose OMNI (${{ github.event.inputs.environment }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Capture ECS, target health, and CloudWatch evidence
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p omni-diagnostics
+          exec > >(tee omni-diagnostics/diagnose-omni.log) 2>&1
+
+          MINUTES="${{ github.event.inputs.minutes }}"
+          LOG_LIMIT="${{ github.event.inputs.log_limit }}"
+          if ! [[ "${MINUTES}" =~ ^[0-9]+$ ]] || [ "${MINUTES}" -lt 1 ]; then
+            echo "::error::minutes must be a positive integer"
+            exit 1
+          fi
+          if ! [[ "${LOG_LIMIT}" =~ ^[0-9]+$ ]] || [ "${LOG_LIMIT}" -lt 1 ]; then
+            echo "::error::log_limit must be a positive integer"
+            exit 1
+          fi
+
+          START_MS=$(( ($(date +%s) - MINUTES * 60) * 1000 ))
+          END_MS=$(( $(date +%s) * 1000 ))
+          echo "=== OMNI diagnostic window ==="
+          echo "cluster=${ECS_CLUSTER}"
+          echo "service=${OMNI_SERVICE}"
+          echo "log_group=${OMNI_LOG_GROUP}"
+          echo "stream_prefix=${OMNI_STREAM_PREFIX}"
+          echo "minutes=${MINUTES}"
+          echo "start_ms=${START_MS}"
+          echo "end_ms=${END_MS}"
+
+          echo ""
+          echo "=== Caller identity ==="
+          aws sts get-caller-identity || true
+
+          echo ""
+          echo "=== ECS service summary ==="
+          aws ecs describe-services \
+            --cluster "${ECS_CLUSTER}" \
+            --services "${OMNI_SERVICE}" \
+            --output json \
+            > omni-diagnostics/service.json || true
+          cat omni-diagnostics/service.json
+
+          echo ""
+          echo "=== ECS deployments/events summary ==="
+          python3 - <<'PY' || true
+          import json
+          p = "omni-diagnostics/service.json"
+          try:
+              data = json.load(open(p))
+              service = data.get("services", [{}])[0]
+          except Exception as exc:
+              print(f"failed to parse service.json: {exc}")
+              raise SystemExit(0)
+          print(json.dumps({
+              "status": service.get("status"),
+              "desiredCount": service.get("desiredCount"),
+              "runningCount": service.get("runningCount"),
+              "pendingCount": service.get("pendingCount"),
+              "taskDefinition": service.get("taskDefinition"),
+              "deployments": [
+                  {
+                      "id": d.get("id"),
+                      "status": d.get("status"),
+                      "rolloutState": d.get("rolloutState"),
+                      "rolloutStateReason": d.get("rolloutStateReason"),
+                      "desiredCount": d.get("desiredCount"),
+                      "runningCount": d.get("runningCount"),
+                      "pendingCount": d.get("pendingCount"),
+                      "failedTasks": d.get("failedTasks"),
+                      "createdAt": str(d.get("createdAt")),
+                      "updatedAt": str(d.get("updatedAt")),
+                  }
+                  for d in service.get("deployments", [])
+              ],
+              "events": [
+                  {"createdAt": str(e.get("createdAt")), "message": e.get("message")}
+                  for e in service.get("events", [])[:20]
+              ],
+          }, indent=2))
+          PY
+
+          echo ""
+          echo "=== Running tasks ==="
+          RUNNING_TASKS=$(aws ecs list-tasks \
+            --cluster "${ECS_CLUSTER}" \
+            --service-name "${OMNI_SERVICE}" \
+            --desired-status RUNNING \
+            --query 'taskArns[]' \
+            --output text 2>/dev/null || true)
+          echo "${RUNNING_TASKS:-NONE}" | tee omni-diagnostics/running-tasks.txt
+          if [ -n "${RUNNING_TASKS}" ]; then
+            aws ecs describe-tasks \
+              --cluster "${ECS_CLUSTER}" \
+              --tasks ${RUNNING_TASKS} \
+              --output json \
+              > omni-diagnostics/running-task-details.json || true
+            cat omni-diagnostics/running-task-details.json
+          fi
+
+          echo ""
+          echo "=== Recent stopped tasks ==="
+          STOPPED_TASKS=$(aws ecs list-tasks \
+            --cluster "${ECS_CLUSTER}" \
+            --service-name "${OMNI_SERVICE}" \
+            --desired-status STOPPED \
+            --query 'taskArns[0:10]' \
+            --output text 2>/dev/null || true)
+          echo "${STOPPED_TASKS:-NONE}" | tee omni-diagnostics/stopped-tasks.txt
+          if [ -n "${STOPPED_TASKS}" ]; then
+            aws ecs describe-tasks \
+              --cluster "${ECS_CLUSTER}" \
+              --tasks ${STOPPED_TASKS} \
+              --output json \
+              > omni-diagnostics/stopped-task-details.json || true
+            cat omni-diagnostics/stopped-task-details.json
+          fi
+
+          echo ""
+          echo "=== Target health ==="
+          TARGET_GROUPS=$(python3 - <<'PY' || true
+          import json
+          try:
+              service = json.load(open("omni-diagnostics/service.json")).get("services", [{}])[0]
+              print(" ".join(lb.get("targetGroupArn", "") for lb in service.get("loadBalancers", []) if lb.get("targetGroupArn")))
+          except Exception:
+              pass
+          PY
+          )
+          echo "${TARGET_GROUPS:-NONE}" | tee omni-diagnostics/target-groups.txt
+          for tg in ${TARGET_GROUPS}; do
+            echo "--- ${tg} ---"
+            safe=$(echo "${tg}" | tr '/:' '__')
+            aws elbv2 describe-target-health \
+              --target-group-arn "${tg}" \
+              --output json \
+              > "omni-diagnostics/target-health-${safe}.json" || true
+            cat "omni-diagnostics/target-health-${safe}.json"
+          done
+
+          echo ""
+          echo "=== Recent OMNI log streams ==="
+          aws logs describe-log-streams \
+            --log-group-name "${OMNI_LOG_GROUP}" \
+            --order-by LastEventTime \
+            --descending \
+            --limit 10 \
+            --output json \
+            > omni-diagnostics/log-streams.json || true
+          cat omni-diagnostics/log-streams.json
+
+          echo ""
+          echo "=== Recent OMNI CloudWatch log events ==="
+          : > omni-diagnostics/omni-cloudwatch-events.txt
+          python3 - <<'PY' > omni-diagnostics/recent-streams.txt || true
+          import json
+          try:
+              data = json.load(open("omni-diagnostics/log-streams.json"))
+          except Exception:
+              raise SystemExit(0)
+          for stream in data.get("logStreams", []):
+              name = stream.get("logStreamName")
+              if name:
+                  print(name)
+          PY
+          while IFS= read -r stream; do
+            [ -z "${stream}" ] && continue
+            echo "--- stream: ${stream} ---" | tee -a omni-diagnostics/omni-cloudwatch-events.txt
+            aws logs get-log-events \
+              --log-group-name "${OMNI_LOG_GROUP}" \
+              --log-stream-name "${stream}" \
+              --start-time "${START_MS}" \
+              --end-time "${END_MS}" \
+              --limit "${LOG_LIMIT}" \
+              --query 'events[*].{timestamp:timestamp,message:message}' \
+              --output json \
+              >> omni-diagnostics/omni-cloudwatch-events.txt 2>&1 || true
+          done < omni-diagnostics/recent-streams.txt
+          cat omni-diagnostics/omni-cloudwatch-events.txt
+
+          echo ""
+          echo "=== Error-focused log scan ==="
+          grep -iE "error|exception|fail|fatal|oom|out of memory|killed|timeout|unhealthy|502|bad gateway|crash|exceed|voxel" \
+            omni-diagnostics/omni-cloudwatch-events.txt \
+            | head -300 \
+            > omni-diagnostics/error-scan.txt || true
+          cat omni-diagnostics/error-scan.txt
+
+      - name: Upload OMNI diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: omni-diagnostics-${{ github.event.inputs.environment }}
+          path: omni-diagnostics/
+          retention-days: 14
