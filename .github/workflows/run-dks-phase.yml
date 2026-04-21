@@ -14,6 +14,7 @@ on:
           - 0a-schema
           - bq-dryrun
           - 1a-bq
+          - 1a-stage
           - 1b-harvest
           - 1b-smoke
       env:
@@ -26,7 +27,7 @@ on:
           - test
           - prod
       source:
-        description: "Objective/source for 1b phases (1a-bq is patents-only)"
+        description: "Objective/source for 1a-stage / 1b phases (1a-bq is patents-only)"
         required: false
         default: "patents"
         type: choice
@@ -40,7 +41,7 @@ on:
         type: string
         default: ""
       timeout_minutes:
-        description: "Override poll timeout in minutes (blank = phase default: 1b-harvest=90, 1b-smoke=20, others=10)"
+        description: "Override poll timeout in minutes (blank = phase default: 1b-harvest=90, 1b-smoke=20, 1a-stage=60, others=10)"
         required: false
         type: string
         default: ""
@@ -139,18 +140,21 @@ jobs:
               SOURCE_DIR_FLAG="--patents-dir"
               DATASET_CANON="uspto_patents"
               DATASET_ALT="patents"
+              STAGER_SCRIPT=""
               ;;
             arxiv)
               CORPUS_DIR="/data/arxiv_t1/"
               SOURCE_DIR_FLAG="--arxiv-dir"
               DATASET_CANON="arxiv_papers"
               DATASET_ALT="arxiv"
+              STAGER_SCRIPT="scripts/stage_arxiv.py"
               ;;
             materials)
               CORPUS_DIR="/data/materials_t1/"
               SOURCE_DIR_FLAG="--materials-dir"
               DATASET_CANON="materials_catalog"
               DATASET_ALT="materials"
+              STAGER_SCRIPT="scripts/stage_materials.py"
               ;;
             *)
               echo "::error::unknown source: $SOURCE"; exit 1 ;;
@@ -221,6 +225,80 @@ jobs:
           python3 scripts/extract_bigquery.py --tier t1 --output /data/patents_t1/ --local --force
           ls -la /data/patents_t1/
           wc -l /data/patents_t1/*.jsonl 2>/dev/null || true
+          EOS
+              ;;
+            1a-stage)
+              # 1a-stage materializes the arxiv or materials corpus onto EFS at
+              # the same /data/<src>_t1/ path that 1b-harvest/1b-smoke expect.
+              # Patents are produced by 1a-bq; staging patents here is a no-op
+              # error to avoid ambiguity.
+              if [ "$SOURCE" = "patents" ]; then
+                echo "::error::Phase 1a-stage is arxiv/materials-only; use 1a-bq for patents."
+                exit 1
+              fi
+              cat > /tmp/phase/cmd.sh <<'EOS'
+          set -euo pipefail
+          # Materialize GCP SA key for ADC (stagers may hit GCS for source data).
+          mkdir -p /tmp/gcp
+          printf '%s' "$GEMMA_VERTEX_SA_KEY_JSON" > /tmp/gcp/sa.json
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp/sa.json
+          export GOOGLE_CLOUD_PROJECT="${GEMMA_VERTEX_PROJECT:-mindful-vial-493123-a5}"
+
+          SRC="__SRC__"
+          OUT_DIR="__CORPUS_DIR__"
+          STAGER="__STAGER__"
+
+          echo ">>> staging source=$SRC into $OUT_DIR via $STAGER"
+          echo ">>> /data mount info:"
+          df -T /data 2>&1 || echo "(df failed)"
+          mount | grep -E "/data|efs" || echo "(no efs mount)"
+
+          mkdir -p "$OUT_DIR"
+
+          LIMIT_ARGS=()
+          if [ -n "${DKS_MAX_DOCS:-}" ] && [ "${DKS_MAX_DOCS}" -gt 0 ] 2>/dev/null; then
+            LIMIT_ARGS=(--limit "$DKS_MAX_DOCS")
+            echo ">>> applying --limit $DKS_MAX_DOCS"
+          fi
+
+          if [ ! -f "/app/$STAGER" ] && [ ! -f "$STAGER" ]; then
+            echo "::error::stager script not found at /app/$STAGER or $STAGER in container"
+            echo "::error::rebuild dks-ingest image with forgenew stager scripts or mount them in"
+            exit 1
+          fi
+
+          STAGER_PATH="$STAGER"
+          if [ -f "/app/$STAGER" ]; then STAGER_PATH="/app/$STAGER"; fi
+          echo ">>> invoking: python3 $STAGER_PATH --out $OUT_DIR ${LIMIT_ARGS[*]}"
+          python3 "$STAGER_PATH" --out "$OUT_DIR" "${LIMIT_ARGS[@]}"
+
+          echo ">>> staged corpus listing (top 20):"
+          ls -la "$OUT_DIR" | head -20 || true
+
+          FILE_COUNT=$(find "$OUT_DIR" -maxdepth 1 -type f \( -name '*.jsonl' -o -name '*.json' \) | wc -l | tr -d ' ')
+          JSONL_LINES=$(cat "$OUT_DIR"*.jsonl 2>/dev/null | wc -l | tr -d ' ')
+          JSON_FILES=$(ls -1 "$OUT_DIR"*.json 2>/dev/null | wc -l | tr -d ' ')
+          echo ">>> file count : $FILE_COUNT"
+          echo ">>> jsonl lines: $JSONL_LINES"
+          echo ">>> json files : $JSON_FILES"
+
+          echo ">>> sample lines (first 3 from first jsonl shard):"
+          FIRST_JSONL=$(ls -1 "$OUT_DIR"*.jsonl 2>/dev/null | head -n1 || true)
+          if [ -n "$FIRST_JSONL" ]; then
+            head -n 3 "$FIRST_JSONL" || true
+          else
+            FIRST_JSON=$(ls -1 "$OUT_DIR"*.json 2>/dev/null | head -n1 || true)
+            if [ -n "$FIRST_JSON" ]; then
+              head -c 2000 "$FIRST_JSON" || true
+              echo
+            fi
+          fi
+
+          if [ "$FILE_COUNT" -eq 0 ] || { [ "$JSONL_LINES" -eq 0 ] && [ "$JSON_FILES" -eq 0 ]; }; then
+            echo "::error::Phase 1a-stage produced empty output at $OUT_DIR for $SRC"
+            exit 2
+          fi
+          echo ">>> Phase 1a-stage complete for $SRC ($FILE_COUNT files, $JSONL_LINES jsonl lines, $JSON_FILES json files)"
           EOS
               ;;
             1b-harvest|1b-smoke)
@@ -406,10 +484,10 @@ jobs:
           # Strip the 10-space YAML block indent that got prepended to every line
           sed -i 's/^          //' /tmp/phase/cmd.sh
 
-          # Expand source-routing placeholders for 1b phases. Using a
-          # delimiter unlikely to appear in the values (|) and escaping any
-          # stray '|' defensively.
-          if [ "$PHASE" = "1b-harvest" ] || [ "$PHASE" = "1b-smoke" ]; then
+          # Expand source-routing placeholders for 1a-stage and 1b phases.
+          # Using a delimiter unlikely to appear in the values (|) and escaping
+          # any stray '|' defensively.
+          if [ "$PHASE" = "1a-stage" ] || [ "$PHASE" = "1b-harvest" ] || [ "$PHASE" = "1b-smoke" ]; then
             esc() { printf '%s' "$1" | sed 's/[\/&|]/\\&/g'; }
             sed -i \
               -e "s|__SRC__|$(esc "$SOURCE")|g" \
@@ -417,6 +495,7 @@ jobs:
               -e "s|__SRC_FLAG__|$(esc "$SOURCE_DIR_FLAG")|g" \
               -e "s|__DATASET_CANON__|$(esc "$DATASET_CANON")|g" \
               -e "s|__DATASET_ALT__|$(esc "$DATASET_ALT")|g" \
+              -e "s|__STAGER__|$(esc "$STAGER_SCRIPT")|g" \
               /tmp/phase/cmd.sh
           fi
 
@@ -526,6 +605,7 @@ jobs:
           case "${{ inputs.phase }}" in
             1b-harvest) TIMEOUT=5400 ;;
             1b-smoke)   TIMEOUT=1200 ;;
+            1a-stage)   TIMEOUT=3600 ;;
             *)          TIMEOUT=600  ;;
           esac
           if [ -n "${INPUT_TIMEOUT_MINUTES:-}" ] && [ "${INPUT_TIMEOUT_MINUTES}" -gt 0 ] 2>/dev/null; then
