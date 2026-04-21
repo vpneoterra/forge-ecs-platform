@@ -242,12 +242,18 @@ jobs:
           fi
 
           # Baseline patent chunk count BEFORE harvest so we can diff after.
+          # Use COALESCE(source_dataset, source_file) so legacy smoke rows that
+          # populated only source_file='uspto_patents' (source_dataset NULL) are
+          # still counted as patents for the guardrail.
           BASELINE_PATENT_CHUNKS=$(psql "$DATABASE_URL" -At -c \
-            "select coalesce(count(*),0) from design_knowledge_chunks where source_dataset='patents';")
+            "select coalesce(count(*),0) from design_knowledge_chunks where coalesce(source_dataset, source_file) = 'uspto_patents';")
           BASELINE_TOTAL_CHUNKS=$(psql "$DATABASE_URL" -At -c \
             "select coalesce(count(*),0) from design_knowledge_chunks;")
-          echo ">>> baseline patent chunks : $BASELINE_PATENT_CHUNKS"
-          echo ">>> baseline total chunks  : $BASELINE_TOTAL_CHUNKS"
+          BASELINE_LEGACY_PATENT_CHUNKS=$(psql "$DATABASE_URL" -At -c \
+            "select coalesce(count(*),0) from design_knowledge_chunks where source_dataset is null and source_file='uspto_patents';")
+          echo ">>> baseline patent chunks        : $BASELINE_PATENT_CHUNKS"
+          echo ">>> baseline legacy patent chunks : $BASELINE_LEGACY_PATENT_CHUNKS (source_dataset IS NULL, source_file='uspto_patents')"
+          echo ">>> baseline total chunks         : $BASELINE_TOTAL_CHUNKS"
 
           echo ">>> harvest patents via vertex (patents-dir=$PATENTS_DIR)"
           python3 dks_harvest.py --source patents --patents-dir "$PATENTS_DIR" --backend vertex --validate 2>&1 | tee "$LOG"
@@ -256,22 +262,34 @@ jobs:
           psql "$DATABASE_URL" -c "select count(*) as total_chunks from design_knowledge_chunks;"
           psql "$DATABASE_URL" -c "select chunk_type, count(*) from design_knowledge_chunks group by chunk_type order by 2 desc;"
           psql "$DATABASE_URL" -c "select source_dataset, count(*) from design_knowledge_chunks group by source_dataset order by 2 desc limit 10;"
+          # Provenance diagnostic: surface legacy smoke rows where source_dataset
+          # is NULL but source_file='uspto_patents' so regressions stay visible.
+          psql "$DATABASE_URL" -c "select 'legacy_patents_null_dataset' as bucket, count(*) from design_knowledge_chunks where source_dataset is null and source_file='uspto_patents';"
+          psql "$DATABASE_URL" -c "select coalesce(source_dataset, source_file) as provenance, count(*) from design_knowledge_chunks group by coalesce(source_dataset, source_file) order by 2 desc limit 10;"
           psql "$DATABASE_URL" -c "select column_name, data_type from information_schema.columns where table_name='design_knowledge_chunks' order by ordinal_position;" || true
           psql "$DATABASE_URL" -c "select phase, source, status, backend, row_count_delta, duration_ms, cost_estimate_usd, created_at from dks_runlog order by created_at desc limit 5;"
 
           # ---- Zero-output guardrail ----
           # Fail the task if the harvest inserted zero patent chunks, even when
           # dks_harvest.py reported success. Checks two independent signals:
-          #   1) design_knowledge_chunks row count for source_dataset='patents'
-          #      must have grown vs. the pre-run baseline.
+          #   1) design_knowledge_chunks row count for
+          #      coalesce(source_dataset, source_file)='uspto_patents' must have
+          #      grown vs. the pre-run baseline. COALESCE is used so legacy
+          #      smoke rows (source_dataset NULL, source_file='uspto_patents')
+          #      are counted as patents.
           #   2) The latest dks_runlog row for phase1b_harvest / patents must
           #      have status='success' AND row_count_delta > 0.
           echo ">>> validating row_count_delta and chunk growth"
           POST_PATENT_CHUNKS=$(psql "$DATABASE_URL" -At -c \
-            "select coalesce(count(*),0) from design_knowledge_chunks where source_dataset='patents';")
+            "select coalesce(count(*),0) from design_knowledge_chunks where coalesce(source_dataset, source_file) = 'uspto_patents';")
+          POST_LEGACY_PATENT_CHUNKS=$(psql "$DATABASE_URL" -At -c \
+            "select coalesce(count(*),0) from design_knowledge_chunks where source_dataset is null and source_file='uspto_patents';")
           PATENT_DELTA=$(( POST_PATENT_CHUNKS - BASELINE_PATENT_CHUNKS ))
-          echo "post patent chunks  : $POST_PATENT_CHUNKS"
-          echo "patent chunk delta  : $PATENT_DELTA"
+          LEGACY_PATENT_DELTA=$(( POST_LEGACY_PATENT_CHUNKS - BASELINE_LEGACY_PATENT_CHUNKS ))
+          echo "post patent chunks         : $POST_PATENT_CHUNKS"
+          echo "post legacy patent chunks  : $POST_LEGACY_PATENT_CHUNKS"
+          echo "patent chunk delta         : $PATENT_DELTA"
+          echo "legacy patent chunk delta  : $LEGACY_PATENT_DELTA"
 
           RUNLOG_ROW=$(psql "$DATABASE_URL" -At -F '|' -c \
             "select coalesce(status,''), coalesce(row_count_delta,0)
