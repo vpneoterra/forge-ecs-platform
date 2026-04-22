@@ -423,19 +423,24 @@ jobs:
           echo ">>> staged corpus listing (top 20):"
           ls -la "$OUT_DIR" | head -20 || true
 
+          # Count output files/lines WITHOUT relying on shell globs that
+          # return non-zero when unmatched — under `set -euo pipefail` the
+          # outer assignment then aborts the whole script even though the
+          # stager succeeded. Use `find` for enumeration (always exits 0)
+          # and stream matches into `cat`/`wc` so a no-match case yields 0.
           FILE_COUNT=$(find "$OUT_DIR" -maxdepth 1 -type f \( -name '*.jsonl' -o -name '*.json' \) | wc -l | tr -d ' ')
-          JSONL_LINES=$(cat "$OUT_DIR"*.jsonl 2>/dev/null | wc -l | tr -d ' ')
-          JSON_FILES=$(ls -1 "$OUT_DIR"*.json 2>/dev/null | wc -l | tr -d ' ')
+          JSONL_LINES=$(find "$OUT_DIR" -maxdepth 1 -type f -name '*.jsonl' -exec cat {} + 2>/dev/null | wc -l | tr -d ' ')
+          JSON_FILES=$(find "$OUT_DIR" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' ')
           echo ">>> file count : $FILE_COUNT"
           echo ">>> jsonl lines: $JSONL_LINES"
           echo ">>> json files : $JSON_FILES"
 
           echo ">>> sample lines (first 3 from first jsonl shard):"
-          FIRST_JSONL=$(ls -1 "$OUT_DIR"*.jsonl 2>/dev/null | head -n1 || true)
+          FIRST_JSONL=$(find "$OUT_DIR" -maxdepth 1 -type f -name '*.jsonl' 2>/dev/null | sort | head -n1 || true)
           if [ -n "$FIRST_JSONL" ]; then
             head -n 3 "$FIRST_JSONL" || true
           else
-            FIRST_JSON=$(ls -1 "$OUT_DIR"*.json 2>/dev/null | head -n1 || true)
+            FIRST_JSON=$(find "$OUT_DIR" -maxdepth 1 -type f -name '*.json' 2>/dev/null | sort | head -n1 || true)
             if [ -n "$FIRST_JSON" ]; then
               head -c 2000 "$FIRST_JSON" || true
               echo
