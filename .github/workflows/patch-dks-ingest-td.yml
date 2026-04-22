@@ -20,6 +20,10 @@ on:
         description: "ECR image tag to pin (default: latest)"
         required: false
         default: "latest"
+      dks_concurrency:
+        description: "DKS_CONCURRENCY env (intra-source doc parallelism; 1 = serial, 4 = Vertex min-replicas=4). Empty string = leave existing value untouched."
+        required: false
+        default: ""
 
 env:
   AWS_REGION: us-east-1
@@ -68,6 +72,7 @@ jobs:
         id: build
         env:
           IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+          DKS_CONCURRENCY: ${{ github.event.inputs.dks_concurrency }}
           VERTEX_SA_ARN: ${{ steps.vertex.outputs.arn }}
           DBURL_ARN: ${{ steps.dburl.outputs.arn }}
           ACCOUNT_ID: ${{ env.ACCOUNT_ID }}
@@ -127,6 +132,15 @@ jobs:
 
           existing = {e['name']: e['value'] for e in cd.get('environment', [])}
           existing.update(vertex_env)
+
+          # Optional DKS_CONCURRENCY override. Empty input = keep whatever
+          # was already in the task definition (no-op for back-compat).
+          # Non-empty input writes the value as-is; the harvester's
+          # _resolve_concurrency() clamps to [1, _CONCURRENCY_MAX] at runtime.
+          dks_conc = os.environ.get('DKS_CONCURRENCY', '').strip()
+          if dks_conc:
+              existing['DKS_CONCURRENCY'] = dks_conc
+
           cd['environment'] = [{'name': k, 'value': v} for k, v in sorted(existing.items())]
 
           # Secrets (desired state). valueFrom must be a SecretsManager or SSM ARN.
