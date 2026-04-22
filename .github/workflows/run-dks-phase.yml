@@ -835,6 +835,18 @@ jobs:
           echo "Task ARN: $TASK_ARN"
           echo "Task ID : $TASK_ID"
 
+      - name: Log initial task image digest
+        if: always() && steps.run.outputs.task_arn != ''
+        shell: bash
+        run: |
+          set +e
+          TASK_ARN="${{ steps.run.outputs.task_arn }}"
+          CLUSTER="${{ steps.net.outputs.cluster }}"
+          echo "=== describe-tasks (initial, post run-task) ==="
+          aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+            --query 'tasks[0].{taskDefinitionArn:taskDefinitionArn,lastStatus:lastStatus,desiredStatus:desiredStatus,pullStartedAt:pullStartedAt,pullStoppedAt:pullStoppedAt,containers:containers[].{name:name,image:image,imageDigest:imageDigest,lastStatus:lastStatus,exitCode:exitCode,reason:reason}}' \
+            --output json || echo "(describe-tasks unavailable)"
+
       - name: Poll for completion
         id: poll
         shell: bash
@@ -878,7 +890,7 @@ jobs:
             echo ""
             echo "=== describe-tasks (pre stop-task) ==="
             aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
-              --query 'tasks[0].{lastStatus:lastStatus,desiredStatus:desiredStatus,stoppedReason:stoppedReason,startedAt:startedAt,connectivity:connectivity,pullStartedAt:pullStartedAt,pullStoppedAt:pullStoppedAt,containers:containers[].{name:name,lastStatus:lastStatus,exitCode:exitCode,reason:reason}}' \
+              --query 'tasks[0].{taskDefinitionArn:taskDefinitionArn,lastStatus:lastStatus,desiredStatus:desiredStatus,stoppedReason:stoppedReason,startedAt:startedAt,connectivity:connectivity,pullStartedAt:pullStartedAt,pullStoppedAt:pullStoppedAt,containers:containers[].{name:name,image:image,imageDigest:imageDigest,lastStatus:lastStatus,exitCode:exitCode,reason:reason}}' \
               --output json || true
             echo ""
             echo "=== CloudWatch tail (last 400 lines, pre stop-task) ==="
@@ -892,6 +904,11 @@ jobs:
             echo "exit_code=timeout" >> $GITHUB_OUTPUT
             exit 1
           fi
+
+          echo "=== describe-tasks (terminal STOPPED) ==="
+          aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+            --query 'tasks[0].{taskDefinitionArn:taskDefinitionArn,lastStatus:lastStatus,desiredStatus:desiredStatus,stoppedReason:stoppedReason,startedAt:startedAt,stoppedAt:stoppedAt,connectivity:connectivity,pullStartedAt:pullStartedAt,pullStoppedAt:pullStoppedAt,containers:containers[].{name:name,image:image,imageDigest:imageDigest,lastStatus:lastStatus,exitCode:exitCode,reason:reason}}' \
+            --output json || true
 
           EXIT=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
             --query 'tasks[0].containers[0].exitCode' --output text)
