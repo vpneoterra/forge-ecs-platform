@@ -45,6 +45,39 @@ on:
         required: false
         type: string
         default: ""
+      patent_scope:
+        description: "Patent extract scope for 1a-bq (target=legacy 1K T1, all_estimate=BQ dry-run across all USPTO, all_sample=bounded export, all_export=full ramp — requires force_full_all)"
+        required: false
+        default: "target"
+        type: choice
+        options:
+          - target
+          - all_estimate
+          - all_sample
+          - all_export
+      year_range:
+        description: "Publication year range for all-USPTO scopes, e.g. 2015-2024 or single year 2024 (ignored for target)"
+        required: false
+        type: string
+        default: ""
+      max_rows:
+        description: "Row cap for all_sample (default 10000) and safety ceiling for all_export (default 0=unbounded when force_full_all=true)"
+        required: false
+        type: string
+        default: ""
+      force_full_all:
+        description: "Safety gate: must be 'true' to run patent_scope=all_export with no max_rows (cost guard)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      patents_dir:
+        description: "Override patents corpus dir for 1b phases (blank=default /data/patents_t1/; e.g. /data/patents_all_sample/ or /data/patents_all/)"
+        required: false
+        type: string
+        default: ""
 
 env:
   AWS_REGION: us-east-1
@@ -117,6 +150,11 @@ jobs:
           PHASE: ${{ inputs.phase }}
           SOURCE: ${{ inputs.source }}
           INPUT_MAX_DOCS: ${{ inputs.max_docs }}
+          INPUT_PATENT_SCOPE: ${{ inputs.patent_scope }}
+          INPUT_YEAR_RANGE: ${{ inputs.year_range }}
+          INPUT_MAX_ROWS: ${{ inputs.max_rows }}
+          INPUT_FORCE_FULL_ALL: ${{ inputs.force_full_all }}
+          INPUT_PATENTS_DIR: ${{ inputs.patents_dir }}
         shell: bash
         run: |
           set -euo pipefail
@@ -141,20 +179,35 @@ jobs:
               DATASET_CANON="uspto_patents"
               DATASET_ALT="patents"
               STAGER_SCRIPT=""
+              # Optional override so 1b-smoke/1b-harvest can point at
+              # all-USPTO sample/export dirs produced by patent_scope=all_*.
+              # Only honored for the patents source; arxiv/materials have
+              # their own stager paths.
+              if [ -n "${INPUT_PATENTS_DIR:-}" ]; then
+                case "$INPUT_PATENTS_DIR" in
+                  /data/patents_t1/|/data/patents_all/|/data/patents_all_sample/)
+                    CORPUS_DIR="$INPUT_PATENTS_DIR"
+                    echo "note: patents_dir override active — CORPUS_DIR=$CORPUS_DIR"
+                    ;;
+                  *)
+                    echo "::error::patents_dir must be one of /data/patents_t1/ | /data/patents_all/ | /data/patents_all_sample/ (got: $INPUT_PATENTS_DIR)"
+                    exit 1 ;;
+                esac
+              fi
               ;;
             arxiv)
               CORPUS_DIR="/data/arxiv_t1/"
               SOURCE_DIR_FLAG="--arxiv-dir"
               DATASET_CANON="arxiv_papers"
               DATASET_ALT="arxiv"
-              STAGER_SCRIPT="scripts/stage_arxiv.py"
+              STAGER_SCRIPT="scripts/stage_arxiv_t1.py"
               ;;
             materials)
               CORPUS_DIR="/data/materials_t1/"
               SOURCE_DIR_FLAG="--materials-dir"
               DATASET_CANON="materials_catalog"
               DATASET_ALT="materials"
-              STAGER_SCRIPT="scripts/stage_materials.py"
+              STAGER_SCRIPT="scripts/stage_materials_t1.py"
               ;;
             *)
               echo "::error::unknown source: $SOURCE"; exit 1 ;;
@@ -210,21 +263,116 @@ jobs:
                 echo "::error::For arxiv/materials, stage the corpus on EFS first, then run 1b-harvest/1b-smoke."
                 exit 1
               fi
-              cat > /tmp/phase/cmd.sh <<'EOS'
+
+              # ---- patent_scope routing ----
+              # target       : existing 1K T1 extract into /data/patents_t1/ (backward compatible default)
+              # all_estimate : BigQuery dry-run over the all-USPTO query — returns bytes_processed only, no rows written
+              # all_sample   : bounded export into /data/patents_all_sample/ capped by max_rows (default 10000)
+              # all_export   : full all-USPTO export into /data/patents_all/ — requires force_full_all=true
+              #                UNLESS max_rows is set (bounded exports are always permitted as a safety ramp)
+              PSCOPE="${INPUT_PATENT_SCOPE:-target}"
+              YRANGE="${INPUT_YEAR_RANGE:-}"
+              MAX_ROWS="${INPUT_MAX_ROWS:-}"
+              FFALL="${INPUT_FORCE_FULL_ALL:-false}"
+              echo ">>> 1a-bq patent_scope=$PSCOPE year_range='${YRANGE:-<unset>}' max_rows='${MAX_ROWS:-<unset>}' force_full_all=$FFALL"
+
+              # Validate year_range format (YYYY or YYYY-YYYY) when provided
+              if [ -n "$YRANGE" ]; then
+                if ! echo "$YRANGE" | grep -Eq '^[0-9]{4}(-[0-9]{4})?$'; then
+                  echo "::error::year_range must be YYYY or YYYY-YYYY (got: $YRANGE)"
+                  exit 1
+                fi
+              fi
+
+              # Validate max_rows is a non-negative integer when provided
+              if [ -n "$MAX_ROWS" ]; then
+                if ! echo "$MAX_ROWS" | grep -Eq '^[0-9]+$'; then
+                  echo "::error::max_rows must be a non-negative integer (got: $MAX_ROWS)"
+                  exit 1
+                fi
+              fi
+
+              case "$PSCOPE" in
+                target)
+                  if [ -n "$YRANGE" ] || [ -n "$MAX_ROWS" ] || [ "$FFALL" = "true" ]; then
+                    echo "::warning::patent_scope=target ignores year_range/max_rows/force_full_all (legacy 1K T1 path)"
+                  fi
+                  EXPORT_CMD='python3 scripts/extract_bigquery.py --tier t1 --output /data/patents_t1/ --local --force'
+                  EXPORT_OUTDIR='/data/patents_t1'
+                  ;;
+                all_estimate)
+                  # BigQuery dry-run only — forgenew exporter returns bytes_processed.
+                  # No rows written, no output dir created. The exporter CLI uses
+                  # --tier all to select the full USPTO scope; there is no --scope
+                  # flag and no --estimate flag (dry-run IS the estimate mode).
+                  YFLAG=""
+                  [ -n "$YRANGE" ] && YFLAG="--year-range $YRANGE"
+                  EXPORT_CMD="python3 scripts/extract_bigquery.py --tier all --dry-run $YFLAG"
+                  EXPORT_OUTDIR=""
+                  ;;
+                all_sample)
+                  # Bounded sample into /data/patents_all_sample/. Default cap 10K rows.
+                  EFFECTIVE_ROWS="${MAX_ROWS:-10000}"
+                  if [ "$EFFECTIVE_ROWS" -le 0 ] 2>/dev/null; then
+                    echo "::error::patent_scope=all_sample requires max_rows > 0 (got: $EFFECTIVE_ROWS)"
+                    exit 1
+                  fi
+                  YFLAG=""
+                  [ -n "$YRANGE" ] && YFLAG="--year-range $YRANGE"
+                  EXPORT_CMD="python3 scripts/extract_bigquery.py --tier all --output /data/patents_all_sample/ --local --force --max-rows $EFFECTIVE_ROWS $YFLAG"
+                  EXPORT_OUTDIR='/data/patents_all_sample'
+                  ;;
+                all_export)
+                  # Full all-USPTO ramp into /data/patents_all/. Requires either:
+                  #   - force_full_all=true (unbounded full export), OR
+                  #   - max_rows>0          (bounded ramp — safe without the hard gate)
+                  if [ -z "$MAX_ROWS" ] && [ "$FFALL" != "true" ]; then
+                    echo "::error::patent_scope=all_export without max_rows requires force_full_all=true (cost guard)."
+                    echo "::error::Either set max_rows=<N> for a bounded ramp, or set force_full_all=true for the full extract."
+                    exit 1
+                  fi
+                  RFLAG=""
+                  [ -n "$MAX_ROWS" ] && RFLAG="--max-rows $MAX_ROWS"
+                  YFLAG=""
+                  [ -n "$YRANGE" ] && YFLAG="--year-range $YRANGE"
+                  EXPORT_CMD="python3 scripts/extract_bigquery.py --tier all --output /data/patents_all/ --local --force $RFLAG $YFLAG"
+                  EXPORT_OUTDIR='/data/patents_all'
+                  ;;
+                *)
+                  echo "::error::unknown patent_scope: $PSCOPE"
+                  exit 1 ;;
+              esac
+              echo ">>> export cmd: $EXPORT_CMD"
+              echo "patent_scope=$PSCOPE" >> $GITHUB_OUTPUT
+              echo "export_outdir=$EXPORT_OUTDIR" >> $GITHUB_OUTPUT
+
+              cat > /tmp/phase/cmd.sh <<EOS
           set -euo pipefail
           # Materialize GCP SA key for ADC (BigQuery client needs this)
           mkdir -p /tmp/gcp
-          printf '%s' "$GEMMA_VERTEX_SA_KEY_JSON" > /tmp/gcp/sa.json
+          printf '%s' "\$GEMMA_VERTEX_SA_KEY_JSON" > /tmp/gcp/sa.json
           export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp/sa.json
-          export GOOGLE_CLOUD_PROJECT="${GEMMA_VERTEX_PROJECT:-mindful-vial-493123-a5}"
+          export GOOGLE_CLOUD_PROJECT="\${GEMMA_VERTEX_PROJECT:-mindful-vial-493123-a5}"
           echo ">>> /data mount info:"
           df -T /data 2>&1 || echo "(df failed)"
           mount | grep -E "/data|efs" || echo "(no efs mount)"
-          mkdir -p /data/patents_t1
-          echo ">>> extract T1 1K patents"
-          python3 scripts/extract_bigquery.py --tier t1 --output /data/patents_t1/ --local --force
-          ls -la /data/patents_t1/
-          wc -l /data/patents_t1/*.jsonl 2>/dev/null || true
+          echo ">>> patent_scope=$PSCOPE"
+          if [ -n "$EXPORT_OUTDIR" ]; then
+            mkdir -p "$EXPORT_OUTDIR"
+          fi
+          # CLI-drift probe: surface the actual exporter usage in the task log
+          # so future arg renames (e.g. --years vs --year-range) are obvious
+          # without needing to re-run a failed export.
+          echo ">>> exporter --help (CLI drift probe):"
+          python3 scripts/extract_bigquery.py --help 2>&1 | sed -n '1,40p' || true
+          echo ">>> running: $EXPORT_CMD"
+          $EXPORT_CMD
+          if [ -n "$EXPORT_OUTDIR" ]; then
+            ls -la "$EXPORT_OUTDIR/" || true
+            wc -l "$EXPORT_OUTDIR"/*.jsonl 2>/dev/null || true
+          else
+            echo ">>> dry-run/estimate complete — no output directory written"
+          fi
           EOS
               ;;
             1a-stage)
@@ -269,8 +417,8 @@ jobs:
 
           STAGER_PATH="$STAGER"
           if [ -f "/app/$STAGER" ]; then STAGER_PATH="/app/$STAGER"; fi
-          echo ">>> invoking: python3 $STAGER_PATH --out $OUT_DIR ${LIMIT_ARGS[*]}"
-          python3 "$STAGER_PATH" --out "$OUT_DIR" "${LIMIT_ARGS[@]}"
+          echo ">>> invoking: python3 $STAGER_PATH --output $OUT_DIR ${LIMIT_ARGS[*]}"
+          python3 "$STAGER_PATH" --output "$OUT_DIR" "${LIMIT_ARGS[@]}"
 
           echo ">>> staged corpus listing (top 20):"
           ls -la "$OUT_DIR" | head -20 || true

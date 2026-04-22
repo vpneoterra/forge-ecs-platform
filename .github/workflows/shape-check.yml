@@ -61,6 +61,11 @@ on:
         required: false
         default: true
         type: boolean
+      forgenew_ref:
+        description: 'vpneoterra/forgenew branch, tag, or SHA containing the shape corpus to validate'
+        required: false
+        default: 'main'
+        type: string
 
 env:
   AWS_REGION: us-east-1
@@ -91,7 +96,7 @@ jobs:
         with:
           repository: vpneoterra/forgenew
           token: ${{ secrets.GH_PAT }}
-          ref: main
+          ref: ${{ github.event.inputs.forgenew_ref }}
           path: forgenew-src
 
       - name: Verify shape-check inputs and corpus
@@ -132,6 +137,7 @@ jobs:
             exit 1
           fi
           COUNT=$(find "${CORPUS}" -type f -name '*.json' | wc -l | tr -d ' ')
+          echo "Using forgenew_ref=${{ github.event.inputs.forgenew_ref }}"
           echo "Discovered ${COUNT} shape-chip JSON files under ${CORPUS}"
           if [[ "${COUNT}" -lt 1 ]]; then
             echo "::error::shape corpus is empty"
@@ -251,9 +257,10 @@ jobs:
           fi
           git commit -m "chore(axiom): sync shape check status (${{ github.event.inputs.environment }})"
           git push origin "${BRANCH}"
+          BASE_REF="${{ github.event.inputs.forgenew_ref }}"
           gh pr create \
             --repo vpneoterra/forgenew \
-            --base main \
+            --base "${BASE_REF}" \
             --head "${BRANCH}" \
             --title "chore(axiom): sync Shape Check status (${{ github.event.inputs.environment }})" \
             --body "Syncs Shape Check validation status into AXIOM shape-chip metadata from ${RUN_URL}.

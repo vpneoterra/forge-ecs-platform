@@ -1,0 +1,468 @@
+name: Shape Check Chunked
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+      start_index:
+        description: 'Zero-based corpus index to start from'
+        required: false
+        default: '0'
+        type: string
+      limit:
+        description: "Number of shapes to evaluate, or 'all'"
+        required: false
+        default: 'all'
+        type: string
+      chunk_size:
+        description: 'Shapes per GitHub job chunk; keep low enough to avoid the 6-hour runner limit'
+        required: false
+        default: '75'
+        type: string
+      max_parallel_chunks:
+        description: 'Maximum chunks running against OMNI at once'
+        required: false
+        default: '1'
+        type: string
+      default_voxel_size_mm:
+        description: 'Initial voxel size for preview evaluation'
+        required: false
+        default: '0.5'
+        type: string
+      per_part_timeout_sec:
+        description: 'HTTP timeout per shape render attempt'
+        required: false
+        default: '150'
+        type: string
+      max_renderer_blockers:
+        description: 'Stop each chunk after N renderer blockers; 0 means evaluate the full requested chunk'
+        required: false
+        default: '0'
+        type: string
+      voxel_size_safety_mult:
+        description: 'Multiplier for OMNI suggested voxel size on one retry'
+        required: false
+        default: '2.25'
+        type: string
+      max_voxel_size_mm:
+        description: 'Cap for adaptive retry voxel size'
+        required: false
+        default: '5.0'
+        type: string
+      image_tag:
+        description: 'Extra ECR tag to apply to the harness image (default: github.sha)'
+        required: false
+        default: ''
+        type: string
+      alertEmail:
+        description: 'Email for harness budget / CloudWatch alerts'
+        required: false
+        default: 'notifications@neoterra.partners'
+        type: string
+      sync_axiom_shape_metadata:
+        description: 'Open a vpneoterra/forgenew PR that syncs Shape Check status into AXIOM shape chips'
+        required: false
+        default: true
+        type: boolean
+      forgenew_ref:
+        description: 'vpneoterra/forgenew branch, tag, or SHA containing the shape corpus to validate'
+        required: false
+        default: 'main'
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  NODE_VERSION: '20'
+
+concurrency:
+  group: shape-check-chunked-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare chunk plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      corpus_count: ${{ steps.plan.outputs.corpus_count }}
+      start_index: ${{ steps.plan.outputs.start_index }}
+      normalized_limit: ${{ steps.plan.outputs.normalized_limit }}
+      end_exclusive: ${{ steps.plan.outputs.end_exclusive }}
+      chunk_count: ${{ steps.plan.outputs.chunk_count }}
+      max_parallel_chunks: ${{ steps.plan.outputs.max_parallel_chunks }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Checkout vpneoterra/forgenew shape corpus
+        uses: actions/checkout@v4
+        with:
+          repository: vpneoterra/forgenew
+          token: ${{ secrets.GH_PAT }}
+          ref: ${{ github.event.inputs.forgenew_ref }}
+          path: forgenew-src
+
+      - name: Validate inputs and build chunk matrix
+        id: plan
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' \
+            "${GITHUB_WORKSPACE}/forgenew-src/server/axiom/chips/shapes" \
+            "${{ github.event.inputs.start_index }}" \
+            "${{ github.event.inputs.limit }}" \
+            "${{ github.event.inputs.chunk_size }}" \
+            "${{ github.event.inputs.max_parallel_chunks }}" \
+            "${GITHUB_OUTPUT}"
+          import json
+          import math
+          import pathlib
+          import sys
+
+          corpus_dir = pathlib.Path(sys.argv[1])
+          start_raw, limit_raw, chunk_raw, parallel_raw, output_file = sys.argv[2:]
+          if not corpus_dir.is_dir():
+              raise SystemExit(f"::error::shape corpus directory not found: {corpus_dir}")
+
+          def non_negative_int(name, value):
+              if not value.isdigit():
+                  raise SystemExit(f"::error::{name} must be a non-negative integer, got {value}")
+              return int(value)
+
+          def positive_int(name, value):
+              if not value.isdigit() or int(value) < 1:
+                  raise SystemExit(f"::error::{name} must be a positive integer, got {value}")
+              return int(value)
+
+          corpus_count = len(sorted(corpus_dir.rglob("*.json")))
+          if corpus_count < 1:
+              raise SystemExit("::error::shape corpus is empty")
+          start_index = non_negative_int("start_index", start_raw)
+          if start_index >= corpus_count:
+              raise SystemExit(f"::error::start_index={start_index} exceeds corpus_count={corpus_count}")
+          if limit_raw == "all":
+              normalized_limit = corpus_count - start_index
+          else:
+              normalized_limit = positive_int("limit", limit_raw)
+          end_exclusive = start_index + normalized_limit
+          if end_exclusive > corpus_count:
+              raise SystemExit(f"::error::requested window {start_index}..{end_exclusive - 1} exceeds corpus_count={corpus_count}")
+          chunk_size = positive_int("chunk_size", chunk_raw)
+          max_parallel_chunks = positive_int("max_parallel_chunks", parallel_raw)
+          chunks = []
+          for chunk_number, chunk_start in enumerate(range(start_index, end_exclusive, chunk_size), 1):
+              chunk_end = min(chunk_start + chunk_size, end_exclusive)
+              chunks.append({
+                  "chunk": chunk_number,
+                  "label": f"{chunk_start:04d}-{chunk_end - 1:04d}",
+                  "start_index": chunk_start,
+                  "limit": chunk_end - chunk_start,
+                  "end_exclusive": chunk_end,
+              })
+          matrix = {"include": chunks}
+          print(f"Using forgenew_ref=${{ github.event.inputs.forgenew_ref }}")
+          print(f"Discovered {corpus_count} shape-chip JSON files")
+          print(f"Window {start_index}..{end_exclusive - 1}; chunk_size={chunk_size}; chunks={len(chunks)}; max_parallel={max_parallel_chunks}")
+          with open(output_file, "a", encoding="utf-8") as f:
+              f.write(f"corpus_count={corpus_count}\n")
+              f.write(f"start_index={start_index}\n")
+              f.write(f"normalized_limit={normalized_limit}\n")
+              f.write(f"end_exclusive={end_exclusive}\n")
+              f.write(f"chunk_count={len(chunks)}\n")
+              f.write(f"max_parallel_chunks={max_parallel_chunks}\n")
+              f.write(f"matrix={json.dumps(matrix, separators=(',', ':'))}\n")
+          PY
+
+  setup:
+    name: Deploy harness and build image
+    runs-on: ubuntu-latest
+    needs: prepare
+    environment:
+      name: ${{ github.event.inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 90
+    steps:
+      - name: Checkout forge-ecs-platform
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Checkout vpneoterra/forgenew shape corpus
+        uses: actions/checkout@v4
+        with:
+          repository: vpneoterra/forgenew
+          token: ${{ secrets.GH_PAT }}
+          ref: ${{ github.event.inputs.forgenew_ref }}
+          path: forgenew-src
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.image_tag }}"
+          if [[ -z "${TAG}" ]]; then
+            TAG="${GITHUB_SHA::12}"
+          fi
+          echo "image_tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved harness image tag: ${TAG}"
+
+      - name: CDK Synth (harness, with network for ref resolution)
+        run: |
+          npx cdk synth \
+            ForgeNetwork-${{ github.event.inputs.environment }} \
+            ForgeTestingHarness-${{ github.event.inputs.environment }} \
+            -c env=${{ github.event.inputs.environment }} \
+            -c deployTestingHarness=true \
+            -c deploySolvers=true \
+            -c skipRds=true \
+            -c alertEmail=${{ github.event.inputs.alertEmail }}
+
+      - name: CDK Deploy (harness only)
+        run: |
+          npx cdk deploy \
+            ForgeTestingHarness-${{ github.event.inputs.environment }} \
+            --exclusively \
+            --require-approval never \
+            --outputs-file harness-cdk-outputs.json \
+            -c env=${{ github.event.inputs.environment }} \
+            -c deployTestingHarness=true \
+            -c deploySolvers=true \
+            -c skipRds=true \
+            -c alertEmail=${{ github.event.inputs.alertEmail }}
+
+      - name: Build and push harness image
+        env:
+          FORGENEW_DIR: ${{ github.workspace }}/forgenew-src
+          FORGENEW_SUBPATH: server/axiom/chips/shapes
+        run: |
+          ./scripts/harness-build.sh \
+            ${{ github.event.inputs.environment }} \
+            ${{ steps.tag.outputs.image_tag }}
+
+  shape-check-chunk:
+    name: Shape Check chunk ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - setup
+    environment:
+      name: ${{ github.event.inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(needs.prepare.outputs.max_parallel_chunks) }}
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout forge-ecs-platform
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Checkout vpneoterra/forgenew shape corpus
+        uses: actions/checkout@v4
+        with:
+          repository: vpneoterra/forgenew
+          token: ${{ secrets.GH_PAT }}
+          ref: ${{ github.event.inputs.forgenew_ref }}
+          path: forgenew-src
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run Shape Check chunk in isolated ECS tasks
+        env:
+          FORGENEW_DIR: ${{ github.workspace }}/forgenew-src
+          FORGENEW_SUBPATH: server/axiom/chips/shapes
+          EXPECTED_SHAPE_CHIP_COUNT: ${{ needs.prepare.outputs.corpus_count }}
+          START_INDEX: ${{ matrix.start_index }}
+          LIMIT: ${{ matrix.limit }}
+          DEFAULT_VOXEL_SIZE_MM: ${{ github.event.inputs.default_voxel_size_mm }}
+          PER_PART_TIMEOUT_SEC: ${{ github.event.inputs.per_part_timeout_sec }}
+          VOXEL_BUDGET_RETRY: 'true'
+          VOXEL_SIZE_SAFETY_MULT: ${{ github.event.inputs.voxel_size_safety_mult }}
+          MAX_VOXEL_SIZE_MM: ${{ github.event.inputs.max_voxel_size_mm }}
+          MAX_RENDERER_BLOCKERS: ${{ github.event.inputs.max_renderer_blockers }}
+          OMNI_HEALTH_WAIT_SEC: '360'
+          LOG_EVENT_LIMIT: '1200'
+        run: |
+          echo "Running Shape Check chunk ${{ matrix.label }} (start=${{ matrix.start_index }}, limit=${{ matrix.limit }})"
+          ./scripts/shape-check.sh ${{ github.event.inputs.environment }}
+
+      - name: Upload chunk artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shape-check-${{ github.event.inputs.environment }}-${{ matrix.label }}
+          path: shape-check-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+  aggregate-and-sync:
+    name: Aggregate Shape Check and sync metadata
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - setup
+      - shape-check-chunk
+    if: always()
+    environment:
+      name: ${{ github.event.inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 90
+    steps:
+      - name: Checkout forge-ecs-platform
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Checkout vpneoterra/forgenew shape corpus
+        uses: actions/checkout@v4
+        with:
+          repository: vpneoterra/forgenew
+          token: ${{ secrets.GH_PAT }}
+          ref: ${{ github.event.inputs.forgenew_ref }}
+          path: forgenew-src
+
+      - name: Download chunk artifacts
+        id: download
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: shape-check-${{ github.event.inputs.environment }}-*
+          path: downloaded-shape-check-artifacts
+          merge-multiple: false
+
+      - name: Aggregate chunk artifacts
+        run: |
+          set -euo pipefail
+          node scripts/shape-check-aggregate.mjs \
+            --input downloaded-shape-check-artifacts \
+            --out shape-check-artifacts \
+            --corpus-count "${{ needs.prepare.outputs.corpus_count }}" \
+            --start-index "${{ needs.prepare.outputs.start_index }}" \
+            --limit "${{ needs.prepare.outputs.normalized_limit }}"
+
+      - name: Verify aggregate completeness
+        run: |
+          set -euo pipefail
+          if [[ "${{ needs.shape-check-chunk.result }}" != "success" ]]; then
+            echo "::error::One or more Shape Check chunks did not complete successfully: ${{ needs.shape-check-chunk.result }}"
+            exit 1
+          fi
+          node - <<'NODE'
+          const fs = require('fs');
+          const summary = JSON.parse(fs.readFileSync('shape-check-artifacts/shape-check-aggregate-summary.json', 'utf8'));
+          if (!summary.complete) {
+            console.error(`::error::Chunk aggregation incomplete. Missing indices: ${summary.missing_indices.join(', ') || 'none'}`);
+            process.exit(1);
+          }
+          console.log(`Chunk aggregation complete: ${summary.evaluated}/${summary.expected_evaluated} shapes evaluated.`);
+          NODE
+
+      - name: Sync Shape Check status into AXIOM chips
+        if: ${{ needs.shape-check-chunk.result == 'success' && github.event.inputs.sync_axiom_shape_metadata == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          CHECKED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          node scripts/sync-shape-check-to-axiom.mjs \
+            --results shape-check-artifacts/shape-check-results.jsonl \
+            --chips-root forgenew-src/server/axiom/chips/shapes \
+            --run-id "${{ github.run_id }}" \
+            --workflow-url "${RUN_URL}" \
+            --checked-at "${CHECKED_AT}" \
+            --environment "${{ github.event.inputs.environment }}" \
+            --summary-out shape-check-artifacts/shape-check-axiom-sync-summary.json
+
+          cd forgenew-src
+          git config user.name "Perplexity Computer"
+          git config user.email "notifications@neoterra.partners"
+          BRANCH="chore/shape-check-sync-${{ github.event.inputs.environment }}-${{ github.run_id }}"
+          git checkout -b "${BRANCH}"
+          git add server/axiom/chips/shapes
+          if git diff --cached --quiet; then
+            echo "No AXIOM shape-chip metadata changes to sync."
+            exit 0
+          fi
+          git commit -m "chore(axiom): sync shape check status (${{ github.event.inputs.environment }})"
+          git push origin "${BRANCH}"
+          BASE_REF="${{ github.event.inputs.forgenew_ref }}"
+          gh pr create \
+            --repo vpneoterra/forgenew \
+            --base "${BASE_REF}" \
+            --head "${BRANCH}" \
+            --title "chore(axiom): sync Shape Check status (${{ github.event.inputs.environment }})" \
+            --body "Syncs chunked Shape Check validation status into AXIOM shape-chip metadata from ${RUN_URL}.
+
+            This updates root-level shape_check metadata, render telemetry counters, and shape_check-sourced weaknesses while leaving full evidence in the GitHub Actions artifact."
+
+      - name: Upload aggregate artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shape-check-${{ github.event.inputs.environment }}-aggregate
+          path: shape-check-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Pause harness (always)
+        if: always()
+        run: |
+          ./scripts/harness-pause.sh ${{ github.event.inputs.environment }}
+
+      - name: Fail if chunks were incomplete
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ "${{ needs.shape-check-chunk.result }}" != "success" ]]; then
+            echo "::error::One or more Shape Check chunks did not complete successfully: ${{ needs.shape-check-chunk.result }}"
+            exit 1
+          fi
+          node - <<'NODE'
+          const fs = require('fs');
+          const summary = JSON.parse(fs.readFileSync('shape-check-artifacts/shape-check-aggregate-summary.json', 'utf8'));
+          if (!summary.complete) {
+            console.error(`::error::Chunk aggregation incomplete. Missing indices: ${summary.missing_indices.join(', ') || 'none'}`);
+            process.exit(1);
+          }
+          console.log(`Chunk aggregation complete: ${summary.evaluated}/${summary.expected_evaluated} shapes evaluated.`);
+          NODE
