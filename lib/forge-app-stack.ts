@@ -229,6 +229,13 @@ export class ForgeAppStack extends cdk.Stack {
         DEV_MODE: 'false',
         AXIOM_ENABLED: 'true',
         AXIOM_STRICT: 'false',
+        // -- Maestro / Conductor orchestration --
+        // Flipped to 'true' on 2026-04-22 (see .github/workflows/flip-maestro-conductor.yml
+        // run 24806789117 and PR #30). Persisted here so subsequent `cdk deploy`
+        // invocations do not clobber the runtime flip. Re-run the flip workflow
+        // to toggle without a CDK deploy.
+        MAESTRO_ENABLED: 'true',
+        CONDUCTOR_ENABLED: 'true',
         COMPUTE_HOST: '89.167.79.141',
         PICOGK_API_URL: 'http://89.167.79.141:8015',
         SYSML_API_URL: 'http://89.167.79.141:8003',
