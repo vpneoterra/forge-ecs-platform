@@ -78,6 +78,31 @@ on:
         required: false
         type: string
         default: ""
+      per_doc_timeout_sec:
+        description: "Bounded harvester: per-document Vertex timeout in seconds (1b-smoke/1b-harvest only; blank=image default 120; 1b-smoke phase default 300)"
+        required: false
+        type: string
+        default: ""
+      per_doc_max_attempts:
+        description: "Bounded harvester: per-document retry attempts (1b-smoke/1b-harvest only; blank=image default 2)"
+        required: false
+        type: string
+        default: ""
+      run_timeout_sec:
+        description: "Bounded harvester: overall run timeout in seconds, 0 = unbounded (1b-smoke/1b-harvest only; blank=image default 0; 1b-smoke phase default 1100 — just under 1200s poll)"
+        required: false
+        type: string
+        default: ""
+      progress_every_docs:
+        description: "Bounded harvester: emit progress log every N docs (1b-smoke/1b-harvest only; blank=image default 10; 1b-smoke phase default 1)"
+        required: false
+        type: string
+        default: ""
+      progress_every_sec:
+        description: "Bounded harvester: emit progress log every N seconds (1b-smoke/1b-harvest only; blank=image default 60; 1b-smoke phase default 30)"
+        required: false
+        type: string
+        default: ""
 
 env:
   AWS_REGION: us-east-1
@@ -155,6 +180,11 @@ jobs:
           INPUT_MAX_ROWS: ${{ inputs.max_rows }}
           INPUT_FORCE_FULL_ALL: ${{ inputs.force_full_all }}
           INPUT_PATENTS_DIR: ${{ inputs.patents_dir }}
+          INPUT_PER_DOC_TIMEOUT_SEC: ${{ inputs.per_doc_timeout_sec }}
+          INPUT_PER_DOC_MAX_ATTEMPTS: ${{ inputs.per_doc_max_attempts }}
+          INPUT_RUN_TIMEOUT_SEC: ${{ inputs.run_timeout_sec }}
+          INPUT_PROGRESS_EVERY_DOCS: ${{ inputs.progress_every_docs }}
+          INPUT_PROGRESS_EVERY_SEC: ${{ inputs.progress_every_sec }}
         shell: bash
         run: |
           set -euo pipefail
@@ -226,6 +256,63 @@ jobs:
           fi
           echo "max_docs=$MAX_DOCS" >> $GITHUB_OUTPUT
           echo "Resolved DKS_MAX_DOCS: '${MAX_DOCS:-<unset>}'"
+
+          # ---- Bounded-harvester runtime config (1b-smoke / 1b-harvest) ----
+          # The dks-ingest image reads these as env vars and falls back to its
+          # built-in defaults when unset (per_doc_timeout_sec=120,
+          # per_doc_max_attempts=2, run_timeout_sec=0 (unbounded),
+          # progress_every_docs=10, progress_every_sec=60).
+          #
+          # Phase defaults override image defaults only when the operator did
+          # NOT set the corresponding workflow input — preserving existing
+          # behavior for every other phase. For 1b-smoke we pick tighter
+          # values so a capped run completes (or aborts cleanly) well under
+          # the 1200s poll ceiling and emits progress on every doc:
+          #   per_doc_timeout_sec  = 300   (first USPTO doc needed >120s)
+          #   per_doc_max_attempts = 2
+          #   run_timeout_sec      = 1100  (just under 1200s poll timeout)
+          #   progress_every_docs  = 1
+          #   progress_every_sec   = 30
+          # For 1b-harvest we leave the image defaults alone unless the
+          # operator supplies an override.
+          PER_DOC_TIMEOUT_SEC=""
+          PER_DOC_MAX_ATTEMPTS=""
+          RUN_TIMEOUT_SEC=""
+          PROGRESS_EVERY_DOCS=""
+          PROGRESS_EVERY_SEC=""
+          if [ "$PHASE" = "1b-smoke" ] || [ "$PHASE" = "1b-harvest" ]; then
+            PER_DOC_TIMEOUT_SEC="${INPUT_PER_DOC_TIMEOUT_SEC:-}"
+            PER_DOC_MAX_ATTEMPTS="${INPUT_PER_DOC_MAX_ATTEMPTS:-}"
+            RUN_TIMEOUT_SEC="${INPUT_RUN_TIMEOUT_SEC:-}"
+            PROGRESS_EVERY_DOCS="${INPUT_PROGRESS_EVERY_DOCS:-}"
+            PROGRESS_EVERY_SEC="${INPUT_PROGRESS_EVERY_SEC:-}"
+            if [ "$PHASE" = "1b-smoke" ]; then
+              [ -z "$PER_DOC_TIMEOUT_SEC" ]  && PER_DOC_TIMEOUT_SEC="300"
+              [ -z "$PER_DOC_MAX_ATTEMPTS" ] && PER_DOC_MAX_ATTEMPTS="2"
+              [ -z "$RUN_TIMEOUT_SEC" ]      && RUN_TIMEOUT_SEC="1100"
+              [ -z "$PROGRESS_EVERY_DOCS" ]  && PROGRESS_EVERY_DOCS="1"
+              [ -z "$PROGRESS_EVERY_SEC" ]   && PROGRESS_EVERY_SEC="30"
+            fi
+            # Validate non-empty values are non-negative integers.
+            for pair in \
+              "per_doc_timeout_sec:$PER_DOC_TIMEOUT_SEC" \
+              "per_doc_max_attempts:$PER_DOC_MAX_ATTEMPTS" \
+              "run_timeout_sec:$RUN_TIMEOUT_SEC" \
+              "progress_every_docs:$PROGRESS_EVERY_DOCS" \
+              "progress_every_sec:$PROGRESS_EVERY_SEC"; do
+              key="${pair%%:*}"; val="${pair#*:}"
+              if [ -n "$val" ] && ! echo "$val" | grep -Eq '^[0-9]+$'; then
+                echo "::error::$key must be a non-negative integer (got: $val)"
+                exit 1
+              fi
+            done
+          fi
+          echo "Bounded harvester config:"
+          echo "  per_doc_timeout_sec  = '${PER_DOC_TIMEOUT_SEC:-<image default>}'"
+          echo "  per_doc_max_attempts = '${PER_DOC_MAX_ATTEMPTS:-<image default>}'"
+          echo "  run_timeout_sec      = '${RUN_TIMEOUT_SEC:-<image default>}'"
+          echo "  progress_every_docs  = '${PROGRESS_EVERY_DOCS:-<image default>}'"
+          echo "  progress_every_sec   = '${PROGRESS_EVERY_SEC:-<image default>}'"
 
           case "$PHASE" in
             0a-schema)
@@ -517,40 +604,26 @@ jobs:
           mkdir -p /data/logs
           LOG=/data/logs/phase1_${SRC}_$(date +%Y%m%d_%H%M%S).log
 
-          # ---- Optional corpus cap for smoke runs ----
-          # When DKS_MAX_DOCS is set, materialize a capped copy of the source
-          # corpus at /data/<src>_t1_capped/ so dks_harvest.py only sees the
-          # first N JSON documents. JSONL shards are truncated to N lines
-          # across files in lexical order; plain .json files are copied in
-          # order until the per-file docs sum hits N.
+          # ---- Bounded-harvester doc cap ----
+          # The patched dks-ingest image exposes --max-docs on dks_harvest.py,
+          # which applies uniformly across patents/arxiv/materials corpora
+          # (regardless of jsonl vs json file layout). When DKS_MAX_DOCS is
+          # set we forward it as --max-docs N rather than materializing a
+          # capped copy of the corpus — the old bash cap only worked for
+          # jsonl/json files and didn't map cleanly onto every source.
           USE_DIR="$CORPUS_DIR"
+          MAX_DOCS_FLAG=()
           if [ -n "${DKS_MAX_DOCS:-}" ] && [ "${DKS_MAX_DOCS}" -gt 0 ] 2>/dev/null; then
-            CAP_DIR="/data/${SRC}_t1_capped"
-            echo ">>> capping $SRC corpus to DKS_MAX_DOCS=$DKS_MAX_DOCS at $CAP_DIR"
-            rm -rf "$CAP_DIR"
-            mkdir -p "$CAP_DIR"
-            REMAINING="$DKS_MAX_DOCS"
-            for f in $(ls -1 "$CORPUS_DIR"*.jsonl 2>/dev/null | sort); do
-              [ "$REMAINING" -le 0 ] && break
-              base=$(basename "$f")
-              head -n "$REMAINING" "$f" > "$CAP_DIR/$base"
-              taken=$(wc -l < "$CAP_DIR/$base" | tr -d ' ')
-              REMAINING=$(( REMAINING - taken ))
-              echo "  + $base took $taken (remaining=$REMAINING)"
-            done
-            if [ "$REMAINING" -gt 0 ]; then
-              for f in $(ls -1 "$CORPUS_DIR"*.json 2>/dev/null | sort); do
-                [ "$REMAINING" -le 0 ] && break
-                base=$(basename "$f")
-                cp "$f" "$CAP_DIR/$base"
-                REMAINING=$(( REMAINING - 1 ))
-              done
-            fi
-            echo ">>> capped corpus contents:"
-            ls -la "$CAP_DIR/" || true
-            wc -l "$CAP_DIR"/*.jsonl 2>/dev/null || true
-            USE_DIR="$CAP_DIR/"
+            MAX_DOCS_FLAG=(--max-docs "${DKS_MAX_DOCS}")
+            echo ">>> bounded harvester: --max-docs ${DKS_MAX_DOCS} (no corpus pre-cap)"
           fi
+
+          # ---- CLI drift probe ----
+          # Surface dks_harvest.py --help so future arg renames (e.g.
+          # --max-docs vs --limit) are obvious from the task log without
+          # needing to re-run the failing harvest.
+          echo ">>> dks_harvest.py --help (CLI drift probe):"
+          python3 dks_harvest.py --help 2>&1 | sed -n '1,80p' || true
 
           # Baseline chunk count BEFORE harvest so we can diff after.
           # Uses coalesce(source_dataset, source_file) so legacy rows that only
@@ -565,8 +638,8 @@ jobs:
           echo ">>> baseline legacy $SRC chunks  : $BASELINE_LEGACY_SRC_CHUNKS (source_dataset IS NULL, source_file in ($DATASET_CANON|$DATASET_ALT))"
           echo ">>> baseline total chunks        : $BASELINE_TOTAL_CHUNKS"
 
-          echo ">>> harvest $SRC via vertex (dir=$USE_DIR flag=$SRC_FLAG)"
-          python3 dks_harvest.py --source "$SRC" "$SRC_FLAG" "$USE_DIR" --backend vertex --validate 2>&1 | tee "$LOG"
+          echo ">>> harvest $SRC via vertex (dir=$USE_DIR flag=$SRC_FLAG max_docs='${DKS_MAX_DOCS:-<unset>}')"
+          python3 dks_harvest.py --source "$SRC" "$SRC_FLAG" "$USE_DIR" --backend vertex --validate "${MAX_DOCS_FLAG[@]}" 2>&1 | tee "$LOG"
 
           echo ">>> post-ingest counts"
           psql "$DATABASE_URL" -c "select count(*) as total_chunks from design_knowledge_chunks;"
@@ -669,15 +742,35 @@ jobs:
           BOOTSTRAP="set -euo pipefail; printf %s \"$CMD_B64\" | base64 -d | gunzip | bash"
 
           # When MAX_DOCS is set, pass it as DKS_MAX_DOCS env override so the
-          # in-container corpus-cap block engages.
+          # in-container --max-docs resolution sees it (belt-and-braces with
+          # the CLI flag — the harvester reads the env for legacy callers).
           # For 1b-smoke we also flip GEMMA_VERTEX_LOG_SAMPLES=1 so the extractor
           # dumps the raw :predict body on failure.
+          # Bounded-harvester knobs (per_doc_timeout_sec, per_doc_max_attempts,
+          # run_timeout_sec, progress_every_docs, progress_every_sec) are
+          # forwarded as DKS_<NAME> env vars; the patched image reads them and
+          # falls back to its built-in defaults when unset.
           ENV_JSON='[]'
           if [ -n "$MAX_DOCS" ]; then
             ENV_JSON=$(jq -c --arg max "$MAX_DOCS" '. + [{name:"DKS_MAX_DOCS",value:$max}]' <<<"$ENV_JSON")
           fi
           if [ "$PHASE" = "1b-smoke" ]; then
             ENV_JSON=$(jq -c '. + [{name:"GEMMA_VERTEX_LOG_SAMPLES",value:"1"}]' <<<"$ENV_JSON")
+          fi
+          if [ -n "$PER_DOC_TIMEOUT_SEC" ]; then
+            ENV_JSON=$(jq -c --arg v "$PER_DOC_TIMEOUT_SEC" '. + [{name:"DKS_PER_DOC_TIMEOUT_SEC",value:$v}]' <<<"$ENV_JSON")
+          fi
+          if [ -n "$PER_DOC_MAX_ATTEMPTS" ]; then
+            ENV_JSON=$(jq -c --arg v "$PER_DOC_MAX_ATTEMPTS" '. + [{name:"DKS_PER_DOC_MAX_ATTEMPTS",value:$v}]' <<<"$ENV_JSON")
+          fi
+          if [ -n "$RUN_TIMEOUT_SEC" ]; then
+            ENV_JSON=$(jq -c --arg v "$RUN_TIMEOUT_SEC" '. + [{name:"DKS_RUN_TIMEOUT_SEC",value:$v}]' <<<"$ENV_JSON")
+          fi
+          if [ -n "$PROGRESS_EVERY_DOCS" ]; then
+            ENV_JSON=$(jq -c --arg v "$PROGRESS_EVERY_DOCS" '. + [{name:"DKS_PROGRESS_EVERY_DOCS",value:$v}]' <<<"$ENV_JSON")
+          fi
+          if [ -n "$PROGRESS_EVERY_SEC" ]; then
+            ENV_JSON=$(jq -c --arg v "$PROGRESS_EVERY_SEC" '. + [{name:"DKS_PROGRESS_EVERY_SEC",value:$v}]' <<<"$ENV_JSON")
           fi
 
           if [ "$(jq 'length' <<<"$ENV_JSON")" -gt 0 ]; then
