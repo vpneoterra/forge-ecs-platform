@@ -422,7 +422,17 @@ jobs:
                   [ -n "$MAX_ROWS" ] && RFLAG="--max-rows $MAX_ROWS"
                   YFLAG=""
                   [ -n "$YRANGE" ] && YFLAG="--year-range $YRANGE"
-                  EXPORT_CMD="python3 scripts/extract_bigquery.py --tier all --output /data/patents_all/ --local --force $RFLAG $YFLAG"
+                  # When a year_range is supplied, use year-partitioned layout
+                  # with --resume so multiple decade-by-decade batches can
+                  # accumulate into /data/patents_all/ without clobbering.
+                  # BigQuery ORDER BY on the full 17M-row corpus exceeds
+                  # memory, so year-batched runs are the safe path to full
+                  # USPTO coverage.
+                  LAYOUT_FLAGS=""
+                  if [ -n "$YRANGE" ]; then
+                    LAYOUT_FLAGS="--output-layout year --resume"
+                  fi
+                  EXPORT_CMD="python3 scripts/extract_bigquery.py --tier all --output /data/patents_all/ --local --force $RFLAG $YFLAG $LAYOUT_FLAGS"
                   EXPORT_OUTDIR='/data/patents_all'
                   ;;
                 *)
