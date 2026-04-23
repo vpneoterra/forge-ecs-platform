@@ -46,6 +46,20 @@ on:
         required: false
         type: boolean
         default: false
+      deployLucid:
+        description: 'Deploy LUCID multi-mode AI workspace'
+        required: false
+        type: boolean
+        default: false
+      lucidActiveMode:
+        description: 'LUCID active mode'
+        required: false
+        default: 'code'
+        type: choice
+        options:
+          - code
+          - dac
+          - iac
 
 env:
   AWS_REGION: us-east-1
@@ -169,6 +183,8 @@ jobs:
             -c deployDks=${{ github.event.inputs.deployDks || 'true' }} \
             -c deployGemma=${{ github.event.inputs.deployGemma || 'false' }} \
             -c deployGeometry=${{ inputs.deployGeometry || 'false' }} \
+            -c deployLucid=${{ inputs.deployLucid || 'false' }} \
+            -c lucidActiveMode=${{ github.event.inputs.lucidActiveMode || 'code' }} \
             -c appDomain=forge.qrucible.ai \
             -c skipRds=true \
             -c alertEmail=${{ github.event.inputs.alertEmail || 'ops@forge.local' }}
@@ -183,6 +199,8 @@ jobs:
             -c deployDks=${{ github.event.inputs.deployDks || 'true' }} \
             -c deployGemma=${{ github.event.inputs.deployGemma || 'false' }} \
             -c deployGeometry=${{ inputs.deployGeometry || 'false' }} \
+            -c deployLucid=${{ inputs.deployLucid || 'false' }} \
+            -c lucidActiveMode=${{ github.event.inputs.lucidActiveMode || 'code' }} \
             -c appDomain=forge.qrucible.ai \
             -c skipRds=true \
             -c alertEmail=${{ github.event.inputs.alertEmail || 'ops@forge.local' }}
