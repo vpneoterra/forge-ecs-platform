@@ -103,6 +103,22 @@ on:
         required: false
         type: string
         default: ""
+      cpc_scope:
+        description: "CPC prefix tier for 1a-bq extract and 1b-harvest filter (forge_core=legacy 10 prefixes, t0_shapes=16 SHAPES core, t2_cross=27 cross-industry, codex_full=240-subclass union, custom=use cpc_prefixes input). Default forge_core preserves existing behavior."
+        required: false
+        default: "forge_core"
+        type: choice
+        options:
+          - forge_core
+          - t0_shapes
+          - t2_cross
+          - codex_full
+          - custom
+      cpc_prefixes:
+        description: "Comma-separated CPC prefixes when cpc_scope=custom (e.g. 'B21D,B23B,F16C'). Ignored for other scopes."
+        required: false
+        type: string
+        default: ""
 
 env:
   AWS_REGION: us-east-1
@@ -185,6 +201,8 @@ jobs:
           INPUT_RUN_TIMEOUT_SEC: ${{ inputs.run_timeout_sec }}
           INPUT_PROGRESS_EVERY_DOCS: ${{ inputs.progress_every_docs }}
           INPUT_PROGRESS_EVERY_SEC: ${{ inputs.progress_every_sec }}
+          INPUT_CPC_SCOPE: ${{ inputs.cpc_scope }}
+          INPUT_CPC_PREFIXES: ${{ inputs.cpc_prefixes }}
         shell: bash
         run: |
           set -euo pipefail
@@ -313,6 +331,38 @@ jobs:
           echo "  run_timeout_sec      = '${RUN_TIMEOUT_SEC:-<image default>}'"
           echo "  progress_every_docs  = '${PROGRESS_EVERY_DOCS:-<image default>}'"
           echo "  progress_every_sec   = '${PROGRESS_EVERY_SEC:-<image default>}'"
+
+          # ---- CPC scope selection (flows to extract_bigquery.py as env vars) ----
+          # The containerized extractor resolves DKS_CPC_SCOPE / DKS_CPC_PREFIXES
+          # at module load. forge_core preserves the historical 10-prefix filter.
+          CPC_SCOPE="${INPUT_CPC_SCOPE:-forge_core}"
+          CPC_PREFIXES_STR="${INPUT_CPC_PREFIXES:-}"
+          case "$CPC_SCOPE" in
+            forge_core|t0_shapes|t2_cross|codex_full|custom) ;;
+            *) echo "::error::unknown cpc_scope: $CPC_SCOPE"; exit 1 ;;
+          esac
+          if [ "$CPC_SCOPE" = "custom" ] && [ -z "$CPC_PREFIXES_STR" ]; then
+            echo "::error::cpc_scope=custom requires cpc_prefixes input (comma-separated CPC prefixes)"
+            exit 1
+          fi
+          if [ "$CPC_SCOPE" != "custom" ] && [ -n "$CPC_PREFIXES_STR" ]; then
+            echo "::warning::cpc_prefixes is ignored when cpc_scope=$CPC_SCOPE (only used with cpc_scope=custom)"
+          fi
+          if [ -n "$CPC_PREFIXES_STR" ]; then
+            # Validate each token is alnum with a 1-8 char length (CPC class/subclass shape).
+            IFS=',' read -ra _cpc_tokens <<< "$CPC_PREFIXES_STR"
+            for t in "${_cpc_tokens[@]}"; do
+              t_trim=$(echo "$t" | tr -d '[:space:]')
+              if [ -z "$t_trim" ]; then continue; fi
+              if ! echo "$t_trim" | grep -Eq '^[A-Za-z0-9]{1,8}$'; then
+                echo "::error::invalid CPC prefix token: '$t_trim' (must be alphanumeric, 1-8 chars)"
+                exit 1
+              fi
+            done
+          fi
+          echo "CPC scope config:"
+          echo "  cpc_scope    = '$CPC_SCOPE'"
+          echo "  cpc_prefixes = '${CPC_PREFIXES_STR:-<unset>}'"
 
           case "$PHASE" in
             0a-schema)
@@ -781,6 +831,15 @@ jobs:
           fi
           if [ -n "$PROGRESS_EVERY_SEC" ]; then
             ENV_JSON=$(jq -c --arg v "$PROGRESS_EVERY_SEC" '. + [{name:"DKS_PROGRESS_EVERY_SEC",value:$v}]' <<<"$ENV_JSON")
+          fi
+          # CPC scope flows to every phase that invokes extract_bigquery.py
+          # (1a-bq, bq-dryrun, and 1b-harvest — the latter re-runs the extractor
+          # when its EFS shards are stale). Pass both vars so custom scopes work.
+          if [ -n "$CPC_SCOPE" ]; then
+            ENV_JSON=$(jq -c --arg v "$CPC_SCOPE" '. + [{name:"DKS_CPC_SCOPE",value:$v}]' <<<"$ENV_JSON")
+          fi
+          if [ -n "$CPC_PREFIXES_STR" ]; then
+            ENV_JSON=$(jq -c --arg v "$CPC_PREFIXES_STR" '. + [{name:"DKS_CPC_PREFIXES",value:$v}]' <<<"$ENV_JSON")
           fi
 
           if [ "$(jq 'length' <<<"$ENV_JSON")" -gt 0 ]; then
