@@ -19,7 +19,6 @@
 
 import * as cdk from 'aws-cdk-lib';
 import * as sns from 'aws-cdk-lib/aws-sns';
-import * as snsSubscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as events from 'aws-cdk-lib/aws-events';
@@ -37,8 +36,14 @@ export interface ForgeMonitoringStackProps extends cdk.StackProps {
   alb: elbv2.ApplicationLoadBalancer;
   ecsCluster: ecs.ICluster;
   ecsServiceName: string;
-  alertEmail: string;   // SNS notification email
-  alertEmail2?: string; // Optional second email
+  /**
+   * Deprecated: retained so callers pass-through without TS errors, but no
+   * longer used -- SNS subscriptions on forge-deploy-alerts are managed
+   * out-of-band via `aws sns subscribe` rather than through this stack.
+   */
+  alertEmail: string;
+  /** @deprecated see alertEmail */
+  alertEmail2?: string;
   tags?: Record<string, string>;
 }
 
@@ -47,22 +52,22 @@ export class ForgeMonitoringStack extends cdk.Stack {
     super(scope, id, props);
 
     // ── A. SNS Alert Topic ────────────────────────────────────────────────────
-    const alertTopic = new sns.Topic(this, 'ForgeDeployAlerts', {
-      topicName: 'forge-deploy-alerts',
-      displayName: 'FORGE Deploy & Operations Alerts',
-    });
-
-    // Primary email subscription
-    alertTopic.addSubscription(
-      new snsSubscriptions.EmailSubscription(props.alertEmail),
+    // The topic is provisioned out-of-band (pre-existing from an earlier
+    // deploy that rolled back) and is imported here by ARN so CDK does not
+    // try to create it (which would fail with AlreadyExists) and does not
+    // mutate existing confirmed email subscriptions. Alarm actions point at
+    // the imported ARN just like they would a managed topic.
+    //
+    // Subscriptions are assumed to already be present on the topic; they are
+    // managed out-of-band via `aws sns subscribe` (see README). If you need
+    // to add a new subscription, do it via the CLI or console rather than
+    // via CDK, or flip this back to `new sns.Topic(...)` once the out-of-band
+    // topic is retired.
+    const alertTopic = sns.Topic.fromTopicArn(
+      this,
+      'ForgeDeployAlerts',
+      `arn:aws:sns:${this.region}:${this.account}:forge-deploy-alerts`,
     );
-
-    // Optional second email
-    if (props.alertEmail2) {
-      alertTopic.addSubscription(
-        new snsSubscriptions.EmailSubscription(props.alertEmail2),
-      );
-    }
 
     // ── B. CloudWatch 5xx Alarm ───────────────────────────────────────────────
     // Fires when >10 HTTP 5xx responses are returned from targets in 2
