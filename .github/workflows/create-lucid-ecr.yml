@@ -1,0 +1,61 @@
+name: Create LUCID ECR Repository
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  create-ecr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create ECR repository
+        run: |
+          aws ecr create-repository \
+            --repository-name lucid \
+            --region ${{ env.AWS_REGION }} \
+            --image-scanning-configuration scanOnPush=true \
+            --image-tag-mutability MUTABLE \
+            --tags Key=Project,Value=LUCID Key=ManagedBy,Value=CDK Key=Owner,Value=vpneoterra \
+            2>/dev/null || echo "Repository 'lucid' may already exist"
+
+          echo "ECR repository 'lucid' ready:"
+          aws ecr describe-repositories --repository-names lucid --region ${{ env.AWS_REGION }} \
+            --query 'repositories[0].repositoryUri' --output text
+
+      - name: Create Secrets Manager placeholders for LUCID
+        run: |
+          ENV=dev
+          for name in \
+            lucid-openai-api-key \
+            lucid-anthropic-api-key \
+            lucid-github-token \
+            lucid-github-owner \
+            lucid-github-repo \
+            lucid-forgejo-url \
+            lucid-forgejo-token \
+            lucid-forgejo-owner \
+            lucid-forgejo-repo \
+            lucid-session-secret; do
+            aws secretsmanager create-secret \
+              --name "forge/${ENV}/${name}" \
+              --description "LUCID ${ENV} env -- ${name} (placeholder, populate before deploy)" \
+              --secret-string "REPLACE_ME" \
+              --region ${{ env.AWS_REGION }} \
+              2>/dev/null || echo "Secret forge/${ENV}/${name} may already exist"
+          done
+
+          # Long random placeholder for session secret
+          aws secretsmanager put-secret-value \
+            --secret-id "forge/${ENV}/lucid-session-secret" \
+            --secret-string "$(openssl rand -hex 32)" \
+            --region ${{ env.AWS_REGION }} \
+            2>/dev/null || echo "Could not rotate session secret placeholder"

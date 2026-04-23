@@ -65,6 +65,11 @@ jobs:
             dockerfile: Dockerfile
             platforms: linux/amd64
 
+          - name: lucid
+            repo: LUCID
+            dockerfile: Dockerfile
+            platforms: linux/amd64
+
           - name: dks-query
             repo: forge-dks
             dockerfile: Dockerfile.query

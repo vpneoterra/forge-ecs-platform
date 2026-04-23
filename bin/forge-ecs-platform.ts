@@ -19,6 +19,11 @@
  *   deployDks     "true" to deploy DKS (Design Knowledge System) in ForgeAppStack
  *   deployGemma   "true" to deploy Gemma GPU inference stack (g6.2xlarge + NLB)
  *   deployGeometry "true" to deploy Geometry Platform stack (B-Rep, GPU SDF, Neural SDF)
+ *   deployLucid   "true" to deploy LUCID (multi-mode AI workspace) on the shared ALB
+ *   lucidDomain   Domain for LUCID (default: api-lucid.qrucible.ai)
+ *   lucidActiveMode  Active LUCID mode: code | dac | iac (default: code)
+ *   lucidCpu      Fargate CPU units for LUCID (default: 512)
+ *   lucidMemory   Fargate memory MiB for LUCID (default: 1024)
  *   deployTestingHarness "true" to deploy the Tier-2 OMNI shape-chip harness. OMNI
  *                        does NOT need to be redeployed -- the harness only needs the
  *                        OMNI ALB hostname (`omniDomain`), which is assumed to already
@@ -44,6 +49,7 @@ import { ForgeNetworkStack } from '../lib/forge-network-stack';
 import { ForgeDataStack } from '../lib/forge-data-stack';
 import { ForgeComputeStack } from '../lib/forge-compute-stack';
 import { ForgeAppStack } from '../lib/forge-app-stack';
+import { ForgeLucidStack } from '../lib/forge-lucid-stack';
 import { ForgeOmniStack } from '../lib/forge-omni-stack';
 import { ForgeGemmaStack } from '../lib/forge-gemma-stack';
 import { ForgeOrchestrationStack } from '../lib/forge-orchestration-stack';
@@ -75,6 +81,10 @@ const deployGemma =
   (app.node.tryGetContext('deployGemma') as string | undefined) === 'true';
 const deployGeometry =
   (app.node.tryGetContext('deployGeometry') as string | undefined) === 'true';
+const deployLucid =
+  (app.node.tryGetContext('deployLucid') as string | undefined) === 'true';
+const lucidDomain =
+  (app.node.tryGetContext('lucidDomain') as string | undefined) ?? 'api-lucid.qrucible.ai';
 const deployTestingHarness =
   (app.node.tryGetContext('deployTestingHarness') as string | undefined) === 'true';
 // Auto-pause Lambda defaults on. Set -c enableHarnessAutoPause=false to
@@ -139,11 +149,35 @@ if (deployApp) {
     deployDks,
     deployGemma,
     gemmaEndpoint: gemmaStack?.gemmaEndpoint,
+    // When deployLucid=true we pre-provision the ACM SAN so the shared
+    // ALB cert covers api-lucid.qrucible.ai before ForgeLucidStack
+    // attaches its target group.
+    lucidDomainName: deployLucid ? lucidDomain : undefined,
     tags: sharedTags,
   });
   appStack.addDependency(networkStack);
   if (gemmaStack) {
     appStack.addDependency(gemmaStack);
+  }
+
+  // -- LUCID Stack (rides on the shared ALB + cluster) ----------------------
+  if (deployLucid) {
+    const lucidStack = new ForgeLucidStack(app, `ForgeLucid-${env}`, {
+      env: awsEnv,
+      description: 'LUCID Multi-Mode AI Workspace -- Fargate on shared ALB, Cloud Map, Route 53',
+      forgeEnv: env,
+      vpc: networkStack.vpc,
+      ecsSecurityGroup: networkStack.ecsSecurityGroup,
+      privateSubnets: networkStack.privateSubnets,
+      ecsCluster: appStack.ecsCluster,
+      alb: appStack.alb,
+      httpsListener: appStack.httpsListener,
+      cloudMapNamespace: appStack.cloudMapNamespace,
+      domainName: lucidDomain,
+      hostedZoneDomain: lucidDomain.split('.').slice(-2).join('.'),
+      tags: sharedTags,
+    });
+    lucidStack.addDependency(appStack);
   }
 
   // -- Monitoring Stack (observability for the app stack) --------------------

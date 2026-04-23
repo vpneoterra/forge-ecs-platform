@@ -58,6 +58,13 @@ export interface ForgeAppStackProps extends cdk.StackProps {
   gemmaEndpoint?: string;
   /** Enable Gemma routing in the forge-app task definition */
   deployGemma?: boolean;
+  /**
+   * Optional public domain for LUCID (e.g. 'api-lucid.qrucible.ai').
+   * When provided, the shared ACM cert is issued with this hostname as
+   * a SAN so the ForgeLucidStack can attach a target group to the same
+   * HTTPS listener without a separate certificate.
+   */
+  lucidDomainName?: string;
   tags?: Record<string, string>;
 }
 
@@ -66,6 +73,12 @@ export class ForgeAppStack extends cdk.Stack {
   public readonly albDnsName: cdk.CfnOutput;
   public readonly ecsCluster: ecs.Cluster;
   public readonly serviceName: string;
+  /** HTTPS listener on the shared ALB -- exposed so other stacks
+   *  (e.g. ForgeLucidStack) can attach host-header target groups. */
+  public readonly httpsListener: elbv2.ApplicationListener;
+  /** Cloud Map namespace (forge.local) -- exposed so other stacks can
+   *  register services for internal service discovery. */
+  public readonly cloudMapNamespace: servicediscovery.PrivateDnsNamespace;
 
   constructor(scope: Construct, id: string, props: ForgeAppStackProps) {
     super(scope, id, props);
@@ -91,6 +104,7 @@ export class ForgeAppStack extends cdk.Stack {
       vpc: props.vpc,
       description: 'FORGE private service discovery',
     });
+    this.cloudMapNamespace = namespace;
 
     // -- ECR Repository (import existing or create) --------------------------
     // Use existing repo created by the CI/CD pipeline
@@ -380,10 +394,15 @@ export class ForgeAppStack extends cdk.Stack {
     this.alb.logAccessLogs(accessLogBucket, 'forge-app');
 
     // -- ACM Certificate (DNS validated via Route 53 -- fully automatic) ------
-    // Single certificate covers both forge.qrucible.ai and omni.qrucible.ai
+    // Single certificate covers forge.qrucible.ai, omni.qrucible.ai, and
+    // optionally api-lucid.qrucible.ai (when ForgeLucidStack is deployed).
+    const certSans: string[] = [props.omniDomainName];
+    if (props.lucidDomainName) {
+      certSans.push(props.lucidDomainName);
+    }
     const certificate = new acm.Certificate(this, 'ForgeAppCert', {
       domainName: props.domainName,
-      subjectAlternativeNames: [props.omniDomainName],
+      subjectAlternativeNames: certSans,
       validation: acm.CertificateValidation.fromDns(hostedZone),
       // Route 53 validation: CDK automatically creates the CNAME records
       // in the hosted zone. No manual DNS steps needed.
@@ -395,6 +414,7 @@ export class ForgeAppStack extends cdk.Stack {
       certificates: [certificate],
       sslPolicy: elbv2.SslPolicy.TLS13_RES,
     });
+    this.httpsListener = httpsListener;
 
     // HTTP listener -- redirect to HTTPS
     this.alb.addListener('Http', {
