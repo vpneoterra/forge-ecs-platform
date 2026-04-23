@@ -205,6 +205,7 @@ forge-ecs-platform/
 | `ForgeData-{env}` | S3 bucket, EFS filesystem, RDS PostgreSQL, 8 ECR repos, DynamoDB |
 | `ForgeCompute-{env}` | ECS cluster, 3 capacity providers, 8 task definitions, 3 ECS services, SQS queues |
 | `ForgeGemma-{env}` | Gemma 4 GPU inference -- g6.2xlarge, vLLM, internal NLB |
+| `ForgeLucid-{env}` | LUCID multi-mode AI workspace -- Fargate Spot on shared ALB, Cloud Map (`lucid.forge.local`), Route 53 |
 | `ForgeOrchestration-{env}` | Step Functions (CEM loop + Stellarator pipeline), EventBridge, CloudWatch dashboard, SNS alerts |
 
 ---
@@ -237,6 +238,7 @@ forge-ecs-platform/
 | forge-stellarator-config | [vpneoterra/forge-stellarator-config](https://github.com/vpneoterra/forge-stellarator-config) |
 | forge-stellarator-coils | [vpneoterra/forge-stellarator-coils](https://github.com/vpneoterra/forge-stellarator-coils) |
 | forge-stellarator-cad | [vpneoterra/forge-stellarator-cad](https://github.com/vpneoterra/forge-stellarator-cad) |
+| lucid                 | [vpneoterra/LUCID](https://github.com/vpneoterra/LUCID) |
 
 ---
 
@@ -248,6 +250,11 @@ forge-ecs-platform/
 | `deployApp` | `false` | Deploy ForgeAppStack (Fargate web app) |
 | `deployDks` | `false` | Deploy DKS (Design Knowledge System) |
 | `deployGemma` | `false` | Deploy Gemma GPU inference stack (g6.2xlarge + NLB) |
+| `deployLucid` | `false` | Deploy LUCID (multi-mode AI workspace) on the shared ALB |
+| `lucidDomain` | `api-lucid.qrucible.ai` | Public domain for LUCID |
+| `lucidActiveMode` | `code` | LUCID mode: `code` \| `dac` \| `iac` |
+| `lucidCpu` | `512` | Fargate CPU units for LUCID |
+| `lucidMemory` | `1024` | Fargate memory (MiB) for LUCID |
 | `deploySolvers` | `false` | Deploy full Compute + Orchestration stacks |
 | `skipRds` | `false` | Skip RDS — use external Supabase |
 | `alertEmail` | `ops@forge.local` | Email for CloudWatch alerts |
@@ -258,6 +265,9 @@ npx cdk deploy --all -c env=dev -c deployApp=true -c skipRds=true
 
 # Dev with Gemma GPU inference
 npx cdk deploy --all -c env=dev -c deployApp=true -c deployGemma=true -c skipRds=true
+
+# Dev with LUCID alongside forge-app on the shared ALB
+npx cdk deploy --all -c env=dev -c deployApp=true -c deployLucid=true -c skipRds=true
 
 # Prod with RDS
 npx cdk deploy --all -c env=prod -c alertEmail=you@example.com
