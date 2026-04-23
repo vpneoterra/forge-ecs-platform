@@ -116,7 +116,7 @@ jobs:
             --query 'services[0].taskDefinition' --output text)
           echo "Running TD ARN: $RUNNING_ARN"
           VAL=$(aws ecs describe-task-definition --task-definition "$RUNNING_ARN" \
-            --query 'taskDefinition.containerDefinitions[?name==`forge-app`].environment[?name==`CHORUS_FORGE_MODE`].value | [0][0]' \
+            --query 'taskDefinition.containerDefinitions[?name==`forge-app`].environment[]|[?name==`CHORUS_FORGE_MODE`].value|[0]' \
             --output text)
           echo "CHORUS_FORGE_MODE on running task: $VAL"
           if [ "$VAL" != "$EXPECTED" ]; then
