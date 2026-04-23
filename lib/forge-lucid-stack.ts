@@ -267,7 +267,10 @@ export class ForgeLucidStack extends cdk.Stack {
       healthCheck: {
         // start.sh exits on first failure, so hitting the Node server is
         // enough -- if uvicorn dies, the task dies anyway.
-        command: ['CMD-SHELL', 'wget -qO- http://localhost:3000/health || exit 1'],
+        // curl is installed in the LUCID image (python:3.12-slim + apt-get install curl git);
+        // wget is NOT — using wget here previously caused `wget: not found` → exit 127 →
+        // container health check failure → ECS deployment circuit breaker → stack rollback.
+        command: ['CMD-SHELL', 'curl -fsS http://localhost:3000/health || exit 1'],
         interval: cdk.Duration.seconds(30),
         timeout: cdk.Duration.seconds(10),
         retries: 3,
