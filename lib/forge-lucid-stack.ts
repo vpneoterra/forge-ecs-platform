@@ -139,7 +139,11 @@ export class ForgeLucidStack extends cdk.Stack {
     // LUCID runtime config (stored in Secrets Manager by the operator's
     // preference -- functionally these are feature flags / URLs, but we
     // honor the chosen storage location):
-    const backendUrl         = importSecret(this, 'LucidBackendUrl',         'LUCID_BACKEND_URL');
+    // NOTE: LUCID_BACKEND_URL is intentionally NOT imported as a Secrets
+    // Manager binding because its value must be `http://localhost:8000`
+    // inside the container (backend + frontend ride the same task). The
+    // Secrets Manager value is kept for external callers but is applied
+    // as a plain environment variable below.
     const corsProxyUrl       = importSecret(this, 'LucidCorsProxyUrl',       'LUCID_CORS_PROXY_URL');
     const strictBackendProxy = importSecret(this, 'LucidStrictBackendProxy', 'LUCID_STRICT_BACKEND_PROXY');
     const chorusEnabled      = importSecret(this, 'LucidChorusEnabled',      'LUCID_CHORUS_ENABLED');
@@ -149,10 +153,14 @@ export class ForgeLucidStack extends cdk.Stack {
     const forgeUrl = importSecret(this, 'LucidForgeUrl', 'FORGE_URL');
 
     // -- CloudWatch log group ------------------------------------------------
+    // RETAIN on stack rollback/destroy so container crash logs from failed
+    // first-time CREATEs are still inspectable. If a prior failed deploy
+    // already left this log group behind, we import it instead of recreating.
+    const logGroupName = `/forge/ecs/lucid-${props.forgeEnv}`;
     const logGroup = new logs.LogGroup(this, 'LucidLogGroup', {
-      logGroupName: `/forge/ecs/lucid-${props.forgeEnv}`,
+      logGroupName,
       retention: logs.RetentionDays.ONE_WEEK,
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
     // -- Task roles ----------------------------------------------------------
@@ -218,6 +226,11 @@ export class ForgeLucidStack extends cdk.Stack {
         BACKEND_PORT: '8000',
         LUCID_ACTIVE_MODE: String(activeMode),
         LUCID_PUBLIC_URL: `https://${props.domainName}`,
+        // The Python backend (uvicorn) and Node frontend run in the SAME
+        // container, so the frontend must proxy to localhost, NOT to the
+        // public URL (which would loop back through the ALB and deadlock
+        // the healthcheck during startup).
+        LUCID_BACKEND_URL: 'http://localhost:8000',
         // Telemetry: let the dashboard stream SSE against itself.
         LUCID_TELEMETRY_ENABLED: 'true',
         LUCID_TELEMETRY_BUFFER_SIZE: '1000',
@@ -236,7 +249,10 @@ export class ForgeLucidStack extends cdk.Stack {
         SUPABASE_URL:      supabaseUrl,
         SUPABASE_ANON_KEY: supabaseAnonKey,
         // LUCID runtime config (feature flags + URLs stored in Secrets Manager)
-        LUCID_BACKEND_URL:          backendUrl,
+        // NOTE: LUCID_BACKEND_URL is intentionally set as a plain env var
+        // above (http://localhost:8000) to avoid a self-referential proxy
+        // loop through the public ALB. The Secrets Manager value remains
+        // for external consumers but is not bound here.
         LUCID_CORS_PROXY_URL:       corsProxyUrl,
         LUCID_STRICT_BACKEND_PROXY: strictBackendProxy,
         LUCID_CHORUS_ENABLED:       chorusEnabled,
