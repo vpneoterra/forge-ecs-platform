@@ -50,6 +50,7 @@ import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
 import { Construct } from 'constructs';
+import { ecsSecretByName } from './secret-lookup';
 
 export interface ForgeLucidStackProps extends cdk.StackProps {
   forgeEnv: string;
@@ -83,18 +84,18 @@ export interface ForgeLucidStackProps extends cdk.StackProps {
 }
 
 /**
- * Helper: import a Secrets Manager secret by exact name and return it
- * as an ecs.Secret. fromSecretNameV2 avoids the 6-char suffix requirement
- * of fromSecretCompleteArn and does not attempt to mutate the secret.
+ * Helper: import a Secrets Manager secret by exact name and return it as an
+ * ecs.Secret. Delegates to secret-lookup.ts which resolves the secret's full
+ * ARN (with 6-char suffix) at deploy time via AwsCustomResource. This avoids
+ * the ResourceNotFoundException the ECS agent throws when valueFrom is a
+ * name-only ARN.
  */
 function importSecret(
   scope: Construct,
   logicalId: string,
   secretName: string,
 ): ecs.Secret {
-  return ecs.Secret.fromSecretsManager(
-    secretsmanager.Secret.fromSecretNameV2(scope, logicalId, secretName),
-  );
+  return ecsSecretByName(scope, logicalId, secretName);
 }
 
 export class ForgeLucidStack extends cdk.Stack {

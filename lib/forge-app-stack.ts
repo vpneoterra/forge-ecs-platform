@@ -42,6 +42,7 @@ import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
 import * as efs from 'aws-cdk-lib/aws-efs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Construct } from 'constructs';
+import { importSecretByName, ecsSecretByName } from './secret-lookup';
 
 export interface ForgeAppStackProps extends cdk.StackProps {
   forgeEnv: string;
@@ -159,31 +160,32 @@ export class ForgeAppStack extends cdk.Stack {
       'dks-supabase-service-key',
     ];
 
-    // These secrets are provisioned out-of-band (CloudShell / console) and are
-    // imported by name so CDK does not try to create or mutate them. This
-    // mirrors the pattern used for vertex-sa-json below. Previously we used
-    // `new secretsmanager.Secret(...)` which failed with AlreadyExists on any
-    // stack update once the secret had been populated manually.
+    // These secrets are provisioned out-of-band (CloudShell / console).
+    // We resolve each secret's *full* ARN (including the 6-char suffix) at
+    // deploy time via an AwsCustomResource (see secret-lookup.ts). Using
+    // fromSecretNameV2 caused the rendered task definition to embed a
+    // name-only ARN which the ECS agent rejected with ResourceNotFoundException
+    // when it later called GetSecretValue. Using the complete ARN with suffix
+    // is the form every AWS doc recommends and eliminates partial-match
+    // ambiguity.
     const dksSecrets: Record<string, ecs.Secret> = {};
     for (const name of dksSecretNames) {
-      const secret = secretsmanager.Secret.fromSecretNameV2(
+      const envName = name.replace(/-/g, '_').toUpperCase();
+      dksSecrets[envName] = ecsSecretByName(
         this,
         `Secret${name.replace(/-/g, '')}`,
         `forge/test/${name}`,
       );
-      const envName = name.replace(/-/g, '_').toUpperCase();
-      dksSecrets[envName] = ecs.Secret.fromSecretsManager(secret);
     }
 
     const secrets: Record<string, ecs.Secret> = {};
     for (const name of secretNames) {
-      const secret = secretsmanager.Secret.fromSecretNameV2(
+      const envName = name.replace(/-/g, '_').toUpperCase();
+      secrets[envName] = ecsSecretByName(
         this,
         `Secret${name.replace(/-/g, '')}`,
         `forge/test/${name}`,
       );
-      const envName = name.replace(/-/g, '_').toUpperCase();
-      secrets[envName] = ecs.Secret.fromSecretsManager(secret);
     }
 
     // -- CloudWatch Log Group ------------------------------------------------
@@ -716,10 +718,10 @@ export class ForgeAppStack extends cdk.Stack {
       });
 
       // Vertex AI (Gemma) service-account JSON -- managed out-of-band in
-      // Secrets Manager at forge/test/vertex-sa-json. Imported by name so CDK
-      // does not try to create or mutate the secret; fromSecretNameV2 avoids
-      // the 6-char suffix requirement of fromSecretCompleteArn.
-      const vertexSaSecret = secretsmanager.Secret.fromSecretNameV2(
+      // Secrets Manager at forge/test/vertex-sa-json. Imported at deploy time
+      // with its full ARN (including suffix) via importSecretByName so the
+      // ECS agent can successfully call GetSecretValue at container start.
+      const vertexSaSecret = importSecretByName(
         this,
         'VertexSaSecret',
         'forge/test/vertex-sa-json',
