@@ -159,22 +159,29 @@ export class ForgeAppStack extends cdk.Stack {
       'dks-supabase-service-key',
     ];
 
+    // These secrets are provisioned out-of-band (CloudShell / console) and are
+    // imported by name so CDK does not try to create or mutate them. This
+    // mirrors the pattern used for vertex-sa-json below. Previously we used
+    // `new secretsmanager.Secret(...)` which failed with AlreadyExists on any
+    // stack update once the secret had been populated manually.
     const dksSecrets: Record<string, ecs.Secret> = {};
     for (const name of dksSecretNames) {
-      const secret = new secretsmanager.Secret(this, `Secret${name.replace(/-/g, '')}`, {
-        secretName: `forge/test/${name}`,
-        description: `DKS (forge-dks Supabase) -- ${name}`,
-      });
+      const secret = secretsmanager.Secret.fromSecretNameV2(
+        this,
+        `Secret${name.replace(/-/g, '')}`,
+        `forge/test/${name}`,
+      );
       const envName = name.replace(/-/g, '_').toUpperCase();
       dksSecrets[envName] = ecs.Secret.fromSecretsManager(secret);
     }
 
     const secrets: Record<string, ecs.Secret> = {};
     for (const name of secretNames) {
-      const secret = new secretsmanager.Secret(this, `Secret${name.replace(/-/g, '')}`, {
-        secretName: `forge/test/${name}`,
-        description: `FORGE test env -- ${name}`,
-      });
+      const secret = secretsmanager.Secret.fromSecretNameV2(
+        this,
+        `Secret${name.replace(/-/g, '')}`,
+        `forge/test/${name}`,
+      );
       const envName = name.replace(/-/g, '_').toUpperCase();
       secrets[envName] = ecs.Secret.fromSecretsManager(secret);
     }
