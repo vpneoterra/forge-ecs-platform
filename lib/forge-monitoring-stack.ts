@@ -83,8 +83,13 @@ export class ForgeMonitoringStack extends cdk.Stack {
       period: cdk.Duration.seconds(60),
     });
 
+    // NOTE: alarmName bumped to -v2 because the original `forge-app-5xx-rate`
+    // alarm was orphaned by a prior failed stack rollback and manual deletion
+    // attempts have been inconclusive. Renaming lets CloudFormation create a
+    // fresh managed resource without a naming collision. The v1 alarm can be
+    // deleted from the console when convenient.
     const fivexxAlarm = new cloudwatch.Alarm(this, 'Forge5xxAlarm', {
-      alarmName: 'forge-app-5xx-rate',
+      alarmName: 'forge-app-5xx-rate-v2',
       alarmDescription: 'FORGE ALB: >10 HTTP 5xx responses in a 60-second window (2 consecutive)',
       metric: fivexxMetric,
       threshold: 10,
