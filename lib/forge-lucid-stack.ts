@@ -3,7 +3,7 @@
  *
  * Deploys the LUCID backend + frontend (vpneoterra/LUCID) on the same
  * Fargate cluster and ALB used by ForgeAppStack. This replaces the
- * external Railway deployment that forge-app already points to via
+ * external Railway deployment that forge-app points to via
  * LUCID_URL=https://api-lucid.qrucible.ai.
  *
  * Layout:
@@ -12,21 +12,30 @@
  *   - One Fargate Spot task running LUCID's multi-stage image:
  *       * Python FastAPI backend on :8000 (internal)
  *       * Node frontend on :3000 (ALB target)
- *       * start.sh supervises both — matches the upstream Dockerfile.
+ *       * start.sh supervises both -- matches the upstream Dockerfile.
  *   - Host-header routing on the shared ALB:
  *       api-lucid.qrucible.ai -> lucid target group (port 3000)
  *   - Cloud Map: lucid.forge.local:3000 for internal calls from forge-app.
  *   - Route 53 Alias A-record on the existing hosted zone.
+ *
+ * Secrets layout:
+ *   The stack imports existing Secrets Manager entries by bare name
+ *   (fromSecretNameV2) rather than creating new ones. This matches the
+ *   operator-provisioned set:
+ *     LUCID_ANTHROPIC_KEY, LUCID_DEEPSEEK_KEY, LUCID_GOOGLE_KEY,
+ *     LUCID_GITHUB_TOKEN, LUCID_SUPABASE_URL, LUCID_SUPABASE_ANON_KEY,
+ *     LUCID_BACKEND_URL, LUCID_CORS_PROXY_URL, LUCID_STRICT_BACKEND_PROXY,
+ *     LUCID_CHORUS_ENABLED, LUCID_CHORUS_SWARM_DISPATCH, FORGE_URL
  *
  * Source repo:  https://github.com/vpneoterra/LUCID
  * ECR repo:     lucid
  *
  * Cost breakdown (incremental):
  *   - Fargate Spot 512/1024 MB (always-on):     ~$6/month
- *   - Secrets Manager (6 LUCID secrets):        ~$2.40/month
+ *   - Secrets Manager imports (no new secrets): $0
  *   - CloudWatch Logs (7-day retention):        ~$0.50/month
  *   - Route 53 A-alias + ACM SAN:               free
- *   Total: ~$9/month
+ *   Total: ~$7/month
  */
 
 import * as cdk from 'aws-cdk-lib';
@@ -73,6 +82,21 @@ export interface ForgeLucidStackProps extends cdk.StackProps {
   tags?: Record<string, string>;
 }
 
+/**
+ * Helper: import a Secrets Manager secret by exact name and return it
+ * as an ecs.Secret. fromSecretNameV2 avoids the 6-char suffix requirement
+ * of fromSecretCompleteArn and does not attempt to mutate the secret.
+ */
+function importSecret(
+  scope: Construct,
+  logicalId: string,
+  secretName: string,
+): ecs.Secret {
+  return ecs.Secret.fromSecretsManager(
+    secretsmanager.Secret.fromSecretNameV2(scope, logicalId, secretName),
+  );
+}
+
 export class ForgeLucidStack extends cdk.Stack {
   public readonly serviceName: string;
   public readonly internalEndpoint: string;
@@ -93,47 +117,35 @@ export class ForgeLucidStack extends cdk.Stack {
     });
 
     // -- Secrets -------------------------------------------------------------
-    // LUCID-specific secrets. Supabase secrets are intentionally shared
-    // with forge-app -- we import by name (no mutation) so there is no
-    // collision with the ones ForgeAppStack creates under forge/test/.
-    const lucidSecretNames = [
-      'lucid-openai-api-key',
-      'lucid-anthropic-api-key',
-      'lucid-github-token',
-      'lucid-github-owner',
-      'lucid-github-repo',
-      'lucid-forgejo-url',
-      'lucid-forgejo-token',
-      'lucid-forgejo-owner',
-      'lucid-forgejo-repo',
-      'lucid-session-secret',
-    ];
+    // All values are imported by bare name from the operator-provisioned
+    // Secrets Manager entries in us-east-1. The stack never creates or
+    // mutates these secrets. See file header for the full list.
+    //
+    // Model provider keys (required for at least one to be populated):
+    const anthropicKey = importSecret(this, 'LucidAnthropicKey', 'LUCID_ANTHROPIC_KEY');
+    const deepseekKey  = importSecret(this, 'LucidDeepseekKey',  'LUCID_DEEPSEEK_KEY');
+    const googleKey    = importSecret(this, 'LucidGoogleKey',    'LUCID_GOOGLE_KEY');
 
-    const lucidSecrets: Record<string, ecs.Secret> = {};
-    for (const name of lucidSecretNames) {
-      const secret = new secretsmanager.Secret(this, `Secret${name.replace(/-/g, '')}`, {
-        secretName: `forge/${props.forgeEnv}/${name}`,
-        description: `LUCID ${props.forgeEnv} env -- ${name}`,
-      });
-      const envName = name.replace(/^lucid-/, '').replace(/-/g, '_').toUpperCase();
-      lucidSecrets[envName] = ecs.Secret.fromSecretsManager(secret);
-    }
+    // GitHub integration (code mode):
+    const githubToken  = importSecret(this, 'LucidGithubToken',  'LUCID_GITHUB_TOKEN');
 
-    // Reuse the shared Supabase secrets provisioned by ForgeAppStack.
-    // fromSecretNameV2 avoids the 6-char suffix requirement and does not
-    // try to create or mutate the secret.
-    const supabaseUrl = secretsmanager.Secret.fromSecretNameV2(
-      this, 'SupabaseUrl', `forge/${props.forgeEnv}/supabase-url`,
-    );
-    const supabaseServiceKey = secretsmanager.Secret.fromSecretNameV2(
-      this, 'SupabaseServiceKey', `forge/${props.forgeEnv}/supabase-service-key`,
-    );
-    const supabaseAnonKey = secretsmanager.Secret.fromSecretNameV2(
-      this, 'SupabaseAnonKey', `forge/${props.forgeEnv}/supabase-anon-key`,
-    );
-    const supabaseJwtSecret = secretsmanager.Secret.fromSecretNameV2(
-      this, 'SupabaseJwtSecret', `forge/${props.forgeEnv}/supabase-jwt-secret`,
-    );
+    // Supabase (anon-key only -- server falls back to stateless reads for
+    // admin ops; operator explicitly chose not to provision a service-role
+    // key):
+    const supabaseUrl     = importSecret(this, 'LucidSupabaseUrl',     'LUCID_SUPABASE_URL');
+    const supabaseAnonKey = importSecret(this, 'LucidSupabaseAnonKey', 'LUCID_SUPABASE_ANON_KEY');
+
+    // LUCID runtime config (stored in Secrets Manager by the operator's
+    // preference -- functionally these are feature flags / URLs, but we
+    // honor the chosen storage location):
+    const backendUrl         = importSecret(this, 'LucidBackendUrl',         'LUCID_BACKEND_URL');
+    const corsProxyUrl       = importSecret(this, 'LucidCorsProxyUrl',       'LUCID_CORS_PROXY_URL');
+    const strictBackendProxy = importSecret(this, 'LucidStrictBackendProxy', 'LUCID_STRICT_BACKEND_PROXY');
+    const chorusEnabled      = importSecret(this, 'LucidChorusEnabled',      'LUCID_CHORUS_ENABLED');
+    const chorusSwarmDispatch = importSecret(this, 'LucidChorusSwarmDispatch', 'LUCID_CHORUS_SWARM_DISPATCH');
+
+    // FORGE integration:
+    const forgeUrl = importSecret(this, 'LucidForgeUrl', 'FORGE_URL');
 
     // -- CloudWatch log group ------------------------------------------------
     const logGroup = new logs.LogGroup(this, 'LucidLogGroup', {
@@ -151,17 +163,17 @@ export class ForgeLucidStack extends cdk.Stack {
         ),
       ],
     });
+    // Grant read on every secret we reference. fromSecretNameV2 returns an
+    // ISecret whose ARN is resolved at synth-time; a coarse wildcard policy
+    // avoids having to track each ARN individually while still scoping to
+    // Secrets Manager in this account + region.
     executionRole.addToPolicy(new iam.PolicyStatement({
       actions: ['secretsmanager:GetSecretValue', 'kms:Decrypt'],
       resources: [
-        `arn:aws:secretsmanager:${this.region}:${this.account}:secret:forge/${props.forgeEnv}/*`,
+        `arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`,
       ],
     }));
     ecrRepo.grantPull(executionRole);
-    supabaseUrl.grantRead(executionRole);
-    supabaseServiceKey.grantRead(executionRole);
-    supabaseAnonKey.grantRead(executionRole);
-    supabaseJwtSecret.grantRead(executionRole);
 
     const taskRole = new iam.Role(this, 'LucidTaskRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
@@ -177,8 +189,8 @@ export class ForgeLucidStack extends cdk.Stack {
 
     // -- Fargate task definition --------------------------------------------
     // LUCID's Dockerfile runs uvicorn (8000) + node (3000) via start.sh.
-    // 512 CPU / 1024 MB is enough for the code mode; bump to 1024/2048
-    // once DAC/IAC knowledge bases are loaded (-c lucidCpu / lucidMemory).
+    // 512 CPU / 1024 MB is enough for the code mode; bump via
+    // -c lucidCpu / -c lucidMemory once DAC/IAC knowledge bases load.
     const cpu = Number(this.node.tryGetContext('lucidCpu') ?? 512);
     const memoryLimitMiB = Number(this.node.tryGetContext('lucidMemory') ?? 1024);
 
@@ -213,22 +225,23 @@ export class ForgeLucidStack extends cdk.Stack {
         LUCID_EMBED_ALLOWED_ORIGINS: 'https://forge.qrucible.ai,https://omni.qrucible.ai',
       },
       secrets: {
-        // LUCID-specific
-        OPENAI_API_KEY: lucidSecrets['OPENAI_API_KEY'],
-        ANTHROPIC_API_KEY: lucidSecrets['ANTHROPIC_API_KEY'],
-        GITHUB_TOKEN: lucidSecrets['GITHUB_TOKEN'],
-        GITHUB_OWNER: lucidSecrets['GITHUB_OWNER'],
-        GITHUB_REPO: lucidSecrets['GITHUB_REPO'],
-        FORGEJO_URL: lucidSecrets['FORGEJO_URL'],
-        FORGEJO_TOKEN: lucidSecrets['FORGEJO_TOKEN'],
-        FORGEJO_OWNER: lucidSecrets['FORGEJO_OWNER'],
-        FORGEJO_REPO: lucidSecrets['FORGEJO_REPO'],
-        SESSION_SECRET: lucidSecrets['SESSION_SECRET'],
-        // Shared Supabase (same project as forge-app)
-        SUPABASE_URL: ecs.Secret.fromSecretsManager(supabaseUrl),
-        SUPABASE_SERVICE_KEY: ecs.Secret.fromSecretsManager(supabaseServiceKey),
-        SUPABASE_ANON_KEY: ecs.Secret.fromSecretsManager(supabaseAnonKey),
-        SUPABASE_JWT_SECRET: ecs.Secret.fromSecretsManager(supabaseJwtSecret),
+        // Model provider keys
+        ANTHROPIC_API_KEY: anthropicKey,
+        DEEPSEEK_API_KEY:  deepseekKey,
+        GOOGLE_API_KEY:    googleKey,
+        // GitHub (code mode)
+        GITHUB_TOKEN:      githubToken,
+        // Supabase
+        SUPABASE_URL:      supabaseUrl,
+        SUPABASE_ANON_KEY: supabaseAnonKey,
+        // LUCID runtime config (feature flags + URLs stored in Secrets Manager)
+        LUCID_BACKEND_URL:          backendUrl,
+        LUCID_CORS_PROXY_URL:       corsProxyUrl,
+        LUCID_STRICT_BACKEND_PROXY: strictBackendProxy,
+        LUCID_CHORUS_ENABLED:       chorusEnabled,
+        LUCID_CHORUS_SWARM_DISPATCH: chorusSwarmDispatch,
+        // FORGE integration
+        FORGE_URL: forgeUrl,
       },
       logging: ecs.LogDrivers.awsLogs({
         logGroup,
@@ -259,6 +272,8 @@ export class ForgeLucidStack extends cdk.Stack {
       assignPublicIp: false,
       securityGroups: [props.ecsSecurityGroup],
       vpcSubnets: { subnets: props.privateSubnets },
+      minHealthyPercent: 50,
+      maxHealthyPercent: 200,
       capacityProviderStrategies: [
         // Mostly Spot, one on-demand base task for availability during
         // Spot interruptions (parity with OMNI's weighting).
