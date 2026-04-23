@@ -185,6 +185,20 @@ jobs:
             --query 'taskDefinition.{family:family,rev:revision,image:containerDefinitions[0].image,env:containerDefinitions[0].environment[*].name,secrets:containerDefinitions[0].secrets[*].name}' \
             --output json
 
+      - name: Ensure CloudWatch log group exists
+        run: |
+          set +e
+          aws logs describe-log-groups --log-group-name-prefix /forge/ecs/dks-ingest \
+            --query 'logGroups[?logGroupName==`/forge/ecs/dks-ingest`].logGroupName' --output text | grep -q dks-ingest
+          if [ $? -ne 0 ]; then
+            echo "Creating log group /forge/ecs/dks-ingest"
+            aws logs create-log-group --log-group-name /forge/ecs/dks-ingest
+            aws logs put-retention-policy --log-group-name /forge/ecs/dks-ingest --retention-in-days 14
+          else
+            echo "Log group /forge/ecs/dks-ingest already exists"
+          fi
+          set -e
+
       - name: Write command script for phase
         id: cmd
         env:
