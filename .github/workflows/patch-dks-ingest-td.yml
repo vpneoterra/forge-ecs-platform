@@ -95,37 +95,40 @@ jobs:
           # Image pinned to latest (or user-supplied)
           cd['image'] = f"{os.environ['ACCOUNT_ID']}.dkr.ecr.{os.environ['AWS_REGION']}.amazonaws.com/dks-ingest:{os.environ['IMAGE_TAG']}"
 
-          # Full Vertex env set (desired state, not delta)
-          # Project number corrected to 141501991950 (recovered from GCP console);
-          # the previously configured 945884688373 produced a dedicated DNS host
-          # that did not resolve. Dedicated DNS is re-enabled and pinned to the
-          # endpoint prefix surfaced by the console:
-          #   mg-endpoint-8f11b5ef-4cd2-414e-a238-0f3b4904d17f.us-central1-141501991950.prediction.vertexai.goog
+          # Full Vertex env set (desired state, not delta).
           #
-          # API mode is pinned to "predict" (standard Vertex online prediction
-          # contract: POST .../endpoints/<id>:predict with {"instances":[...]}).
-          # Gemma one-click-deploy endpoints are served via the standard
-          # prediction surface, NOT :rawPredict / :generateContent, so the
-          # client must use :predict to avoid 404/"method not supported" from
-          # the dedicated DNS host.
-          # GEMMA_VERTEX_SUPPRESS_PROMPT_ECHO pinned to "false": forgenew
-          # defaults this on, which makes the client send
-          # `return_full_text=false` to the Vertex serving container. The
-          # one-click-deploy Gemma container rejects that kwarg with HTTP 500
-          # ("Unexpected keyword argument 'return_full_text'") — observed in
-          # smoke run 24733280270 after forgenew PR #430. Disabling the
-          # suppression here lets the parser handle prompt-echo output
-          # instead of sending unsupported params to Vertex.
+          # MIGRATION (2026-04-22): moved from dedicated-endpoint (predict
+          # mode) to Vertex AI Model-as-a-Service (MaaS / global region).
+          # The previous dedicated endpoint
+          #   mg-endpoint-8f11b5ef-4cd2-414e-a238-0f3b4904d17f.us-central1-141501991950.prediction.vertexai.goog
+          # was deleted upstream. Earlier c=4 / c=8 smokes were passing off
+          # stale DNS cache; c=12 smoke (run 24809955204) failed the DNS
+          # preflight, exposing the issue.
+          #
+          # MaaS target (user-confirmed):
+          #   URL:   https://aiplatform.googleapis.com/v1/projects/mindful-vial-493123-a5/locations/global/endpoints/openapi/chat/completions
+          #   Model: google/gemma-4-26b-a4b-it-maas  (Gemma 4 26B A4B IT)
+          #   Auth:  existing GEMMA_VERTEX_SA_KEY_JSON service account
+          #
+          # In MaaS mode, forgenew's vertex_backend._build_endpoint_url()
+          # short-circuits on api_mode==maas and needs ONLY
+          # GEMMA_VERTEX_PROJECT. ENDPOINT_ID / PROJECT_NUMBER / REGION are
+          # ignored (left in env for diagnostic back-compat; harmless).
+          # GEMMA_VERTEX_DEDICATED_DNS=false disables the preflight DNS probe
+          # in run-dks-phase.yml so runs no longer block on the dead host.
+          # GEMMA_VERTEX_SUPPRESS_PROMPT_ECHO is left "false" for back-compat;
+          # MaaS chat/completions returns only the assistant message, so the
+          # prompt-echo concern doesn't apply.
           vertex_env = {
               'LLM_BACKEND':                         'vertex',
               'GEMMA_VERTEX_PROJECT':                'mindful-vial-493123-a5',
               'GEMMA_VERTEX_PROJECT_NUMBER':         '141501991950',
-              'GEMMA_VERTEX_REGION':                 'us-central1',
+              'GEMMA_VERTEX_REGION':                 'global',
               'GEMMA_VERTEX_ENDPOINT_ID':            'mg-endpoint-8f11b5ef-4cd2-414e-a238-0f3b4904d17f',
-              'GEMMA_VERTEX_MODEL':                  'gemma-4-26b-a4b-mg-one-click-deploy',
-              'GEMMA_VERTEX_API_MODE':               'predict',
+              'GEMMA_VERTEX_MODEL':                  'google/gemma-4-26b-a4b-it-maas',
+              'GEMMA_VERTEX_API_MODE':               'maas',
               'DKS_EMBEDDING_MODEL':                 'all-MiniLM-L6-v2',
-              'GEMMA_VERTEX_DEDICATED_DNS':          'true',
+              'GEMMA_VERTEX_DEDICATED_DNS':          'false',
               'GEMMA_VERTEX_DEDICATED_DNS_PREFIX':   'mg-endpoint-8f11b5ef-4cd2-414e-a238-0f3b4904d17f',
               'GEMMA_VERTEX_SUPPRESS_PROMPT_ECHO':   'false',
           }
