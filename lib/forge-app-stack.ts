@@ -236,6 +236,12 @@ export class ForgeAppStack extends cdk.Stack {
         // to toggle without a CDK deploy.
         MAESTRO_ENABLED: 'true',
         CONDUCTOR_ENABLED: 'true',
+        // -- CHORUS --
+        // Flipped to 'write' on 2026-04-23 (see .github/workflows/flip-chorus-forge-mode.yml
+        // run 24844843052 and PR #35). Persisted here so subsequent `cdk deploy`
+        // invocations do not clobber the runtime flip. Re-run the flip workflow
+        // to toggle between write / shadow / off without a CDK deploy.
+        CHORUS_FORGE_MODE: 'write',
         COMPUTE_HOST: '89.167.79.141',
         PICOGK_API_URL: 'http://89.167.79.141:8015',
         SYSML_API_URL: 'http://89.167.79.141:8003',
