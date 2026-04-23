@@ -1,0 +1,134 @@
+name: "Flip CHORUS_FORGE_MODE"
+# ================================================================
+# flip-chorus-forge-mode.yml — Flip CHORUS_FORGE_MODE on forge-app-test
+# and force a new deployment.
+#
+# Modeled on flip-maestro-conductor.yml — same AWS creds, same
+# jq-patch pattern, same register-task-definition -> update-service
+# -> wait -> verify flow.
+#
+# CHORUS_FORGE_MODE controls whether CHORUS runs in write (full
+# enforcement) or shadow (observe-only) against the forge-app-test
+# service. Default of 'shadow' is safer for runtime defaults; flipping
+# to 'write' enables the full enforcement path.
+#
+# Safe + idempotent: re-running with the same inputs produces the
+# same env block. Rollback is printed at the end.
+# ================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      chorus_forge_mode:
+        description: "CHORUS_FORGE_MODE value"
+        required: true
+        default: "write"
+        type: choice
+        options: ["write", "shadow", "off"]
+
+env:
+  AWS_REGION: us-east-1
+  ECS_CLUSTER: forge-app-dev
+  ECS_SERVICE: forge-app-test
+
+jobs:
+  flip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: test
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 1. Snapshot current task-def for rollback
+      - name: Snapshot current task definition
+        id: snapshot
+        run: |
+          CUR_ARN=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' --output text)
+          echo "Current TD ARN: $CUR_ARN"
+          echo "current_arn=$CUR_ARN" >> "$GITHUB_OUTPUT"
+          aws ecs describe-task-definition --task-definition "$CUR_ARN" \
+            --query taskDefinition > /tmp/taskdef.json
+          jq '.revision' /tmp/taskdef.json
+
+      # 2. Patch env vars (desired state, not delta) using jq
+      - name: Build patched task definition
+        env:
+          CHORUS_FORGE_MODE: ${{ github.event.inputs.chorus_forge_mode }}
+        run: |
+          jq --arg V "$CHORUS_FORGE_MODE" '
+            .containerDefinitions |= (map(
+              if .name == "forge-app" then
+                .environment |= (
+                  (map(select(.name != "CHORUS_FORGE_MODE")))
+                  + [{"name":"CHORUS_FORGE_MODE","value":$V}]
+                )
+              else . end
+            ))
+            | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,
+                  .compatibilities,.registeredAt,.registeredBy)
+          ' /tmp/taskdef.json > /tmp/taskdef-new.json
+          echo "Patched forge-app env (preview):"
+          jq '.containerDefinitions[] | select(.name=="forge-app") | .environment
+              | map(select(.name=="CHORUS_FORGE_MODE"))' \
+              /tmp/taskdef-new.json
+
+      # 3. Register new revision
+      - name: Register new task definition
+        id: register
+        run: |
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/taskdef-new.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "New revision: $NEW_ARN"
+          echo "new_arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
+
+      # 4. Deploy (force new tasks)
+      - name: Update service (force new deployment)
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+            --task-definition "${{ steps.register.outputs.new_arn }}" \
+            --force-new-deployment >/dev/null
+          echo "Update issued."
+
+      # 5. Wait for steady state
+      - name: Wait for steady state
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+          echo "Service is stable."
+
+      # 6. Verify env value on the running task
+      - name: Verify running task has new CHORUS_FORGE_MODE
+        env:
+          EXPECTED: ${{ github.event.inputs.chorus_forge_mode }}
+        run: |
+          # Pull the task-def ARN currently serving the service (should match steps.register.outputs.new_arn)
+          RUNNING_ARN=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' --output text)
+          echo "Running TD ARN: $RUNNING_ARN"
+          VAL=$(aws ecs describe-task-definition --task-definition "$RUNNING_ARN" \
+            --query 'taskDefinition.containerDefinitions[?name==`forge-app`].environment[?name==`CHORUS_FORGE_MODE`].value | [0][0]' \
+            --output text)
+          echo "CHORUS_FORGE_MODE on running task: $VAL"
+          if [ "$VAL" != "$EXPECTED" ]; then
+            echo "::error::Expected CHORUS_FORGE_MODE=$EXPECTED but running task has $VAL"
+            exit 1
+          fi
+          echo "::notice::CHORUS_FORGE_MODE=$VAL confirmed on running task."
+
+      # 7. Print rollback command
+      - name: Print rollback command
+        if: always()
+        run: |
+          echo "::notice::Rollback (if needed):"
+          echo "aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE \\"
+          echo "  --task-definition '${{ steps.snapshot.outputs.current_arn }}' --force-new-deployment"
