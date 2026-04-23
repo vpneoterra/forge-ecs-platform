@@ -153,15 +153,13 @@ export class ForgeLucidStack extends cdk.Stack {
     const forgeUrl = importSecret(this, 'LucidForgeUrl', 'FORGE_URL');
 
     // -- CloudWatch log group ------------------------------------------------
-    // RETAIN on stack rollback/destroy so container crash logs from failed
-    // first-time CREATEs are still inspectable. If a prior failed deploy
-    // already left this log group behind, we import it instead of recreating.
+    // Import the log group by name instead of creating it. A prior failed
+    // stack CREATE retained the log group (by design -- crash logs must
+    // outlive a rollback), so a fresh CREATE cannot allocate the same name.
+    // Importing is the idempotent path: if the group doesn't exist yet, the
+    // first ECS task write creates it; retention is managed out-of-band.
     const logGroupName = `/forge/ecs/lucid-${props.forgeEnv}`;
-    const logGroup = new logs.LogGroup(this, 'LucidLogGroup', {
-      logGroupName,
-      retention: logs.RetentionDays.ONE_WEEK,
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-    });
+    const logGroup = logs.LogGroup.fromLogGroupName(this, 'LucidLogGroup', logGroupName);
 
     // -- Task roles ----------------------------------------------------------
     const executionRole = new iam.Role(this, 'LucidExecutionRole', {
