@@ -899,16 +899,32 @@ jobs:
           cat /tmp/phase/netcfg.json
           echo
 
-          TASK_ARN=$(aws ecs run-task \
-            --cluster "${{ steps.net.outputs.cluster }}" \
-            --launch-type FARGATE \
-            --task-definition dks-ingest \
-            --network-configuration "$(cat /tmp/phase/netcfg.json)" \
-            --overrides file:///tmp/phase/overrides.json \
-            --query 'tasks[0].taskArn' --output text)
+          # Capture full run-task response so failures[] are visible when tasks[] is empty.
+          # Retry up to 3 times for transient Fargate capacity / resource-init errors.
+          RT_JSON=""
+          ATTEMPT=0
+          while [ $ATTEMPT -lt 3 ]; do
+            ATTEMPT=$((ATTEMPT+1))
+            echo ">>> run-task attempt $ATTEMPT"
+            RT_JSON=$(aws ecs run-task \
+              --cluster "${{ steps.net.outputs.cluster }}" \
+              --launch-type FARGATE \
+              --task-definition dks-ingest \
+              --network-configuration "$(cat /tmp/phase/netcfg.json)" \
+              --overrides file:///tmp/phase/overrides.json \
+              --output json 2>&1 || true)
+            echo "$RT_JSON"
+            TASK_ARN=$(echo "$RT_JSON" | grep -oE '"taskArn"[[:space:]]*:[[:space:]]*"arn:aws:ecs:[^"]+"' | head -n1 | sed -E 's/.*"(arn:aws:ecs:[^"]+)".*/\1/' || echo "")
+            if [ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ]; then
+              break
+            fi
+            echo "::warning::run-task attempt $ATTEMPT yielded no ARN; sleeping before retry"
+            sleep 30
+          done
 
           if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
-            echo "::error::run-task returned no ARN"
+            echo "::error::run-task returned no ARN after 3 attempts"
+            echo "::error::last response: $RT_JSON"
             exit 1
           fi
 
