@@ -1,0 +1,19 @@
+name: DKS — Check TD
+on:
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      - run: |
+          # Latest revision of dks-ingest
+          LATEST=$(aws ecs list-task-definitions --family-prefix dks-ingest --sort DESC --max-results 3 --region us-east-1 --query 'taskDefinitionArns[*]' --output text)
+          echo "Recent: $LATEST"
+          LATEST_ARN=$(echo "$LATEST" | awk '{print $1}')
+          aws ecs describe-task-definition --task-definition "$LATEST_ARN" --region us-east-1 \
+            --query 'taskDefinition.{revision:revision,containerDefinitions:containerDefinitions[*].{name:name,entryPoint:entryPoint,command:command}}' --output json
