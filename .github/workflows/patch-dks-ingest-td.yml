@@ -155,6 +155,24 @@ jobs:
           existing_secrets.update(desired_secrets)
           cd['secrets'] = [{'name': k, 'valueFrom': v} for k, v in sorted(existing_secrets.items())]
 
+          # Strip awslogs-create-group so DKS runs never auto-create the
+          # /forge/ecs/dks-ingest log group.
+          #
+          # Background: this option was inherited from the pre-CDK task
+          # definition. With it set to "true", every DKS run-task call would
+          # recreate the log group if it didn't exist. Once ForgeApp-dev CDK
+          # started owning DksIngestLogGroup34D3B5D7, the auto-created group
+          # became an "orphan" (not owned by CFN) and caused
+          # CREATE_FAILED / AlreadyExists on every cdk deploy — blocking the
+          # stack until the group was manually deleted (see runbook
+          # 2026-04-24). The log group is now CDK-managed; the container
+          # must not try to create it on its own.
+          logc = cd.get('logConfiguration', {})
+          opts = logc.get('options', {})
+          opts.pop('awslogs-create-group', None)
+          logc['options'] = opts
+          cd['logConfiguration'] = logc
+
           # Override image ENTRYPOINT (python3) with bash -c so that
           # ECS containerOverrides.command = [script] runs as bash -c script.
           # This lets run-dks-phase pass an arbitrary shell script per phase.
@@ -169,6 +187,7 @@ jobs:
           print("Patched container secrets:")
           print(json.dumps([s['name'] for s in cd['secrets']], indent=2))
           print("Image:", cd['image'])
+          print("logConfiguration.options:", json.dumps(cd.get('logConfiguration', {}).get('options', {}), indent=2))
           PYEOF
 
       - name: Register new task definition revision

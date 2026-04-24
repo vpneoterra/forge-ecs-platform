@@ -60,6 +60,16 @@ on:
           - code
           - dac
           - iac
+      lucidImageTag:
+        description: 'LUCID image tag (used when lucidImageDigest is empty). Default: latest'
+        required: false
+        default: 'latest'
+        type: string
+      lucidImageDigest:
+        description: "LUCID image digest (preferred, e.g. 'sha256:abc...'). Leave blank to pin by tag instead."
+        required: false
+        default: ''
+        type: string
 
 env:
   AWS_REGION: us-east-1
@@ -185,6 +195,8 @@ jobs:
             -c deployGeometry=${{ inputs.deployGeometry || 'false' }} \
             -c deployLucid=${{ inputs.deployLucid || 'false' }} \
             -c lucidActiveMode=${{ github.event.inputs.lucidActiveMode || 'code' }} \
+            -c lucidImageTag=${{ github.event.inputs.lucidImageTag || 'latest' }} \
+            -c lucidImageDigest=${{ github.event.inputs.lucidImageDigest || '' }} \
             -c appDomain=forge.qrucible.ai \
             -c skipRds=true \
             -c alertEmail=${{ github.event.inputs.alertEmail || 'ops@forge.local' }}
@@ -201,6 +213,8 @@ jobs:
             -c deployGeometry=${{ inputs.deployGeometry || 'false' }} \
             -c deployLucid=${{ inputs.deployLucid || 'false' }} \
             -c lucidActiveMode=${{ github.event.inputs.lucidActiveMode || 'code' }} \
+            -c lucidImageTag=${{ github.event.inputs.lucidImageTag || 'latest' }} \
+            -c lucidImageDigest=${{ github.event.inputs.lucidImageDigest || '' }} \
             -c appDomain=forge.qrucible.ai \
             -c skipRds=true \
             -c alertEmail=${{ github.event.inputs.alertEmail || 'ops@forge.local' }}

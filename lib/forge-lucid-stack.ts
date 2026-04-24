@@ -215,8 +215,38 @@ export class ForgeLucidStack extends cdk.Stack {
 
     const activeMode = this.node.tryGetContext('lucidActiveMode') ?? 'code';
 
+    // Optional image tag / digest override.
+    //   -c lucidImageTag=<tag>        -> pins the ECR tag (default: 'latest')
+    //   -c lucidImageDigest=<sha256:…> -> pins the ECR image digest (preferred)
+    //
+    // Why this matters: CDK's fromEcrRepository(repo, 'latest') references
+    // the tag by NAME, not by digest. When 'latest' gets overwritten in ECR
+    // out-of-band (e.g. from build-images.yml), the synthesized CFN task
+    // definition is byte-identical to the existing one -- CDK sees no diff,
+    // no new task revision is created, and ECS keeps running the old image.
+    //
+    // Passing -c lucidImageDigest=sha256:abc... at synth time forces the
+    // task def to reference an immutable digest, so every new image push
+    // produces a NEW task def revision and ECS auto-rolls the service.
+    // When neither override is provided, we fall back to :latest for
+    // backwards compatibility -- callers must then run
+    //   aws ecs update-service --force-new-deployment
+    // after an image push to roll the container.
+    const lucidImageTag = this.node.tryGetContext('lucidImageTag') ?? 'latest';
+    const lucidImageDigest = this.node.tryGetContext('lucidImageDigest') as
+      | string
+      | undefined;
+    // ecs.EcrImage(repo, tagOrDigest): digests must be passed WITH the
+    // 'sha256:' prefix and no leading '@'. CDK appends '@' in the URI.
+    const lucidImageRef = lucidImageDigest
+      ? (lucidImageDigest.startsWith('sha256:')
+          ? lucidImageDigest
+          : `sha256:${lucidImageDigest}`)
+      : String(lucidImageTag);
+    const lucidImage = ecs.ContainerImage.fromEcrRepository(ecrRepo, lucidImageRef);
+
     const container = taskDef.addContainer('lucid', {
-      image: ecs.ContainerImage.fromEcrRepository(ecrRepo, 'latest'),
+      image: lucidImage,
       essential: true,
       environment: {
         NODE_ENV: 'production',
