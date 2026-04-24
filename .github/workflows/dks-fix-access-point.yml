@@ -1,0 +1,156 @@
+name: DKS — Fix EFS Access Point + TD
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      FS_ID: fs-05664f6a354018609
+      OLD_BAD_AP: fsap-0af293c95013c5359
+      TEMP_ROOT_AP: fsap-0f21bcc9ff11fc2b7
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Who am I
+        run: aws sts get-caller-identity
+
+      - name: Discover UID/GID of /dks-data via one-shot ECS task
+        id: uidcheck
+        run: |
+          set -e
+          aws ecs describe-task-definition --task-definition dks-ingest --region $AWS_REGION --query 'taskDefinition' --output json > /tmp/td.json
+          python3 - <<'PYEOF'
+          import json, os
+          d = json.load(open('/tmp/td.json'))
+          for v in d.get('volumes', []):
+              efs = v.get('efsVolumeConfiguration')
+              if efs and 'authorizationConfig' in efs:
+                  efs['authorizationConfig']['accessPointId'] = os.environ['TEMP_ROOT_AP']
+                  efs['authorizationConfig']['iam'] = 'DISABLED'
+          for c in d['containerDefinitions']:
+              c['command'] = ['sh','-c','stat -c "UIDGID %u %g" /data/dks-data 2>&1; ls -la /data/dks-data 2>&1 | head -3']
+          d['family'] = 'dks-ingest-uidcheck'
+          for k in ['taskDefinitionArn','revision','status','requiresAttributes','compatibilities','registeredAt','registeredBy']:
+              d.pop(k, None)
+          open('/tmp/td_uidcheck.json','w').write(json.dumps(d))
+          PYEOF
+
+          aws ecs register-task-definition --region $AWS_REGION --cli-input-json file:///tmp/td_uidcheck.json --query 'taskDefinition.{family:family,revision:revision}' --output json
+
+          CLUSTER=$(aws ecs list-clusters --region $AWS_REGION --query 'clusterArns[?contains(@, `dev`)]|[0]' --output text | awk -F'/' '{print $NF}')
+          echo "Cluster: $CLUSTER"
+
+          SUBNETS=$(aws ec2 describe-subnets --region $AWS_REGION \
+            --filters "Name=tag:aws-cdk:subnet-type,Values=Private" \
+            --query 'Subnets[].SubnetId' --output text | tr '\t' ',')
+          SG=sg-0871ce467d6c10739
+          echo "Subnets: $SUBNETS  SG: $SG"
+
+          TASK_ARN=$(aws ecs run-task --region $AWS_REGION --cluster "$CLUSTER" \
+            --launch-type FARGATE --task-definition dks-ingest-uidcheck \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SG],assignPublicIp=DISABLED}" \
+            --query 'tasks[0].taskArn' --output text)
+          echo "Task: $TASK_ARN"
+
+          TASK_ID=$(echo $TASK_ARN | awk -F/ '{print $NF}')
+
+          # Wait for completion
+          for i in $(seq 1 40); do
+            STATUS=$(aws ecs describe-tasks --region $AWS_REGION --cluster "$CLUSTER" --tasks "$TASK_ARN" --query 'tasks[0].lastStatus' --output text)
+            echo "poll $i: $STATUS"
+            if [ "$STATUS" = "STOPPED" ]; then break; fi
+            sleep 10
+          done
+
+          # Fetch logs
+          STREAM="dks-ingest/dks-ingest/$TASK_ID"
+          sleep 10
+          aws logs tail /forge/ecs/dks-ingest --log-stream-names "$STREAM" --region $AWS_REGION --format short | tee /tmp/uidcheck.log
+
+          UID=$(grep -oE 'UIDGID [0-9]+ [0-9]+' /tmp/uidcheck.log | awk '{print $2}' | head -1)
+          GID=$(grep -oE 'UIDGID [0-9]+ [0-9]+' /tmp/uidcheck.log | awk '{print $3}' | head -1)
+          echo "Discovered UID=$UID GID=$GID"
+          if [ -z "$UID" ] || [ -z "$GID" ]; then
+            echo "::error::Failed to discover UID/GID"
+            exit 1
+          fi
+          echo "uid=$UID" >> $GITHUB_OUTPUT
+          echo "gid=$GID" >> $GITHUB_OUTPUT
+
+      - name: Create access point rooted at /dks-data
+        id: ap
+        env:
+          UID_: ${{ steps.uidcheck.outputs.uid }}
+          GID_: ${{ steps.uidcheck.outputs.gid }}
+        run: |
+          set -e
+          AP_JSON=$(aws efs create-access-point \
+            --file-system-id $FS_ID --region $AWS_REGION \
+            --posix-user Uid=$UID_,Gid=$GID_ \
+            --root-directory "Path=/dks-data,CreationInfo={OwnerUid=$UID_,OwnerGid=$GID_,Permissions=0755}" \
+            --tags 'Key=Name,Value=dks-ingest-ap-dksdata' 'Key=Project,Value=FORGE' 'Key=Owner,Value=vpneoterra' 'Key=RecreatedBy,Value=perplexity-computer')
+          echo "$AP_JSON"
+          NEW_AP=$(echo "$AP_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessPointId"])')
+          echo "NEW_AP=$NEW_AP"
+
+          # Wait for it to become available
+          for i in $(seq 1 20); do
+            STATE=$(aws efs describe-access-points --access-point-id $NEW_AP --region $AWS_REGION --query 'AccessPoints[0].LifeCycleState' --output text)
+            echo "AP state: $STATE"
+            if [ "$STATE" = "available" ]; then break; fi
+            sleep 5
+          done
+          echo "new_ap=$NEW_AP" >> $GITHUB_OUTPUT
+
+      - name: Register new dks-ingest task-def revision
+        id: td
+        env:
+          NEW_AP: ${{ steps.ap.outputs.new_ap }}
+        run: |
+          set -e
+          aws ecs describe-task-definition --task-definition dks-ingest --region $AWS_REGION --query 'taskDefinition' --output json > /tmp/td_base.json
+          python3 - <<'PYEOF'
+          import json, os
+          d = json.load(open('/tmp/td_base.json'))
+          for v in d.get('volumes', []):
+              efs = v.get('efsVolumeConfiguration')
+              if efs and 'authorizationConfig' in efs:
+                  efs['authorizationConfig']['accessPointId'] = os.environ['NEW_AP']
+                  efs['authorizationConfig']['iam'] = 'DISABLED'
+          for k in ['taskDefinitionArn','revision','status','requiresAttributes','compatibilities','registeredAt','registeredBy']:
+              d.pop(k, None)
+          open('/tmp/td_new.json','w').write(json.dumps(d))
+          PYEOF
+
+          aws ecs register-task-definition --region $AWS_REGION --cli-input-json file:///tmp/td_new.json \
+            --query 'taskDefinition.{family:family,revision:revision,accessPointId:volumes[0].efsVolumeConfiguration.authorizationConfig.accessPointId,iam:volumes[0].efsVolumeConfiguration.authorizationConfig.iam}' --output json
+
+      - name: Cleanup temp/bad resources
+        run: |
+          set +e
+          # Delete bad AP (roots at /data, empty subtree)
+          aws efs delete-access-point --access-point-id $OLD_BAD_AP --region $AWS_REGION 2>&1
+          # Delete temp root AP (security: gives Uid/Gid 0 to root)
+          aws efs delete-access-point --access-point-id $TEMP_ROOT_AP --region $AWS_REGION 2>&1
+          # Deregister inspect task-defs
+          for r in 1 2 3; do
+            aws ecs deregister-task-definition --task-definition dks-ingest-inspect:$r --region $AWS_REGION 2>&1 | head -1
+          done
+          for r in 1 2 3; do
+            aws ecs deregister-task-definition --task-definition dks-ingest-uidcheck:$r --region $AWS_REGION 2>&1 | head -1
+          done
+          exit 0
