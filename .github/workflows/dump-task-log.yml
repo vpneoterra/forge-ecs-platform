@@ -1,0 +1,27 @@
+name: DKS — Dump Task Log Full
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        required: true
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      - run: |
+          TID="${{ inputs.task_id }}"
+          STREAM="dks-ingest/dks-ingest/$TID"
+          echo "=== Stream: $STREAM ==="
+          aws logs get-log-events --log-group-name /forge/ecs/dks-ingest \
+            --log-stream-name "$STREAM" --region us-east-1 \
+            --start-from-head --limit 200 \
+            --query 'events[].[timestamp,message]' --output text | head -c 20000
+          echo ""
+          echo "=== Task describe ==="
+          aws ecs describe-tasks --cluster forge-app-dev --tasks "$TID" --region us-east-1 \
+            --query 'tasks[0].{stopCode:stopCode,stoppedReason:stoppedReason,containers:containers[*].{name:name,exitCode:exitCode,reason:reason}}' --output json
