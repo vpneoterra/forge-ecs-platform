@@ -76,10 +76,25 @@ jobs:
             sleep 10
           done
 
-          # Fetch logs
-          STREAM="dks-ingest/dks-ingest/$TASK_ID"
-          sleep 10
-          aws logs tail /forge/ecs/dks-ingest --log-stream-names "$STREAM" --region $AWS_REGION --format short | tee /tmp/uidcheck.log
+          # Check stopped reason first
+          echo "--- task stopped details ---"
+          aws ecs describe-tasks --region $AWS_REGION --cluster "$CLUSTER" --tasks "$TASK_ARN" --query 'tasks[0].{stoppedReason:stoppedReason,containers:containers[].{name:name,exitCode:exitCode,reason:reason,lastStatus:lastStatus}}' --output json
+
+          # Fetch logs — find the newest stream by task id
+          sleep 15
+          STREAMS=$(aws logs describe-log-streams --log-group-name /forge/ecs/dks-ingest \
+            --order-by LastEventTime --descending --limit 10 --region $AWS_REGION \
+            --query "logStreams[?contains(logStreamName, \`$TASK_ID\`)].logStreamName" --output text)
+          echo "Streams matching task: $STREAMS"
+          # Fallback: newest stream
+          if [ -z "$STREAMS" ]; then
+            STREAMS=$(aws logs describe-log-streams --log-group-name /forge/ecs/dks-ingest --order-by LastEventTime --descending --limit 1 --region $AWS_REGION --query 'logStreams[0].logStreamName' --output text)
+            echo "Fallback stream: $STREAMS"
+          fi
+          for S in $STREAMS; do
+            echo "=== $S ==="
+            aws logs tail /forge/ecs/dks-ingest --log-stream-names "$S" --region $AWS_REGION --format short | tee -a /tmp/uidcheck.log
+          done
 
           DKS_UID=$(grep -oE 'UIDGID [0-9]+ [0-9]+' /tmp/uidcheck.log | awk '{print $2}' | head -1)
           DKS_GID=$(grep -oE 'UIDGID [0-9]+ [0-9]+' /tmp/uidcheck.log | awk '{print $3}' | head -1)
