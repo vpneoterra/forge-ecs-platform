@@ -25,4 +25,4 @@ jobs:
           echo "=== Using stream #$IDX: $STREAM ==="
           aws logs get-log-events --log-group-name /forge/ecs/dks-ingest \
             --log-stream-name "$STREAM" --region us-east-1 \
-            --limit 40 --start-from-head false --query 'events[].message' --output text | head -c 8000
+            --limit 60 --query 'events[].message' --output text
