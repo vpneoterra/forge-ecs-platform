@@ -81,27 +81,28 @@ jobs:
           sleep 10
           aws logs tail /forge/ecs/dks-ingest --log-stream-names "$STREAM" --region $AWS_REGION --format short | tee /tmp/uidcheck.log
 
-          UID=$(grep -oE 'UIDGID [0-9]+ [0-9]+' /tmp/uidcheck.log | awk '{print $2}' | head -1)
-          GID=$(grep -oE 'UIDGID [0-9]+ [0-9]+' /tmp/uidcheck.log | awk '{print $3}' | head -1)
-          echo "Discovered UID=$UID GID=$GID"
-          if [ -z "$UID" ] || [ -z "$GID" ]; then
-            echo "::error::Failed to discover UID/GID"
+          DKS_UID=$(grep -oE 'UIDGID [0-9]+ [0-9]+' /tmp/uidcheck.log | awk '{print $2}' | head -1)
+          DKS_GID=$(grep -oE 'UIDGID [0-9]+ [0-9]+' /tmp/uidcheck.log | awk '{print $3}' | head -1)
+          echo "Discovered UID=$DKS_UID GID=$DKS_GID"
+          if [ -z "$DKS_UID" ] || [ -z "$DKS_GID" ]; then
+            echo "::error::Failed to discover UID/GID. Log dump:"
+            cat /tmp/uidcheck.log
             exit 1
           fi
-          echo "uid=$UID" >> $GITHUB_OUTPUT
-          echo "gid=$GID" >> $GITHUB_OUTPUT
+          echo "uid=$DKS_UID" >> $GITHUB_OUTPUT
+          echo "gid=$DKS_GID" >> $GITHUB_OUTPUT
 
       - name: Create access point rooted at /dks-data
         id: ap
         env:
-          UID_: ${{ steps.uidcheck.outputs.uid }}
-          GID_: ${{ steps.uidcheck.outputs.gid }}
+          DKS_UID: ${{ steps.uidcheck.outputs.uid }}
+          DKS_GID: ${{ steps.uidcheck.outputs.gid }}
         run: |
           set -e
           AP_JSON=$(aws efs create-access-point \
             --file-system-id $FS_ID --region $AWS_REGION \
-            --posix-user Uid=$UID_,Gid=$GID_ \
-            --root-directory "Path=/dks-data,CreationInfo={OwnerUid=$UID_,OwnerGid=$GID_,Permissions=0755}" \
+            --posix-user Uid=$DKS_UID,Gid=$DKS_GID \
+            --root-directory "Path=/dks-data,CreationInfo={OwnerUid=$DKS_UID,OwnerGid=$DKS_GID,Permissions=0755}" \
             --tags 'Key=Name,Value=dks-ingest-ap-dksdata' 'Key=Project,Value=FORGE' 'Key=Owner,Value=vpneoterra' 'Key=RecreatedBy,Value=perplexity-computer')
           echo "$AP_JSON"
           NEW_AP=$(echo "$AP_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessPointId"])')
