@@ -1,0 +1,28 @@
+name: DKS — Tail Harvest Log
+on:
+  workflow_dispatch:
+    inputs:
+      stream_index:
+        description: "Stream index (0=newest)"
+        required: true
+        default: "1"
+jobs:
+  tail:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      - run: |
+          IDX=${{ inputs.stream_index }}
+          STREAMS=$(aws logs describe-log-streams --log-group-name /forge/ecs/dks-ingest \
+            --order-by LastEventTime --descending --limit 5 --region us-east-1 \
+            --query 'logStreams[].logStreamName' --output text)
+          echo "Streams: $STREAMS"
+          STREAM=$(echo "$STREAMS" | awk -v i=$((IDX+1)) '{print $i}')
+          echo "=== Using stream #$IDX: $STREAM ==="
+          aws logs get-log-events --log-group-name /forge/ecs/dks-ingest \
+            --log-stream-name "$STREAM" --region us-east-1 \
+            --limit 40 --start-from-head false --query 'events[].message' --output text | head -c 8000
