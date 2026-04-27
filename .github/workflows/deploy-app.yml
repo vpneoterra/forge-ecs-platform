@@ -66,9 +66,16 @@ jobs:
           fi
           REGISTRY="${{ steps.ecr-login.outputs.registry }}"
           echo "image_uri=${REGISTRY}/${{ env.ECR_REPO }}:${TAG}" >> $GITHUB_OUTPUT
-          echo "omni_uri=${REGISTRY}/forge-omni:${TAG}" >> $GITHUB_OUTPUT
           echo "image_tag=${TAG}" >> $GITHUB_OUTPUT
           echo "Deploying tag: ${TAG}"
+          # NOTE: OMNI's image is built by a separate pipeline (forge-omni repo)
+          # and uses its own commit SHAs — not the forgenew SHA. Stamping the
+          # forgenew SHA onto OMNI's task definition produces a non-existent
+          # ECR reference that breaks OMNI on the next pull (restart, scale,
+          # AZ rebalance). The `Update OMNI ECS service` step below resolves
+          # OMNI's image from ECR's `latest` tag at deploy time instead.
+          # See: incident on 2026-04-26 (OMNI restart blocked by stale image
+          # tag 4829cb96... which was a forgenew commit SHA).
 
       # ── App service ─────────────────────────────────────────
       - name: Update app ECS task definition
@@ -182,16 +189,38 @@ jobs:
           echo "App deployment triggered"
 
       # ── OMNI service ────────────────────────────────────────
+      # OMNI is built by a separate pipeline (forge-omni repo) and tags its
+      # images with its own commit SHAs — never the forgenew SHA. This step
+      # resolves OMNI's image from ECR's `latest` tag, verifies the image
+      # actually exists, and only then updates the OMNI task definition.
+      # If `latest` is missing or unresolvable, the step skips with a warning
+      # rather than stamping a broken image reference.
       - name: Update OMNI ECS service
         env:
           CLUSTER: ${{ env.ECS_CLUSTER }}
-          OMNI_URI: ${{ steps.resolve.outputs.omni_uri }}
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         run: |
-          if [ -z "$OMNI_URI" ]; then
-            echo "No OMNI image — skipping"
+          set -uo pipefail
+
+          # 1. Resolve OMNI's `latest` tag to an immutable image digest in ECR.
+          # We deploy by digest (not tag) so the task definition pins to an
+          # exact image, immune to future `latest` reassignments mid-rollout.
+          OMNI_DIGEST=$(aws ecr describe-images \
+            --repository-name forge-omni \
+            --image-ids imageTag=latest \
+            --query 'imageDetails[0].imageDigest' \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$OMNI_DIGEST" ] || [ "$OMNI_DIGEST" = "None" ]; then
+            echo "::warning::OMNI 'latest' tag not found in ECR — skipping OMNI update."
+            echo "Run the forge-omni build pipeline to push a new image, then re-run this workflow."
             exit 0
           fi
 
+          OMNI_URI="${REGISTRY}/forge-omni@${OMNI_DIGEST}"
+          echo "Resolved OMNI image: ${OMNI_URI}"
+
+          # 2. Find the current OMNI task definition.
           CURRENT_TD=$(aws ecs describe-services \
             --cluster "${CLUSTER}" \
             --services "forge-omni" \
@@ -207,27 +236,47 @@ jobs:
             --task-definition "${CURRENT_TD}" \
             --query 'taskDefinition' > /tmp/omni-td.json
 
-          python3 -c "
+          # 3. Decide whether the image actually needs updating. If the
+          # current task def already points at the same digest, skip the
+          # task def churn entirely (no service event, no rollout).
+          CURRENT_IMAGE=$(python3 -c "
+          import json
+          td = json.load(open('/tmp/omni-td.json'))
+          for c in td['containerDefinitions']:
+              if c['name'] == 'omni-api':
+                  print(c['image'])
+                  break
+          ")
+          echo "Current OMNI image: ${CURRENT_IMAGE}"
+
+          if [ "$CURRENT_IMAGE" = "$OMNI_URI" ]; then
+            echo "OMNI already on latest digest — skipping update."
+            exit 0
+          fi
+
+          # 4. Patch the image, register a new revision, force redeploy.
+          OMNI_URI="${OMNI_URI}" python3 -c "
           import json, os
-          with open('/tmp/omni-td.json') as f:
-            td = json.load(f)
-          td['containerDefinitions'][0]['image'] = os.environ['OMNI_URI']
-          for key in ['taskDefinitionArn', 'revision', 'status', 'requiresAttributes', 'compatibilities', 'registeredAt', 'registeredBy']:
-            td.pop(key, None)
-          with open('/tmp/new-omni-td.json', 'w') as f:
-            json.dump(td, f)
+          td = json.load(open('/tmp/omni-td.json'))
+          for c in td['containerDefinitions']:
+              if c['name'] == 'omni-api':
+                  c['image'] = os.environ['OMNI_URI']
+          for key in ['taskDefinitionArn', 'revision', 'status', 'requiresAttributes', 'compatibilities', 'registeredAt', 'registeredBy', 'deregisteredAt']:
+              td.pop(key, None)
+          json.dump(td, open('/tmp/new-omni-td.json', 'w'))
           "
 
           NEW_TD_ARN=$(aws ecs register-task-definition \
             --cli-input-json file:///tmp/new-omni-td.json \
             --query 'taskDefinition.taskDefinitionArn' \
             --output text)
+          echo "New OMNI task def: ${NEW_TD_ARN}"
 
           aws ecs update-service \
             --cluster "${CLUSTER}" \
             --service "forge-omni" \
             --task-definition "${NEW_TD_ARN}" \
-            --force-new-deployment
+            --force-new-deployment > /dev/null
 
           echo "OMNI deployment triggered"
 
