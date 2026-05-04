@@ -1,10 +1,5 @@
 name: "ABC: Fetch CloudWatch logs (debug helper)"
 
-# One-off helper to pull container logs from a stopped Fargate task
-# in /forge/ecs/dks-ingest. Provide the task ID (last segment of the
-# task ARN). The stream name is constructed as
-# <streamPrefix>/<containerName>/<taskId> = dks-download/downloader/<task_id>.
-
 on:
   workflow_dispatch:
     inputs:
@@ -16,16 +11,6 @@ on:
         description: "CloudWatch log group"
         required: false
         default: "/forge/ecs/dks-ingest"
-        type: string
-      stream_prefix:
-        description: "awslogs streamPrefix"
-        required: false
-        default: "dks-download"
-        type: string
-      container_name:
-        description: "Container name"
-        required: false
-        default: "downloader"
         type: string
       lines:
         description: "Number of trailing lines to print"
@@ -47,12 +32,41 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-      - name: Dump log stream
+      - name: List streams matching task
+        id: find
         run: |
-          STREAM="${{ inputs.stream_prefix }}/${{ inputs.container_name }}/${{ inputs.task_id }}"
-          echo "=== ${{ inputs.log_group }} :: $STREAM ==="
+          set -e
+          TASK_ID="${{ inputs.task_id }}"
+          GROUPS=("/forge/ecs/dks-ingest" "/forge/ecs/dks-download" "/forge/ecs/forge-app-test" "/aws/ecs/forge-app-dev")
+          MATCHED_GROUP=""
+          MATCHED_STREAM=""
+          for G in "${GROUPS[@]}"; do
+            echo "--- searching $G for $TASK_ID ---"
+            STREAMS=$(aws logs describe-log-streams \
+              --log-group-name "$G" \
+              --order-by LastEventTime --descending \
+              --limit 50 \
+              --query 'logStreams[].logStreamName' --output text 2>/dev/null || echo "")
+            echo "$STREAMS" | tr '\t' '\n' | grep -i "$TASK_ID" || true
+            FOUND=$(echo "$STREAMS" | tr '\t' '\n' | grep "$TASK_ID" | head -1 || true)
+            if [ -n "$FOUND" ]; then
+              MATCHED_GROUP="$G"
+              MATCHED_STREAM="$FOUND"
+              break
+            fi
+          done
+          if [ -z "$MATCHED_STREAM" ]; then
+            echo "::warning::No log stream containing $TASK_ID found in any inspected log group"
+            echo "matched=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "matched_group=$MATCHED_GROUP" >> "$GITHUB_OUTPUT"
+          echo "matched_stream=$MATCHED_STREAM" >> "$GITHUB_OUTPUT"
+      - name: Dump matched log stream
+        if: steps.find.outputs.matched_stream != ''
+        run: |
           aws logs get-log-events \
-            --log-group-name "${{ inputs.log_group }}" \
-            --log-stream-name "$STREAM" \
+            --log-group-name "${{ steps.find.outputs.matched_group }}" \
+            --log-stream-name "${{ steps.find.outputs.matched_stream }}" \
             --limit ${{ inputs.lines }} \
             --query 'events[].message' --output text 2>&1
