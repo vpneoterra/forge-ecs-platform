@@ -145,6 +145,7 @@ export class ForgeAppStack extends cdk.Stack {
       'together-api-key',
       'lucid-token',
       'database-url',
+      'rodin-api-key',
     ];
     // Autonomous Pipeline v2: Upstash Redis for BullMQ. Only include when
     // the pipeline is enabled, so disabling the flag is a clean CDK-only
@@ -279,6 +280,10 @@ export class ForgeAppStack extends cdk.Stack {
         // -- Gemma 4 self-hosted inference (Model Router) --
         // When GEMMA_ENABLED=false (default), all LLM calls route to Claude.
         // When GEMMA_ENABLED=true, the Model Router selects Claude vs Gemma per call.
+        // -- Rodin BBox 3D artifact --
+RODIN_BBOX_ENABLED: 'true',
+FRAMES_PROGRAM_BBOX_ENABLED: 'true',
+RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         // Flip to 'true' AFTER the GPU instance + NLB are verified healthy.
         GEMMA_ENABLED: props.deployGemma ? 'false' : 'false', // Always deploy as disabled; flip via env update
         GEMMA_ENDPOINT: props.gemmaEndpoint || 'http://gemma-internal:8000/v1',
