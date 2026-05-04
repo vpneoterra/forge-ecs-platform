@@ -26,6 +26,7 @@ import sys
 import tarfile
 import time
 import urllib.request
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -125,12 +126,122 @@ def extract_7z(archive: Path, dest: Path) -> None:
 
 PART_RE = re.compile(r"^(\d{8})")
 
+# ABC feat YAML "surface type" -> Supabase abc_features column.
+SURFACE_TYPE_COLS = {
+    "Plane":      "n_planar",
+    "Cylinder":   "n_cylinder",
+    "Cone":       "n_cone",
+    "Sphere":     "n_sphere",
+    "Torus":      "n_torus",
+    "Revolution": "n_revolution",
+    "Extrusion":  "n_extrusion",
+    "BSpline":    "n_nurbs",
+    "Other":      "n_other",
+}
+
+
+def _parse_feat_yaml(path: Path) -> dict | None:
+    """Best-effort parse of an ABC feat YAML.
+
+    We use a tiny hand-rolled scanner instead of pyyaml so the container
+    image stays minimal. The YAML structure is documented at
+    https://github.com/deep-geometry/abc-dataset — we only need:
+      surfaces:
+        - type: Plane | Cylinder | Cone | Sphere | Torus |
+                Revolution | Extrusion | BSpline | Other
+      curves:
+        - sharp: true | false
+    Anything else is ignored. Returns None on parse failure.
+    """
+    counts = defaultdict(int)
+    n_faces = 0
+    n_edges = 0
+    n_sharp = 0
+    section = None  # 'surfaces' | 'curves' | None
+    in_item = False
+    item_is_sharp = False
+    try:
+        with open(path, "rt", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                if not line.strip():
+                    continue
+                # Section headers at column 0.
+                if line.startswith("surfaces:"):
+                    section = "surfaces"
+                    in_item = False
+                    continue
+                if line.startswith("curves:"):
+                    if in_item and section == "curves" and item_is_sharp:
+                        n_sharp += 1
+                    section = "curves"
+                    in_item = False
+                    item_is_sharp = False
+                    continue
+                # Top-level non-section key — leave any open section.
+                if line and not line[0].isspace() and line.endswith(":"):
+                    section = None
+                    in_item = False
+                    continue
+                stripped = line.strip()
+                if stripped.startswith("- "):
+                    # New list item starts. Flush curve sharp flag.
+                    if in_item and section == "curves" and item_is_sharp:
+                        n_sharp += 1
+                    in_item = True
+                    item_is_sharp = False
+                    if section == "surfaces":
+                        n_faces += 1
+                    elif section == "curves":
+                        n_edges += 1
+                    rest = stripped[2:].strip()
+                    if rest.startswith("type:"):
+                        t = rest.split(":", 1)[1].strip()
+                        col = SURFACE_TYPE_COLS.get(t, "n_other")
+                        if section == "surfaces":
+                            counts[col] += 1
+                    elif rest.startswith(("sharp:", "is_sharp:")):
+                        v = rest.split(":", 1)[1].strip().lower()
+                        if v in ("true", "1", "yes"):
+                            item_is_sharp = True
+                elif in_item:
+                    if section == "surfaces" and stripped.startswith("type:"):
+                        t = stripped.split(":", 1)[1].strip()
+                        col = SURFACE_TYPE_COLS.get(t, "n_other")
+                        counts[col] += 1
+                    elif section == "curves" and stripped.startswith(("sharp:", "is_sharp:")):
+                        v = stripped.split(":", 1)[1].strip().lower()
+                        if v in ("true", "1", "yes"):
+                            item_is_sharp = True
+        # Flush trailing curve.
+        if in_item and section == "curves" and item_is_sharp:
+            n_sharp += 1
+    except OSError:
+        return None
+    return {
+        "n_faces":      n_faces,
+        "n_edges":      n_edges,
+        "n_planar":     counts.get("n_planar", 0),
+        "n_cylinder":   counts.get("n_cylinder", 0),
+        "n_cone":       counts.get("n_cone", 0),
+        "n_sphere":     counts.get("n_sphere", 0),
+        "n_torus":      counts.get("n_torus", 0),
+        "n_revolution": counts.get("n_revolution", 0),
+        "n_extrusion":  counts.get("n_extrusion", 0),
+        "n_nurbs":      counts.get("n_nurbs", 0),
+        "n_other":      counts.get("n_other", 0),
+        "n_sharp_edges": n_sharp,
+    }
+
 
 def walk_extracted(dest: Path, fmt: str, cid: str) -> list[dict]:
     """Enumerate (part_id, file) pairs under `dest`.
 
     ABC convention: extracted layout is `<dest>/<part_id>/<part_id>_*.<ext>`
-    where part_id is an 8-digit prefix.
+    where part_id is an 8-digit prefix. For the `feat` format we also
+    parse each YAML inline and attach feature counts so the GitHub
+    Actions upsert step (which has no EFS access) can populate
+    public.abc_features without re-reading the files.
     """
     rows: list[dict] = []
     if not dest.exists():
@@ -149,16 +260,19 @@ def walk_extracted(dest: Path, fmt: str, cid: str) -> list[dict]:
                 size = f.stat().st_size
             except OSError:
                 continue
-            rows.append(
-                {
-                    "part_id": part_id,
-                    "chunk_id": cid,
-                    "format": fmt,
-                    "efs_path": str(f),
-                    "bytes": size,
-                    "filename": f.name,
-                }
-            )
+            row = {
+                "part_id": part_id,
+                "chunk_id": cid,
+                "format": fmt,
+                "efs_path": str(f),
+                "bytes": size,
+                "filename": f.name,
+            }
+            if fmt == "feat" and f.name.endswith(".yml"):
+                feat = _parse_feat_yaml(f)
+                if feat is not None:
+                    row["features"] = feat
+            rows.append(row)
     return rows
 
 

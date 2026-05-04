@@ -178,18 +178,13 @@ def main() -> int:
             "part_id": pid, "format": fmt,
             "efs_path": r["efs_path"], "bytes": int(r.get("bytes") or 0),
         })
-        if fmt == "feat" and r["filename"].endswith(".yml"):
-            try:
-                with open(r["efs_path"], "rb") as f:
-                    feat = features_from_feat_yaml(f.read())
-                if feat:
-                    feat["part_id"] = pid
-                    feat["raw_stats"] = json.dumps({
-                        "source_path": r["efs_path"],
-                    })
-                    features.append(feat)
-            except OSError as e:
-                print(f"warn: feat read failed for {pid}: {e}", file=sys.stderr)
+        if fmt == "feat" and r["filename"].endswith(".yml") and r.get("features"):
+            # Container parsed feat YAML inline (we have no EFS access here).
+            feat = dict(r["features"])  # shallow copy so we can extend
+            feat["part_id"] = pid
+            feat.setdefault("n_vertices", None)
+            feat["raw_stats"] = json.dumps({"source_path": r["efs_path"]})
+            features.append(feat)
 
     with psycopg.connect(db_url) as conn:
         with conn.cursor() as cur:
