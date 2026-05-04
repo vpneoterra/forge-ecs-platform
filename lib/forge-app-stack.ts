@@ -826,7 +826,10 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       });
 
       const dlContainer = dksDownloadTaskDef.addContainer('downloader', {
-        image: ecs.ContainerImage.fromRegistry('ubuntu:22.04'),
+        // python:3.11-slim has python3 + pip baked in. We add awscli via pip
+        // and a static 7zz binary fetched over HTTPS from GitHub Releases
+        // (apt mirrors are unreliable from this Fargate subnet path).
+        image: ecs.ContainerImage.fromRegistry('python:3.11-slim-bookworm'),
         essential: true,
         command: ['echo', 'Override command at run-task time'],
         logging: ecs.LogDrivers.awsLogs({

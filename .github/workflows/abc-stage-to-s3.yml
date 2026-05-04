@@ -2,12 +2,16 @@ name: "ABC: Stage chunks to S3 (raw archives)"
 
 # Phase 2 of ABC ingest. For each (format, chunk_id) selected:
 #   1. read URL from s3://.../abc/${version}/manifests/${format}_${version}.txt
-#   2. curl the .7z to /tmp, md5-verify against md5.yml
+#   2. download the .7z to /tmp, md5-verify against md5.yml
 #   3. aws s3 cp to s3://.../abc/${version}/raw/${format}/${filename}
-#   4. upsert one row into Supabase public.abc_chunks
+#   4. write per-chunk state JSON to s3://.../abc/${version}/state/...
 #
 # Defaults are SMOKE-MODE: chunk 0 only, all formats. Override via inputs.
 # Prereq: abc-ingest-manifests.yml has run for the same version.
+#
+# Container: python:3.11-slim-bookworm (apt mirrors are unreachable from this
+# Fargate subnet, so we install awscli via pip and use stdlib for everything
+# else: hashlib for md5, urllib for downloads).
 
 on:
   workflow_dispatch:
@@ -59,6 +63,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 600
     steps:
+      - uses: actions/checkout@v4
+
       - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -83,9 +89,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ inputs.formats }}" = "all" ]; then
-            FORMATS="meta step para stl2 obj feat stat ofs"
+            FORMATS="meta,step,para,stl2,obj,feat,stat,ofs"
           else
-            FORMATS=$(echo "${{ inputs.formats }}" | tr ',' ' ')
+            FORMATS="${{ inputs.formats }}"
           fi
           if [ "${{ inputs.chunk_range }}" = "all" ]; then
             START=0; END=99
@@ -98,6 +104,17 @@ jobs:
           echo "chunk_end=$END"       >> "$GITHUB_OUTPUT"
           echo "::notice::Plan: formats=[$FORMATS] chunks=[$START..$END]"
 
+      - name: Upload container script to S3
+        id: payload
+        run: |
+          set -euo pipefail
+          BUCKET="${{ steps.env.outputs.bucket }}"
+          # Per-run script key keeps in-flight tasks isolated from edits.
+          KEY="abc/${{ inputs.version }}/scripts/${{ github.run_id }}/container_stage.py"
+          aws s3 cp scripts/abc/container_stage.py "s3://$BUCKET/$KEY" --no-progress --only-show-errors
+          echo "script_uri=s3://$BUCKET/$KEY" >> "$GITHUB_OUTPUT"
+          echo "::notice::Script: s3://$BUCKET/$KEY"
+
       - name: Launch Fargate task
         id: launch
         run: |
@@ -107,90 +124,26 @@ jobs:
           echo "Task def: $TASK_DEF"
 
           BUCKET="${{ steps.env.outputs.bucket }}"
-          VERSION="${{ inputs.version }}"
-          FORMATS="${{ steps.plan.outputs.formats }}"
-          START="${{ steps.plan.outputs.chunk_start }}"
-          END="${{ steps.plan.outputs.chunk_end }}"
-          VERIFY="${{ inputs.verify_md5 }}"
+          SCRIPT_URI="${{ steps.payload.outputs.script_uri }}"
 
-          # The container script runs entirely from inline bash. Stays under
-          # the ECS overrides 8 KB cap by reading manifests from S3 at runtime.
-          read -r -d '' CMD <<EOSH || true
-          set -euo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          echo "=== ABC stage-to-s3 \$(date -u) ==="
-          for i in 1 2 3 4 5; do
-            apt-get update -qq && break
-            echo "apt-get update attempt \$i failed, retrying in 15s..."
-            sleep 15
-          done
-          for i in 1 2 3 4 5; do
-            apt-get install -y -qq --no-install-recommends curl awscli ca-certificates >/dev/null && break
-            echo "apt-get install attempt \$i failed, retrying in 20s..."
-            sleep 20
-          done
-          for tool in aws curl; do
-            command -v \$tool >/dev/null || { echo "FATAL: \$tool not installed"; exit 70; }
-          done
-          mkdir -p /tmp/abc && cd /tmp/abc
-
-          BUCKET="$BUCKET"
-          VERSION="$VERSION"
-          MANIFEST_PFX="s3://\$BUCKET/abc/\$VERSION/manifests"
-          RAW_PFX="s3://\$BUCKET/abc/\$VERSION/raw"
-          STATE_PFX="s3://\$BUCKET/abc/\$VERSION/state"
-
-          aws s3 cp "\$MANIFEST_PFX/md5.yml"  md5.yml
-          aws s3 cp "\$MANIFEST_PFX/size.yml" size.yml
-
-          for FMT in $FORMATS; do
-            echo "──── format=\$FMT ────"
-            aws s3 cp "\$MANIFEST_PFX/\${FMT}_\${VERSION}.txt" "\${FMT}.txt"
-            for ID in \$(seq -w $START $END); do
-              # zero-pad to 4 digits ('0000', '0001', ...)
-              CID=\$(printf '%04d' \$((10#\$ID)))
-              LINE=\$((10#\$CID + 1))
-              ROW=\$(sed -n "\${LINE}p" "\${FMT}.txt" || true)
-              [ -z "\$ROW" ] && { echo "skip \$FMT chunk \$CID: no row"; continue; }
-              URL=\$(echo  "\$ROW" | awk '{print \$1}')
-              FNAME=\$(echo "\$ROW" | awk '{print \$2}')
-              S3KEY="abc/\$VERSION/raw/\$FMT/\$FNAME"
-              if aws s3api head-object --bucket "\$BUCKET" --key "\$S3KEY" >/dev/null 2>&1; then
-                echo "✓ already staged: \$FNAME"
-                continue
-              fi
-              echo "↓ \$FNAME from \$URL"
-              time curl -fSL --retry 5 --connect-timeout 30 -o "/tmp/abc/\$FNAME" "\$URL"
-              if [ "$VERIFY" = "true" ]; then
-                EXPECTED=\$(grep "^\$FNAME:" md5.yml | awk '{print \$2}')
-                ACTUAL=\$(md5sum "/tmp/abc/\$FNAME" | awk '{print \$1}')
-                if [ -n "\$EXPECTED" ] && [ "\$EXPECTED" != "\$ACTUAL" ]; then
-                  echo "::error::md5 mismatch \$FNAME expected=\$EXPECTED actual=\$ACTUAL"
-                  rm -f "/tmp/abc/\$FNAME"
-                  exit 1
-                fi
-                echo "✓ md5 ok (\$ACTUAL)"
-              fi
-              SIZE=\$(stat -c%s "/tmp/abc/\$FNAME")
-              aws s3 cp "/tmp/abc/\$FNAME" "s3://\$BUCKET/\$S3KEY" --no-progress --only-show-errors
-              # write state stub for downstream extract workflow
-              STATE_KEY="abc/\$VERSION/state/\$FMT/\$CID.json"
-              cat > /tmp/state.json <<JSON
-          {"chunk_id":"\$CID","format":"\$FMT","filename":"\$FNAME","source_url":"\$URL","s3_uri":"s3://\$BUCKET/\$S3KEY","bytes":\$SIZE,"md5_verified":\$([ "$VERIFY" = "true" ] && echo true || echo false),"staged_at":"\$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
-          JSON
-              aws s3 cp /tmp/state.json "s3://\$BUCKET/\$STATE_KEY" --no-progress --only-show-errors
-              rm -f "/tmp/abc/\$FNAME"
-              echo "✓ uploaded \$FNAME (\$SIZE bytes)"
-            done
-          done
-          echo "=== done \$(date -u) ==="
-          EOSH
+          # Container bootstrap: install awscli via pip, fetch script from S3, run it.
+          # All real logic is in scripts/abc/container_stage.py — reads env vars
+          # ABC_BUCKET, ABC_VERSION, ABC_FORMATS, ABC_CHUNK_START, ABC_CHUNK_END,
+          # ABC_VERIFY_MD5. Single-line to stay under ECS 8 KiB overrides cap.
+          BOOTSTRAP="set -euo pipefail; echo \"=== ABC stage-to-s3 \$(date -u) ===\"; pip install --quiet --no-cache-dir --root-user-action=ignore awscli boto3; aws s3 cp \"\$ABC_SCRIPT_URI\" /tmp/run.py --no-progress --only-show-errors; exec python3 /tmp/run.py"
 
           OVERRIDES=$(jq -nc \
             --argjson cpu     "${{ inputs.task_cpu }}" \
             --argjson mem     "${{ inputs.task_memory }}" \
             --argjson eph     "${{ inputs.task_ephemeral_gib }}" \
-            --arg     cmd     "$CMD" \
+            --arg     cmd     "$BOOTSTRAP" \
+            --arg     bucket  "$BUCKET" \
+            --arg     version "${{ inputs.version }}" \
+            --arg     formats "${{ steps.plan.outputs.formats }}" \
+            --arg     cstart  "${{ steps.plan.outputs.chunk_start }}" \
+            --arg     cend    "${{ steps.plan.outputs.chunk_end }}" \
+            --arg     verify  "${{ inputs.verify_md5 }}" \
+            --arg     script  "$SCRIPT_URI" \
             '{
                cpu: ($cpu|tostring),
                memory: ($mem|tostring),
@@ -199,7 +152,16 @@ jobs:
                  name: "downloader",
                  cpu: $cpu,
                  memory: $mem,
-                 command: ["bash","-c", $cmd]
+                 command: ["bash","-c", $cmd],
+                 environment: [
+                   {name:"ABC_BUCKET",       value:$bucket},
+                   {name:"ABC_VERSION",      value:$version},
+                   {name:"ABC_FORMATS",      value:$formats},
+                   {name:"ABC_CHUNK_START",  value:$cstart},
+                   {name:"ABC_CHUNK_END",    value:$cend},
+                   {name:"ABC_VERIFY_MD5",   value:$verify},
+                   {name:"ABC_SCRIPT_URI",   value:$script}
+                 ]
                }]
              }')
 
@@ -238,6 +200,19 @@ jobs:
           done
           echo "::error::Timeout"
           exit 1
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          TASK_ID="${{ steps.launch.outputs.task_id }}"
+          STREAM="dks-download/downloader/$TASK_ID"
+          echo "=== CloudWatch /forge/ecs/dks-ingest stream $STREAM ==="
+          aws logs get-log-events \
+            --log-group-name /forge/ecs/dks-ingest \
+            --log-stream-name "$STREAM" \
+            --start-from-head \
+            --limit 500 \
+            --query 'events[].message' --output text 2>&1 | tail -300 || true
 
   upsert-index:
     name: "Upsert abc_chunks rows into Supabase"
