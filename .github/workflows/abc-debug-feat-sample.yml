@@ -1,0 +1,64 @@
+name: "ABC: Debug — sample one feat YAML"
+
+# One-off helper. Runs a tiny Fargate task that dumps the first 200 lines
+# of one feat YAML from EFS to CloudWatch logs so we can validate the
+# parser's assumptions about the file structure.
+
+on:
+  workflow_dispatch: {}
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER: forge-app-dev
+  SECURITY_GROUP: sg-0871ce467d6c10739
+
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Launch sample task
+        id: launch
+        run: |
+          set -euo pipefail
+          TASK_DEF=$(aws ecs describe-task-definition --task-definition dks-download \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          SUBNET=$(aws cloudformation list-exports \
+            --query "Exports[?Name=='ForgePublicSubnetIds-dev'].Value" --output text | cut -d',' -f1)
+          # find a feat yml, head it, also list a few sibling files
+          BOOTSTRAP="set -euo pipefail; cd /data/datasets/abc/v00/feat/extracted; FIRST=\$(find . -maxdepth 3 -name '*.yml' | head -1); echo \"FIRST=\$FIRST\"; echo '=== HEAD 80 ==='; head -80 \"\$FIRST\"; echo '=== TAIL 40 ==='; tail -40 \"\$FIRST\"; echo '=== WC ==='; wc -l \"\$FIRST\"; echo '=== NEIGHBOURS ==='; ls \$(dirname \$FIRST)"
+          OVERRIDES=$(jq -nc --arg cmd "$BOOTSTRAP" '{
+            cpu:"1024", memory:"2048",
+            containerOverrides:[{name:"downloader", cpu:1024, memory:2048,
+              command:["bash","-c",$cmd]}]
+          }')
+          TASK_ARN=$(aws ecs run-task --cluster ${{ env.CLUSTER }} \
+            --task-definition "$TASK_DEF" \
+            --launch-type FARGATE --platform-version LATEST \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET],securityGroups=[${{ env.SECURITY_GROUP }}],assignPublicIp=ENABLED}" \
+            --overrides "$OVERRIDES" --query 'tasks[0].taskArn' --output text)
+          TASK_ID=$(echo "$TASK_ARN" | rev | cut -d'/' -f1 | rev)
+          echo "task_id=$TASK_ID" >> "$GITHUB_OUTPUT"
+          echo "TASK_ID=$TASK_ID"
+
+      - name: Monitor + fetch logs
+        run: |
+          TID="${{ steps.launch.outputs.task_id }}"
+          ARN="arn:aws:ecs:us-east-1:266087050444:task/forge-app-dev/$TID"
+          for _ in $(seq 1 30); do
+            ST=$(aws ecs describe-tasks --cluster ${{ env.CLUSTER }} --tasks "$ARN" \
+              --query 'tasks[0].lastStatus' --output text 2>/dev/null || echo UNK)
+            echo "status=$ST"
+            [ "$ST" = "STOPPED" ] && break
+            sleep 15
+          done
+          sleep 10  # wait for log flush
+          aws logs get-log-events \
+            --log-group-name /forge/ecs/dks-ingest \
+            --log-stream-name "dks-download/downloader/$TID" \
+            --start-from-head --limit 500 \
+            --query 'events[].message' --output text 2>&1 | tail -200
