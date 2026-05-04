@@ -109,8 +109,11 @@ jobs:
         id: launch
         run: |
           set -euo pipefail
-          TASK_DEF=$(aws ecs list-task-definitions --family-prefix dks-download \
-            --sort DESC --max-items 1 --query 'taskDefinitionArns[0]' --output text)
+          # Latest ACTIVE revision of the family — same fix as stage workflow.
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition dks-download \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "Task def: $TASK_DEF"
 
           BUCKET="${{ steps.env.outputs.bucket }}"
           RUN_KEY="${{ steps.env.outputs.run_key }}"
