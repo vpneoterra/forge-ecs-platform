@@ -119,8 +119,19 @@ jobs:
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           echo "=== ABC stage-to-s3 \$(date -u) ==="
-          apt-get update -qq
-          apt-get install -y -qq curl awscli ca-certificates >/dev/null
+          for i in 1 2 3 4 5; do
+            apt-get update -qq && break
+            echo "apt-get update attempt \$i failed, retrying in 15s..."
+            sleep 15
+          done
+          for i in 1 2 3 4 5; do
+            apt-get install -y -qq --no-install-recommends curl awscli ca-certificates >/dev/null && break
+            echo "apt-get install attempt \$i failed, retrying in 20s..."
+            sleep 20
+          done
+          for tool in aws curl; do
+            command -v \$tool >/dev/null || { echo "FATAL: \$tool not installed"; exit 70; }
+          done
           mkdir -p /tmp/abc && cd /tmp/abc
 
           BUCKET="$BUCKET"

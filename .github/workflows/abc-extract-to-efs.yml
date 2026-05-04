@@ -107,8 +107,23 @@ jobs:
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           echo "=== ABC extract-to-efs \$(date -u) ==="
-          apt-get update -qq
-          apt-get install -y -qq curl awscli p7zip-full unzip ca-certificates jq python3 >/dev/null
+          # apt-get with retries (Fargate networking to archive.ubuntu.com is
+          # occasionally flaky; we tolerate 3 transient failures before bailing).
+          for i in 1 2 3 4 5; do
+            apt-get update -qq && break
+            echo "apt-get update attempt \$i failed, retrying in 15s..."
+            sleep 15
+          done
+          for i in 1 2 3 4 5; do
+            apt-get install -y -qq --no-install-recommends \
+              curl awscli p7zip-full unzip ca-certificates jq python3 >/dev/null && break
+            echo "apt-get install attempt \$i failed, retrying in 20s..."
+            sleep 20
+          done
+          # Sanity check — bail loudly if a required tool is still missing.
+          for tool in 7z aws curl python3; do
+            command -v \$tool >/dev/null || { echo "FATAL: \$tool not installed"; exit 70; }
+          done
           BUCKET="$BUCKET"; VERSION="$VERSION"
           RAW_PFX="s3://\$BUCKET/abc/\$VERSION/raw"
           EFS_ROOT="/data/datasets/abc/\$VERSION"
