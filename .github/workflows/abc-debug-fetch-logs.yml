@@ -7,11 +7,6 @@ on:
         description: "ECS task ID (last path component of the task ARN)"
         required: true
         type: string
-      log_group:
-        description: "CloudWatch log group"
-        required: false
-        default: "/forge/ecs/dks-ingest"
-        type: string
       lines:
         description: "Number of trailing lines to print"
         required: false
@@ -32,34 +27,31 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-      - name: List streams matching task
+      - name: Search every log group
         id: find
+        shell: bash
         run: |
-          set -e
+          set +e
           TASK_ID="${{ inputs.task_id }}"
-          GROUPS=("/forge/ecs/dks-ingest" "/forge/ecs/dks-download" "/forge/ecs/forge-app-test" "/aws/ecs/forge-app-dev")
+          ALL_GROUPS=$(aws logs describe-log-groups --query 'logGroups[].logGroupName' --output text | tr '\t' '\n')
+          echo "=== inspecting $(echo "$ALL_GROUPS" | wc -l) log groups for $TASK_ID ==="
           MATCHED_GROUP=""
           MATCHED_STREAM=""
-          for G in "${GROUPS[@]}"; do
-            echo "--- searching $G for $TASK_ID ---"
+          while IFS= read -r G; do
+            [ -z "$G" ] && continue
             STREAMS=$(aws logs describe-log-streams \
               --log-group-name "$G" \
               --order-by LastEventTime --descending \
               --limit 50 \
-              --query 'logStreams[].logStreamName' --output text 2>/dev/null || echo "")
-            echo "$STREAMS" | tr '\t' '\n' | grep -i "$TASK_ID" || true
-            FOUND=$(echo "$STREAMS" | tr '\t' '\n' | grep "$TASK_ID" | head -1 || true)
+              --query 'logStreams[].logStreamName' --output text 2>/dev/null | tr '\t' '\n')
+            FOUND=$(echo "$STREAMS" | grep "$TASK_ID" | head -1)
             if [ -n "$FOUND" ]; then
+              echo "MATCH: $G :: $FOUND"
               MATCHED_GROUP="$G"
               MATCHED_STREAM="$FOUND"
               break
             fi
-          done
-          if [ -z "$MATCHED_STREAM" ]; then
-            echo "::warning::No log stream containing $TASK_ID found in any inspected log group"
-            echo "matched=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          done <<< "$ALL_GROUPS"
           echo "matched_group=$MATCHED_GROUP" >> "$GITHUB_OUTPUT"
           echo "matched_stream=$MATCHED_STREAM" >> "$GITHUB_OUTPUT"
       - name: Dump matched log stream
