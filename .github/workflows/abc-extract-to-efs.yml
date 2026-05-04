@@ -1,0 +1,240 @@
+name: "ABC: Extract staged chunks to EFS"
+
+# Phase 3 of ABC ingest. For each (format, chunk_id):
+#   1. download s3://.../abc/${version}/raw/${format}/<file>.7z to /tmp
+#   2. 7z extract into /data/datasets/abc/${version}/${format}/extracted/
+#   3. walk the extracted tree, emit per-part manifest JSON to S3
+#   4. trigger Supabase upsert (abc_parts, abc_files, abc_features)
+#
+# Prereq: abc-stage-to-s3.yml has staged the chunks for the same (version, format).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "ABC dataset version"
+        required: true
+        default: "v00"
+        type: string
+      formats:
+        description: "Comma-separated formats to extract (meta,step,para,stl2,obj,feat,stat,ofs)"
+        required: true
+        default: "meta,step,feat,stat"
+        type: string
+      chunk_range:
+        description: "Chunk ID range, e.g. '0-0' (smoke), '0-9'. Inclusive."
+        required: true
+        default: "0-0"
+        type: string
+      task_cpu:
+        description: "Fargate vCPU units"
+        required: false
+        default: "4096"
+        type: string
+      task_memory:
+        description: "Fargate memory in MiB"
+        required: false
+        default: "8192"
+        type: string
+      task_ephemeral_gib:
+        description: "Fargate ephemeral disk for the .7z download (GiB)"
+        required: false
+        default: "32"
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER: forge-app-dev
+  SECURITY_GROUP: sg-0871ce467d6c10739
+
+jobs:
+  extract:
+    name: "Extract chunks onto EFS"
+    runs-on: ubuntu-latest
+    timeout-minutes: 600
+    outputs:
+      manifest_uri: ${{ steps.launch.outputs.manifest_uri }}
+    steps:
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve bucket + subnet
+        id: env
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="forge-platform-data-${ACCOUNT}-${{ env.AWS_REGION }}"
+          SUBNET=$(aws cloudformation list-exports \
+            --query "Exports[?Name=='ForgePublicSubnetIds-dev'].Value" --output text | cut -d',' -f1)
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          echo "subnet=$SUBNET" >> "$GITHUB_OUTPUT"
+          RUN_KEY="abc/${{ inputs.version }}/runs/extract-${{ github.run_id }}.json"
+          echo "run_key=$RUN_KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Plan formats + chunks
+        id: plan
+        run: |
+          set -euo pipefail
+          FORMATS=$(echo "${{ inputs.formats }}" | tr ',' ' ')
+          if [ "${{ inputs.chunk_range }}" = "all" ]; then
+            START=0; END=99
+          else
+            START=$(echo "${{ inputs.chunk_range }}" | cut -d'-' -f1)
+            END=$(echo "${{ inputs.chunk_range }}"   | cut -d'-' -f2)
+          fi
+          echo "formats=$FORMATS"     >> "$GITHUB_OUTPUT"
+          echo "chunk_start=$START"   >> "$GITHUB_OUTPUT"
+          echo "chunk_end=$END"       >> "$GITHUB_OUTPUT"
+
+      - name: Launch Fargate extract task
+        id: launch
+        run: |
+          set -euo pipefail
+          TASK_DEF=$(aws ecs list-task-definitions --family-prefix dks-download \
+            --sort DESC --max-items 1 --query 'taskDefinitionArns[0]' --output text)
+
+          BUCKET="${{ steps.env.outputs.bucket }}"
+          VERSION="${{ inputs.version }}"
+          RUN_KEY="${{ steps.env.outputs.run_key }}"
+          FORMATS="${{ steps.plan.outputs.formats }}"
+          START="${{ steps.plan.outputs.chunk_start }}"
+          END="${{ steps.plan.outputs.chunk_end }}"
+
+          read -r -d '' CMD <<EOSH || true
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          echo "=== ABC extract-to-efs \$(date -u) ==="
+          apt-get update -qq
+          apt-get install -y -qq curl awscli p7zip-full unzip ca-certificates jq python3 >/dev/null
+          BUCKET="$BUCKET"; VERSION="$VERSION"
+          RAW_PFX="s3://\$BUCKET/abc/\$VERSION/raw"
+          EFS_ROOT="/data/datasets/abc/\$VERSION"
+          mkdir -p "\$EFS_ROOT" /tmp/abc
+
+          MANIFEST=/tmp/extract_manifest.json
+          echo '[]' > \$MANIFEST
+
+          for FMT in $FORMATS; do
+            DEST="\$EFS_ROOT/\$FMT/extracted"
+            mkdir -p "\$DEST"
+            for ID in \$(seq -w $START $END); do
+              CID=\$(printf '%04d' \$((10#\$ID)))
+              FILE="abc_\${CID}_\${FMT}_\${VERSION}.7z"
+              S3KEY="abc/\$VERSION/raw/\$FMT/\$FILE"
+              if ! aws s3api head-object --bucket "\$BUCKET" --key "\$S3KEY" >/dev/null 2>&1; then
+                echo "skip (not staged): \$FILE"; continue
+              fi
+              echo "↓ \$FILE"
+              aws s3 cp "s3://\$BUCKET/\$S3KEY" "/tmp/abc/\$FILE" --no-progress --only-show-errors
+              echo "↦ extract to \$DEST"
+              7z x -y -mmt\$(nproc) -o"\$DEST" "/tmp/abc/\$FILE" >/dev/null
+              rm -f "/tmp/abc/\$FILE"
+              # Walk the extracted tree to enumerate (part_id, file) pairs.
+              # ABC convention: <part_id>/<part_id>_*.<ext>
+              python3 - <<'PY' >> /tmp/walk.jsonl
+          import os, sys, json, hashlib, re
+          dest = os.environ['DEST']; fmt = os.environ['FMT']; cid = os.environ['CID']
+          # part_id = first 8 chars of the directory name under dest
+          for d in sorted(os.listdir(dest)):
+              p = os.path.join(dest, d)
+              if not os.path.isdir(p): continue
+              m = re.match(r'^(\d{8})', d)
+              if not m: continue
+              pid = m.group(1)
+              for f in os.listdir(p):
+                  fp = os.path.join(p, f)
+                  if not os.path.isfile(fp): continue
+                  st = os.stat(fp)
+                  print(json.dumps({'part_id': pid, 'chunk_id': cid, 'format': fmt,
+                                    'efs_path': fp, 'bytes': st.st_size,
+                                    'filename': f}))
+          PY
+            done
+          done
+          # Aggregate JSONL into single JSON array
+          if [ -f /tmp/walk.jsonl ]; then
+            python3 -c "import json,sys; print(json.dumps([json.loads(l) for l in open('/tmp/walk.jsonl')]))" > \$MANIFEST
+            wc -l /tmp/walk.jsonl
+          fi
+          aws s3 cp \$MANIFEST "s3://\$BUCKET/$RUN_KEY" --content-type application/json
+          echo "manifest=s3://\$BUCKET/$RUN_KEY"
+          echo "=== done \$(date -u) ==="
+          EOSH
+
+          OVERRIDES=$(jq -nc \
+            --argjson cpu "${{ inputs.task_cpu }}" \
+            --argjson mem "${{ inputs.task_memory }}" \
+            --argjson eph "${{ inputs.task_ephemeral_gib }}" \
+            --arg     cmd "$CMD" \
+            '{
+              cpu: ($cpu|tostring),
+              memory: ($mem|tostring),
+              ephemeralStorage: { sizeInGiB: $eph },
+              containerOverrides: [{ name:"downloader", cpu:$cpu, memory:$mem,
+                                     command:["bash","-c",$cmd] }]
+             }')
+
+          TASK_ARN=$(aws ecs run-task \
+            --cluster ${{ env.CLUSTER }} \
+            --task-definition "$TASK_DEF" \
+            --launch-type FARGATE --platform-version LATEST \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ steps.env.outputs.subnet }}],securityGroups=[${{ env.SECURITY_GROUP }}],assignPublicIp=ENABLED}" \
+            --overrides "$OVERRIDES" \
+            --query 'tasks[0].taskArn' --output text)
+          TASK_ID=$(echo "$TASK_ARN" | rev | cut -d'/' -f1 | rev)
+          echo "task_arn=$TASK_ARN" >> "$GITHUB_OUTPUT"
+          echo "task_id=$TASK_ID"   >> "$GITHUB_OUTPUT"
+          echo "manifest_uri=s3://$BUCKET/$RUN_KEY" >> "$GITHUB_OUTPUT"
+          echo "::notice::Task ID: $TASK_ID  Manifest: s3://$BUCKET/$RUN_KEY"
+
+      - name: Monitor task
+        run: |
+          TASK_ARN="${{ steps.launch.outputs.task_arn }}"
+          TIMEOUT=21600
+          ELAPSED=0
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            STATUS=$(aws ecs describe-tasks --cluster ${{ env.CLUSTER }} --tasks "$TASK_ARN" \
+              --query 'tasks[0].lastStatus' --output text 2>/dev/null || echo UNKNOWN)
+            echo "[$((ELAPSED/60))m] $STATUS"
+            if [ "$STATUS" = "STOPPED" ]; then
+              EXIT=$(aws ecs describe-tasks --cluster ${{ env.CLUSTER }} --tasks "$TASK_ARN" \
+                --query 'tasks[0].containers[0].exitCode' --output text)
+              REASON=$(aws ecs describe-tasks --cluster ${{ env.CLUSTER }} --tasks "$TASK_ARN" \
+                --query 'tasks[0].stoppedReason' --output text)
+              echo "exit=$EXIT reason=$REASON"
+              [ "$EXIT" = "0" ] && exit 0
+              echo "::error::Extract task failed (exit $EXIT): $REASON"
+              exit 1
+            fi
+            sleep 30; ELAPSED=$((ELAPSED + 30))
+          done
+          echo "::error::Timeout"; exit 1
+
+  upsert-index:
+    name: "Upsert abc_parts / abc_files / abc_features into Supabase"
+    needs: extract
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --quiet boto3 psycopg[binary]==3.2.* pyyaml
+      - name: Upsert
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          python scripts/abc/upsert_extract.py \
+            --manifest-uri "${{ needs.extract.outputs.manifest_uri }}" \
+            --version "${{ inputs.version }}"

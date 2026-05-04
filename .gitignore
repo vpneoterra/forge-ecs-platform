@@ -18,3 +18,4 @@ Thumbs.db
 # `COPY corpus/ /corpus/` in the Dockerfile always has a valid source.
 docker/testing-harness/corpus/*
 !docker/testing-harness/corpus/.gitkeep
+scripts/abc/__pycache__/
