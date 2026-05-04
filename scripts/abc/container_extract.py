@@ -31,6 +31,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+try:
+    from yaml import CSafeLoader as _SafeLoader  # libyaml C ext, ~10x faster
+except ImportError:
+    from yaml import SafeLoader as _SafeLoader  # pure-python fallback
 
 # Pinned 7-Zip version. Static linux-x64 binary, ~1.8 MiB compressed.
 SEVENZIP_VERSION = "26.01"
@@ -158,7 +162,7 @@ def _parse_feat_yaml(path: Path) -> dict | None:
     """
     try:
         with open(path, "rb") as f:
-            data = yaml.safe_load(f) or {}
+            data = yaml.load(f, Loader=_SafeLoader) or {}
     except (OSError, yaml.YAMLError):
         return None
     if not isinstance(data, dict):
@@ -202,6 +206,9 @@ def walk_extracted(dest: Path, fmt: str, cid: str) -> list[dict]:
     rows: list[dict] = []
     if not dest.exists():
         return rows
+    parts_seen = 0
+    feat_parsed = 0
+    walk_started = time.time()
     for d in sorted(dest.iterdir()):
         if not d.is_dir():
             continue
@@ -209,6 +216,7 @@ def walk_extracted(dest: Path, fmt: str, cid: str) -> list[dict]:
         if not m:
             continue
         part_id = m.group(1)
+        parts_seen += 1
         for f in d.iterdir():
             if not f.is_file():
                 continue
@@ -228,7 +236,11 @@ def walk_extracted(dest: Path, fmt: str, cid: str) -> list[dict]:
                 feat = _parse_feat_yaml(f)
                 if feat is not None:
                     row["features"] = feat
+                    feat_parsed += 1
             rows.append(row)
+        if parts_seen % 500 == 0:
+            log(f"    walked {parts_seen} parts (feat parsed={feat_parsed}, +{time.time()-walk_started:.1f}s)")
+    log(f"    walked total {parts_seen} parts (feat parsed={feat_parsed}) in {time.time()-walk_started:.1f}s")
     return rows
 
 
