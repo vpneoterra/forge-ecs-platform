@@ -134,6 +134,7 @@ jobs:
               rm -f "/tmp/abc/\$FILE"
               # Walk the extracted tree to enumerate (part_id, file) pairs.
               # ABC convention: <part_id>/<part_id>_*.<ext>
+              export DEST FMT CID
               python3 - <<'PY' >> /tmp/walk.jsonl
           import os, sys, json, hashlib, re
           dest = os.environ['DEST']; fmt = os.environ['FMT']; cid = os.environ['CID']
@@ -191,8 +192,11 @@ jobs:
           echo "::notice::Task ID: $TASK_ID  Manifest: s3://$BUCKET/$RUN_KEY"
 
       - name: Monitor task
+        id: monitor
         run: |
           TASK_ARN="${{ steps.launch.outputs.task_arn }}"
+          TASK_ID="${{ steps.launch.outputs.task_id }}"
+          echo "task_id=$TASK_ID" >> "$GITHUB_OUTPUT"
           TIMEOUT=21600
           ELAPSED=0
           while [ $ELAPSED -lt $TIMEOUT ]; do
@@ -205,6 +209,7 @@ jobs:
               REASON=$(aws ecs describe-tasks --cluster ${{ env.CLUSTER }} --tasks "$TASK_ARN" \
                 --query 'tasks[0].stoppedReason' --output text)
               echo "exit=$EXIT reason=$REASON"
+              echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
               [ "$EXIT" = "0" ] && exit 0
               echo "::error::Extract task failed (exit $EXIT): $REASON"
               exit 1
@@ -212,6 +217,18 @@ jobs:
             sleep 30; ELAPSED=$((ELAPSED + 30))
           done
           echo "::error::Timeout"; exit 1
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          TASK_ID="${{ steps.launch.outputs.task_id }}"
+          STREAM="dks-download/downloader/$TASK_ID"
+          echo "=== CloudWatch /forge/ecs/dks-ingest stream $STREAM ==="
+          aws logs get-log-events \
+            --log-group-name /forge/ecs/dks-ingest \
+            --log-stream-name "$STREAM" \
+            --limit 500 \
+            --query 'events[].message' --output text 2>&1 | tail -300 || true
 
   upsert-index:
     name: "Upsert abc_parts / abc_files / abc_features into Supabase"

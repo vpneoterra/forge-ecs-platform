@@ -1,0 +1,58 @@
+name: "ABC: Fetch CloudWatch logs (debug helper)"
+
+# One-off helper to pull container logs from a stopped Fargate task
+# in /forge/ecs/dks-ingest. Provide the task ID (last segment of the
+# task ARN). The stream name is constructed as
+# <streamPrefix>/<containerName>/<taskId> = dks-download/downloader/<task_id>.
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: "ECS task ID (last path component of the task ARN)"
+        required: true
+        type: string
+      log_group:
+        description: "CloudWatch log group"
+        required: false
+        default: "/forge/ecs/dks-ingest"
+        type: string
+      stream_prefix:
+        description: "awslogs streamPrefix"
+        required: false
+        default: "dks-download"
+        type: string
+      container_name:
+        description: "Container name"
+        required: false
+        default: "downloader"
+        type: string
+      lines:
+        description: "Number of trailing lines to print"
+        required: false
+        default: "500"
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Dump log stream
+        run: |
+          STREAM="${{ inputs.stream_prefix }}/${{ inputs.container_name }}/${{ inputs.task_id }}"
+          echo "=== ${{ inputs.log_group }} :: $STREAM ==="
+          aws logs get-log-events \
+            --log-group-name "${{ inputs.log_group }}" \
+            --log-stream-name "$STREAM" \
+            --limit ${{ inputs.lines }} \
+            --query 'events[].message' --output text 2>&1
