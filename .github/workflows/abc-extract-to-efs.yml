@@ -121,7 +121,7 @@ jobs:
 
           # Bootstrap: install awscli via pip, fetch script from S3, run it.
           # 7zz binary is fetched inside the python script over HTTPS.
-          BOOTSTRAP="set -euo pipefail; echo \"=== ABC extract-to-efs \$(date -u) ===\"; pip install --quiet --no-cache-dir --root-user-action=ignore awscli boto3; aws s3 cp \"\$ABC_SCRIPT_URI\" /tmp/run.py --no-progress --only-show-errors; exec python3 /tmp/run.py"
+          BOOTSTRAP="set -euo pipefail; echo \"=== ABC extract-to-efs \$(date -u) ===\"; pip install --quiet --no-cache-dir --root-user-action=ignore awscli boto3 pyyaml; aws s3 cp \"\$ABC_SCRIPT_URI\" /tmp/run.py --no-progress --only-show-errors; exec python3 /tmp/run.py"
 
           OVERRIDES=$(jq -nc \
             --argjson cpu "${{ inputs.task_cpu }}" \

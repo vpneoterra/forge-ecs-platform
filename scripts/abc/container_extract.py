@@ -30,6 +30,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
+
 # Pinned 7-Zip version. Static linux-x64 binary, ~1.8 MiB compressed.
 SEVENZIP_VERSION = "26.01"
 SEVENZIP_URL = (
@@ -141,86 +143,40 @@ SURFACE_TYPE_COLS = {
 
 
 def _parse_feat_yaml(path: Path) -> dict | None:
-    """Best-effort parse of an ABC feat YAML.
+    """Parse an ABC feat YAML using pyyaml.
 
-    We use a tiny hand-rolled scanner instead of pyyaml so the container
-    image stays minimal. The YAML structure is documented at
-    https://github.com/deep-geometry/abc-dataset — we only need:
+    feat YAML structure (per ABC docs):
       surfaces:
         - type: Plane | Cylinder | Cone | Sphere | Torus |
                 Revolution | Extrusion | BSpline | Other
+          ... (vert_indices, vert_parameters, face_indices, etc.)
       curves:
         - sharp: true | false
-    Anything else is ignored. Returns None on parse failure.
+          ...
+    pyyaml correctly handles nested arrays (vert_indices etc.) that
+    confuse line-based scanners. Returns None on parse / IO failure.
     """
-    counts = defaultdict(int)
-    n_faces = 0
-    n_edges = 0
-    n_sharp = 0
-    section = None  # 'surfaces' | 'curves' | None
-    in_item = False
-    item_is_sharp = False
     try:
-        with open(path, "rt", encoding="utf-8", errors="replace") as f:
-            for raw in f:
-                line = raw.rstrip("\n")
-                if not line.strip():
-                    continue
-                # Section headers at column 0.
-                if line.startswith("surfaces:"):
-                    section = "surfaces"
-                    in_item = False
-                    continue
-                if line.startswith("curves:"):
-                    if in_item and section == "curves" and item_is_sharp:
-                        n_sharp += 1
-                    section = "curves"
-                    in_item = False
-                    item_is_sharp = False
-                    continue
-                # Top-level non-section key — leave any open section.
-                if line and not line[0].isspace() and line.endswith(":"):
-                    section = None
-                    in_item = False
-                    continue
-                stripped = line.strip()
-                if stripped.startswith("- "):
-                    # New list item starts. Flush curve sharp flag.
-                    if in_item and section == "curves" and item_is_sharp:
-                        n_sharp += 1
-                    in_item = True
-                    item_is_sharp = False
-                    if section == "surfaces":
-                        n_faces += 1
-                    elif section == "curves":
-                        n_edges += 1
-                    rest = stripped[2:].strip()
-                    if rest.startswith("type:"):
-                        t = rest.split(":", 1)[1].strip()
-                        col = SURFACE_TYPE_COLS.get(t, "n_other")
-                        if section == "surfaces":
-                            counts[col] += 1
-                    elif rest.startswith(("sharp:", "is_sharp:")):
-                        v = rest.split(":", 1)[1].strip().lower()
-                        if v in ("true", "1", "yes"):
-                            item_is_sharp = True
-                elif in_item:
-                    if section == "surfaces" and stripped.startswith("type:"):
-                        t = stripped.split(":", 1)[1].strip()
-                        col = SURFACE_TYPE_COLS.get(t, "n_other")
-                        counts[col] += 1
-                    elif section == "curves" and stripped.startswith(("sharp:", "is_sharp:")):
-                        v = stripped.split(":", 1)[1].strip().lower()
-                        if v in ("true", "1", "yes"):
-                            item_is_sharp = True
-        # Flush trailing curve.
-        if in_item and section == "curves" and item_is_sharp:
-            n_sharp += 1
-    except OSError:
+        with open(path, "rb") as f:
+            data = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
         return None
+    if not isinstance(data, dict):
+        return None
+    surfaces = data.get("surfaces") or []
+    curves = data.get("curves") or []
+    counts: dict[str, int] = defaultdict(int)
+    for s in surfaces:
+        t = (s.get("type") or "Other") if isinstance(s, dict) else "Other"
+        col = SURFACE_TYPE_COLS.get(t, "n_other")
+        counts[col] += 1
+    n_sharp = 0
+    for c in curves:
+        if isinstance(c, dict) and (c.get("sharp") or c.get("is_sharp")):
+            n_sharp += 1
     return {
-        "n_faces":      n_faces,
-        "n_edges":      n_edges,
+        "n_faces":      len(surfaces),
+        "n_edges":      len(curves),
         "n_planar":     counts.get("n_planar", 0),
         "n_cylinder":   counts.get("n_cylinder", 0),
         "n_cone":       counts.get("n_cone", 0),
