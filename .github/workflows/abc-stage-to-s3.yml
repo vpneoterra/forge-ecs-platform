@@ -1,0 +1,257 @@
+name: "ABC: Stage chunks to S3 (raw archives)"
+
+# Phase 2 of ABC ingest. For each (format, chunk_id) selected:
+#   1. read URL from s3://.../abc/${version}/manifests/${format}_${version}.txt
+#   2. curl the .7z to /tmp, md5-verify against md5.yml
+#   3. aws s3 cp to s3://.../abc/${version}/raw/${format}/${filename}
+#   4. upsert one row into Supabase public.abc_chunks
+#
+# Defaults are SMOKE-MODE: chunk 0 only, all formats. Override via inputs.
+# Prereq: abc-ingest-manifests.yml has run for the same version.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "ABC dataset version (currently only v00)"
+        required: true
+        default: "v00"
+        type: string
+      formats:
+        description: "Comma-separated formats to stage (meta,step,para,stl2,obj,feat,stat,ofs). 'all' = every format."
+        required: true
+        default: "all"
+        type: string
+      chunk_range:
+        description: "Chunk ID range, e.g. '0-0' (smoke), '0-9', or 'all' (0-99). Inclusive."
+        required: true
+        default: "0-0"
+        type: string
+      verify_md5:
+        description: "Verify md5 against md5.yml before S3 upload"
+        required: false
+        default: true
+        type: boolean
+      task_cpu:
+        description: "Fargate vCPU units (1024=1 vCPU)"
+        required: false
+        default: "4096"
+        type: string
+      task_memory:
+        description: "Fargate memory in MiB"
+        required: false
+        default: "16384"
+        type: string
+      task_ephemeral_gib:
+        description: "Fargate ephemeral disk (GiB). 21 covers the largest chunk (stl2 ~9.4 GiB)."
+        required: false
+        default: "32"
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER: forge-app-dev
+  SECURITY_GROUP: sg-0871ce467d6c10739
+
+jobs:
+  stage:
+    name: "Stage chunks to S3"
+    runs-on: ubuntu-latest
+    timeout-minutes: 600
+    steps:
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve bucket + subnet
+        id: env
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="forge-platform-data-${ACCOUNT}-${{ env.AWS_REGION }}"
+          SUBNET=$(aws cloudformation list-exports \
+            --query "Exports[?Name=='ForgePublicSubnetIds-dev'].Value" --output text | cut -d',' -f1)
+          echo "bucket=$BUCKET"   >> "$GITHUB_OUTPUT"
+          echo "subnet=$SUBNET"   >> "$GITHUB_OUTPUT"
+          echo "account=$ACCOUNT" >> "$GITHUB_OUTPUT"
+          echo "::notice::Bucket=$BUCKET  Subnet=$SUBNET"
+
+      - name: Resolve format + chunk lists
+        id: plan
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.formats }}" = "all" ]; then
+            FORMATS="meta step para stl2 obj feat stat ofs"
+          else
+            FORMATS=$(echo "${{ inputs.formats }}" | tr ',' ' ')
+          fi
+          if [ "${{ inputs.chunk_range }}" = "all" ]; then
+            START=0; END=99
+          else
+            START=$(echo "${{ inputs.chunk_range }}" | cut -d'-' -f1)
+            END=$(echo "${{ inputs.chunk_range }}"   | cut -d'-' -f2)
+          fi
+          echo "formats=$FORMATS"     >> "$GITHUB_OUTPUT"
+          echo "chunk_start=$START"   >> "$GITHUB_OUTPUT"
+          echo "chunk_end=$END"       >> "$GITHUB_OUTPUT"
+          echo "::notice::Plan: formats=[$FORMATS] chunks=[$START..$END]"
+
+      - name: Launch Fargate task
+        id: launch
+        run: |
+          set -euo pipefail
+          TASK_DEF=$(aws ecs list-task-definitions --family-prefix dks-download \
+            --sort DESC --max-items 1 --query 'taskDefinitionArns[0]' --output text)
+          echo "Task def: $TASK_DEF"
+
+          BUCKET="${{ steps.env.outputs.bucket }}"
+          VERSION="${{ inputs.version }}"
+          FORMATS="${{ steps.plan.outputs.formats }}"
+          START="${{ steps.plan.outputs.chunk_start }}"
+          END="${{ steps.plan.outputs.chunk_end }}"
+          VERIFY="${{ inputs.verify_md5 }}"
+
+          # The container script runs entirely from inline bash. Stays under
+          # the ECS overrides 8 KB cap by reading manifests from S3 at runtime.
+          read -r -d '' CMD <<EOSH || true
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          echo "=== ABC stage-to-s3 \$(date -u) ==="
+          apt-get update -qq
+          apt-get install -y -qq curl awscli ca-certificates >/dev/null
+          mkdir -p /tmp/abc && cd /tmp/abc
+
+          BUCKET="$BUCKET"
+          VERSION="$VERSION"
+          MANIFEST_PFX="s3://\$BUCKET/abc/\$VERSION/manifests"
+          RAW_PFX="s3://\$BUCKET/abc/\$VERSION/raw"
+          STATE_PFX="s3://\$BUCKET/abc/\$VERSION/state"
+
+          aws s3 cp "\$MANIFEST_PFX/md5.yml"  md5.yml
+          aws s3 cp "\$MANIFEST_PFX/size.yml" size.yml
+
+          for FMT in $FORMATS; do
+            echo "──── format=\$FMT ────"
+            aws s3 cp "\$MANIFEST_PFX/\${FMT}_\${VERSION}.txt" "\${FMT}.txt"
+            for ID in \$(seq -w $START $END); do
+              # zero-pad to 4 digits ('0000', '0001', ...)
+              CID=\$(printf '%04d' \$((10#\$ID)))
+              LINE=\$((10#\$CID + 1))
+              ROW=\$(sed -n "\${LINE}p" "\${FMT}.txt" || true)
+              [ -z "\$ROW" ] && { echo "skip \$FMT chunk \$CID: no row"; continue; }
+              URL=\$(echo  "\$ROW" | awk '{print \$1}')
+              FNAME=\$(echo "\$ROW" | awk '{print \$2}')
+              S3KEY="abc/\$VERSION/raw/\$FMT/\$FNAME"
+              if aws s3api head-object --bucket "\$BUCKET" --key "\$S3KEY" >/dev/null 2>&1; then
+                echo "✓ already staged: \$FNAME"
+                continue
+              fi
+              echo "↓ \$FNAME from \$URL"
+              time curl -fSL --retry 5 --connect-timeout 30 -o "/tmp/abc/\$FNAME" "\$URL"
+              if [ "$VERIFY" = "true" ]; then
+                EXPECTED=\$(grep "^\$FNAME:" md5.yml | awk '{print \$2}')
+                ACTUAL=\$(md5sum "/tmp/abc/\$FNAME" | awk '{print \$1}')
+                if [ -n "\$EXPECTED" ] && [ "\$EXPECTED" != "\$ACTUAL" ]; then
+                  echo "::error::md5 mismatch \$FNAME expected=\$EXPECTED actual=\$ACTUAL"
+                  rm -f "/tmp/abc/\$FNAME"
+                  exit 1
+                fi
+                echo "✓ md5 ok (\$ACTUAL)"
+              fi
+              SIZE=\$(stat -c%s "/tmp/abc/\$FNAME")
+              aws s3 cp "/tmp/abc/\$FNAME" "s3://\$BUCKET/\$S3KEY" --no-progress --only-show-errors
+              # write state stub for downstream extract workflow
+              STATE_KEY="abc/\$VERSION/state/\$FMT/\$CID.json"
+              cat > /tmp/state.json <<JSON
+          {"chunk_id":"\$CID","format":"\$FMT","filename":"\$FNAME","source_url":"\$URL","s3_uri":"s3://\$BUCKET/\$S3KEY","bytes":\$SIZE,"md5_verified":\$([ "$VERIFY" = "true" ] && echo true || echo false),"staged_at":"\$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+          JSON
+              aws s3 cp /tmp/state.json "s3://\$BUCKET/\$STATE_KEY" --no-progress --only-show-errors
+              rm -f "/tmp/abc/\$FNAME"
+              echo "✓ uploaded \$FNAME (\$SIZE bytes)"
+            done
+          done
+          echo "=== done \$(date -u) ==="
+          EOSH
+
+          OVERRIDES=$(jq -nc \
+            --argjson cpu     "${{ inputs.task_cpu }}" \
+            --argjson mem     "${{ inputs.task_memory }}" \
+            --argjson eph     "${{ inputs.task_ephemeral_gib }}" \
+            --arg     cmd     "$CMD" \
+            '{
+               cpu: ($cpu|tostring),
+               memory: ($mem|tostring),
+               ephemeralStorage: { sizeInGiB: $eph },
+               containerOverrides: [{
+                 name: "downloader",
+                 cpu: $cpu,
+                 memory: $mem,
+                 command: ["bash","-c", $cmd]
+               }]
+             }')
+
+          TASK_ARN=$(aws ecs run-task \
+            --cluster ${{ env.CLUSTER }} \
+            --task-definition "$TASK_DEF" \
+            --launch-type FARGATE --platform-version LATEST \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ steps.env.outputs.subnet }}],securityGroups=[${{ env.SECURITY_GROUP }}],assignPublicIp=ENABLED}" \
+            --overrides "$OVERRIDES" \
+            --query 'tasks[0].taskArn' --output text)
+          TASK_ID=$(echo "$TASK_ARN" | rev | cut -d'/' -f1 | rev)
+          echo "task_arn=$TASK_ARN" >> "$GITHUB_OUTPUT"
+          echo "task_id=$TASK_ID"   >> "$GITHUB_OUTPUT"
+          echo "::notice::Task ID: $TASK_ID"
+
+      - name: Monitor task
+        run: |
+          TASK_ARN="${{ steps.launch.outputs.task_arn }}"
+          TIMEOUT=21600
+          ELAPSED=0
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            STATUS=$(aws ecs describe-tasks --cluster ${{ env.CLUSTER }} --tasks "$TASK_ARN" \
+              --query 'tasks[0].lastStatus' --output text 2>/dev/null || echo UNKNOWN)
+            echo "[$((ELAPSED/60))m] $STATUS"
+            if [ "$STATUS" = "STOPPED" ]; then
+              EXIT=$(aws ecs describe-tasks --cluster ${{ env.CLUSTER }} --tasks "$TASK_ARN" \
+                --query 'tasks[0].containers[0].exitCode' --output text)
+              REASON=$(aws ecs describe-tasks --cluster ${{ env.CLUSTER }} --tasks "$TASK_ARN" \
+                --query 'tasks[0].stoppedReason' --output text)
+              echo "exit=$EXIT reason=$REASON"
+              [ "$EXIT" = "0" ] && exit 0
+              echo "::error::Stage task failed (exit $EXIT): $REASON"
+              exit 1
+            fi
+            sleep 30; ELAPSED=$((ELAPSED + 30))
+          done
+          echo "::error::Timeout"
+          exit 1
+
+  upsert-index:
+    name: "Upsert abc_chunks rows into Supabase"
+    needs: stage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --quiet boto3 psycopg[binary]==3.2.* pyyaml
+      - name: Upsert
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="forge-platform-data-${ACCOUNT}-${{ env.AWS_REGION }}"
+          python scripts/abc/upsert_chunks.py \
+            --bucket "$BUCKET" \
+            --version "${{ inputs.version }}"

@@ -1,0 +1,77 @@
+name: "ABC: Ingest Manifests (chunk URL lists + md5/size)"
+
+# Pulls the canonical chunk-list TXT files and md5/size YAML manifests from
+# https://deep-geometry.github.io/abc-dataset/data/ and stores them in
+# s3://forge-platform-data-${ACCOUNT}-${REGION}/abc/${VERSION}/manifests/.
+#
+# Cheap (~1 minute, no Fargate). Run this first, before abc-stage-to-s3.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "ABC dataset version suffix (currently only v00 exists)"
+        required: true
+        default: "v00"
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  ABC_BASE_URL: "https://deep-geometry.github.io/abc-dataset/data"
+
+jobs:
+  fetch-and-stage:
+    name: "Fetch and stage manifests to S3"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve bucket
+        id: bucket
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="forge-platform-data-${ACCOUNT}-${{ env.AWS_REGION }}"
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          echo "::notice::Target bucket: s3://$BUCKET/abc/${{ inputs.version }}/manifests/"
+
+      - name: Fetch chunk-list TXT files
+        run: |
+          set -euo pipefail
+          mkdir -p manifests
+          for fmt in all meta step para stl2 obj feat stat ofs; do
+            URL="${{ env.ABC_BASE_URL }}/${fmt}_${{ inputs.version }}.txt"
+            echo "→ $URL"
+            curl -fSL --retry 3 -o "manifests/${fmt}_${{ inputs.version }}.txt" "$URL"
+            wc -l "manifests/${fmt}_${{ inputs.version }}.txt"
+          done
+
+      - name: Fetch md5 + size YAML manifests
+        run: |
+          set -euo pipefail
+          curl -fSL --retry 3 -o "manifests/md5.yml"  "${{ env.ABC_BASE_URL }}/md5.yml"
+          curl -fSL --retry 3 -o "manifests/size.yml" "${{ env.ABC_BASE_URL }}/size.yml"
+          wc -l manifests/md5.yml manifests/size.yml
+
+      - name: Capture provenance
+        run: |
+          {
+            echo "fetched_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "source_base_url: ${{ env.ABC_BASE_URL }}"
+            echo "version: ${{ inputs.version }}"
+            echo "github_run_id: ${{ github.run_id }}"
+            echo "github_run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > manifests/provenance.yml
+
+      - name: Upload to S3
+        run: |
+          aws s3 sync manifests/ \
+            "s3://${{ steps.bucket.outputs.bucket }}/abc/${{ inputs.version }}/manifests/" \
+            --no-progress --only-show-errors
+          echo "Done. Index manifests:"
+          aws s3 ls "s3://${{ steps.bucket.outputs.bucket }}/abc/${{ inputs.version }}/manifests/"

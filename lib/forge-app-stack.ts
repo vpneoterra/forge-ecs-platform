@@ -776,6 +776,37 @@ export class ForgeAppStack extends cdk.Stack {
       // Grant EFS access to task role
       dksEfs.grantReadWrite(taskRole);
 
+      // -- ABC dataset ingest: S3 access on forge-platform-data/abc/* ---------
+      // The ABC dataset (https://deep-geometry.github.io/abc-dataset/) is too
+      // large for EFS-only staging. Pipeline:
+      //   1. abc-stage-to-s3.yml      → curl chunk URLs into s3://.../abc/v00/raw/
+      //   2. abc-extract-to-efs.yml   → unpack staged chunks to /data on EFS
+      //   3. abc-build-index workflow → emit Parquet snapshot under abc/v00/index/
+      // Bucket name follows the deterministic pattern from ForgeDataStack.
+      const abcDataBucketName = `forge-platform-data-${this.account}-${this.region}`;
+      taskRole.addToPolicy(new iam.PolicyStatement({
+        sid: 'AbcDatasetS3ReadWrite',
+        actions: [
+          's3:PutObject',
+          's3:PutObjectAcl',
+          's3:GetObject',
+          's3:DeleteObject',
+          's3:AbortMultipartUpload',
+          's3:ListMultipartUploadParts',
+        ],
+        resources: [
+          `arn:aws:s3:::${abcDataBucketName}/abc/*`,
+        ],
+      }));
+      taskRole.addToPolicy(new iam.PolicyStatement({
+        sid: 'AbcDatasetS3List',
+        actions: ['s3:ListBucket', 's3:GetBucketLocation'],
+        resources: [`arn:aws:s3:::${abcDataBucketName}`],
+        conditions: {
+          StringLike: { 's3:prefix': ['abc/*', 'abc'] },
+        },
+      }));
+
       // dks-download task definition (lightweight — for downloading datasets to EFS)
       const dksDownloadTaskDef = new ecs.FargateTaskDefinition(this, 'DksDownloadTaskDef', {
         family: 'dks-download',
