@@ -1,0 +1,39 @@
+name: ABC debug — running tasks
+on:
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::266087050444:role/forge-ci-deploy-role
+          aws-region: us-east-1
+
+      - name: List running tasks and tail logs
+        run: |
+          set -euo pipefail
+          CLUSTER=forge-app-dev
+          ARNS=$(aws ecs list-tasks --cluster $CLUSTER --desired-status RUNNING --query 'taskArns' --output text)
+          echo "Running tasks: $ARNS"
+          for arn in $ARNS; do
+            tid=$(echo "$arn" | rev | cut -d/ -f1 | rev)
+            family=$(aws ecs describe-tasks --cluster $CLUSTER --tasks "$arn" --query 'tasks[0].taskDefinitionArn' --output text)
+            echo "----"
+            echo "task_id=$tid family=$family"
+            aws ecs describe-tasks --cluster $CLUSTER --tasks "$arn" \
+              --query 'tasks[0].{started:startedAt,lastStatus:lastStatus,connectivity:connectivity,cpu:cpu,memory:memory}' --output json
+            stream="dks-download/downloader/$tid"
+            echo "=== CloudWatch tail for $stream (last 200 events) ==="
+            aws logs filter-log-events \
+              --log-group-name /forge/ecs/dks-ingest \
+              --log-stream-names "$stream" \
+              --limit 200 \
+              --query 'events[*].[timestamp,message]' --output text 2>&1 | tail -100 || echo "(no events)"
+          done
