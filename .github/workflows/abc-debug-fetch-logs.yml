@@ -57,8 +57,25 @@ jobs:
       - name: Dump matched log stream
         if: steps.find.outputs.matched_stream != ''
         run: |
+          set +e
+          GRP="${{ steps.find.outputs.matched_group }}"
+          STR="${{ steps.find.outputs.matched_stream }}"
+          echo "=== describe-log-streams ==="
+          aws logs describe-log-streams --log-group-name "$GRP" \
+            --log-stream-name-prefix "$STR" \
+            --query 'logStreams[0].{first:firstEventTimestamp,last:lastEventTimestamp,bytes:storedBytes}' \
+            --output json
+          echo "=== get-log-events --start-from-head ==="
           aws logs get-log-events \
-            --log-group-name "${{ steps.find.outputs.matched_group }}" \
-            --log-stream-name "${{ steps.find.outputs.matched_stream }}" \
+            --log-group-name "$GRP" \
+            --log-stream-name "$STR" \
+            --start-from-head \
             --limit ${{ inputs.lines }} \
-            --query 'events[].message' --output text 2>&1
+            --query 'events[].[timestamp,message]' \
+            --output text
+          echo "=== filter-log-events (full search) ==="
+          aws logs filter-log-events \
+            --log-group-name "$GRP" \
+            --log-stream-names "$STR" \
+            --limit ${{ inputs.lines }} \
+            --query 'events[].message' --output text
