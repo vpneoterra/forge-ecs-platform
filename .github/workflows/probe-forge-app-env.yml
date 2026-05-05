@@ -26,8 +26,11 @@ jobs:
           echo "===== ENV ON LIVE TD ====="
           LIVE_TD=$(aws ecs describe-services --cluster forge-app-dev --services forge-app-test --query 'services[0].taskDefinition' --output text)
           echo "Live TD: $LIVE_TD"
+          echo '--- container names ---'
+          aws ecs describe-task-definition --task-definition "$LIVE_TD" --query 'taskDefinition.containerDefinitions[].name' --output json
+          echo '--- ALL env on live TD primary container ---'
           aws ecs describe-task-definition --task-definition "$LIVE_TD" \
-            --query 'taskDefinition.containerDefinitions[?name==`forge-app`].environment[?name==`MAESTRO_ENABLED` || name==`CONDUCTOR_ENABLED` || name==`CONDUCTOR_SHADOW_MODE` || name==`IMAGE_TAG`]' --output json
+            --query 'taskDefinition.containerDefinitions[0].{name:name,env:environment[?name==`MAESTRO_ENABLED` || name==`CONDUCTOR_ENABLED` || name==`CONDUCTOR_SHADOW_MODE` || name==`IMAGE_TAG` || name==`ANTHROPIC_API_KEY`].{n:name,v:value}}' --output json
       - name: Dump env across requested revisions
         run: |
           set -e
@@ -36,6 +39,6 @@ jobs:
             ARN="forge-app-test:$r"
             echo "===== TD $ARN ====="
             aws ecs describe-task-definition --task-definition "$ARN" \
-              --query 'taskDefinition.{revision:revision,registeredAt:registeredAt,image:containerDefinitions[?name==`forge-app`].image,env:containerDefinitions[?name==`forge-app`].environment[?name==`MAESTRO_ENABLED` || name==`CONDUCTOR_ENABLED` || name==`CONDUCTOR_SHADOW_MODE` || name==`IMAGE_TAG`]}' --output json || echo "(missing)"
+              --query 'taskDefinition.{revision:revision,registeredAt:registeredAt,image:containerDefinitions[0].image,name:containerDefinitions[0].name,env:containerDefinitions[0].environment[?name==`MAESTRO_ENABLED` || name==`CONDUCTOR_ENABLED` || name==`CONDUCTOR_SHADOW_MODE` || name==`IMAGE_TAG`].{n:name,v:value}}' --output json || echo "(missing)"
             echo
           done
