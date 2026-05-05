@@ -260,6 +260,15 @@ export class ForgeAppStack extends cdk.Stack {
         // to toggle without a CDK deploy.
         MAESTRO_ENABLED: 'true',
         CONDUCTOR_ENABLED: 'true',
+        // -- Maestro AIN (Augmented Intent Notes / L3 capture layer) --
+        // Persisted as 'true' on 2026-05-04 to fix the production
+        // "ain_enabled:false" symptom observed in monitoring run
+        // 2ba2596d-4ce9-4324-873e-f62db74bb6f3 (FORGE program 43b3a680).
+        // Code default in lib/maestro-ain-capture.js is already on, but the
+        // live forge-app-test task-def had MAESTRO_AIN_ENABLED=false set out
+        // of band, so making the desired state explicit here. Use the
+        // flip-maestro-ain.yml workflow to toggle without a CDK deploy.
+        MAESTRO_AIN_ENABLED: 'true',
         // -- CHORUS --
         // Flipped to 'write' on 2026-04-23 (see .github/workflows/flip-chorus-forge-mode.yml
         // run 24844843052 and PR #35). Persisted here so subsequent `cdk deploy`

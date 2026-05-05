@@ -1,0 +1,144 @@
+name: "Flip MAESTRO_AIN_ENABLED"
+# ================================================================
+# flip-maestro-ain.yml — Toggle the AIN (Augmented Intent Notes /
+# L3 capture) layer on forge-app-test without a full CDK deploy.
+#
+# Modeled exactly on flip-maestro-conductor.yml (which is itself
+# patterned on patch-dks-ingest-td.yml). Registers a new task-def
+# revision via the AWS ECS API.
+#
+# Background: the AIN router is mounted unconditionally in code,
+# but the in-process capture buffer (lib/maestro-ain-capture.js)
+# checks `process.env.MAESTRO_AIN_ENABLED !== 'false'`. Production
+# was observed returning ain_enabled:false on
+# /api/monitor/maestro/ain/health during the 2026-05-05 monitoring
+# run (program 43b3a680, workflow run 2ba2596d), confirming an
+# explicit MAESTRO_AIN_ENABLED=false on the live task-def.
+#
+# Safe + idempotent: re-running with the same input produces the
+# same env block. Rollback is printed at the end.
+# ================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      ain_enabled:
+        description: "MAESTRO_AIN_ENABLED value"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+env:
+  AWS_REGION: us-east-1
+  ECS_CLUSTER: forge-app-dev
+  ECS_SERVICE: forge-app-test
+
+jobs:
+  flip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: test
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 1. Snapshot current task-def for rollback
+      - name: Snapshot current task definition
+        id: snapshot
+        run: |
+          CUR_ARN=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' --output text)
+          echo "Current TD ARN: $CUR_ARN"
+          echo "current_arn=$CUR_ARN" >> "$GITHUB_OUTPUT"
+          aws ecs describe-task-definition --task-definition "$CUR_ARN" \
+            --query taskDefinition > /tmp/taskdef.json
+          jq '.revision' /tmp/taskdef.json
+          echo "Current MAESTRO_AIN_ENABLED:"
+          jq '.containerDefinitions[] | select(.name=="forge-app") | .environment
+              | map(select(.name=="MAESTRO_AIN_ENABLED"))' /tmp/taskdef.json
+
+      # 2. Patch env vars (desired state, not delta) using jq
+      - name: Build patched task definition
+        env:
+          AIN_ENABLED: ${{ github.event.inputs.ain_enabled }}
+        run: |
+          jq --arg A "$AIN_ENABLED" '
+            .containerDefinitions |= (map(
+              if .name == "forge-app" then
+                .environment |= (
+                  (map(select(.name != "MAESTRO_AIN_ENABLED")))
+                  + [{"name":"MAESTRO_AIN_ENABLED","value":$A}]
+                )
+              else . end
+            ))
+            | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,
+                  .compatibilities,.registeredAt,.registeredBy)
+          ' /tmp/taskdef.json > /tmp/taskdef-new.json
+          echo "Patched forge-app env (preview):"
+          jq '.containerDefinitions[] | select(.name=="forge-app") | .environment
+              | map(select(.name=="MAESTRO_AIN_ENABLED"))' \
+              /tmp/taskdef-new.json
+
+      # 3. Register new revision
+      - name: Register new task definition
+        id: register
+        run: |
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/taskdef-new.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "New revision: $NEW_ARN"
+          echo "new_arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
+
+      # 4. Deploy (force new tasks)
+      - name: Update service (force new deployment)
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+            --task-definition "${{ steps.register.outputs.new_arn }}" \
+            --force-new-deployment >/dev/null
+          echo "Update issued."
+
+      # 5. Wait for steady state
+      - name: Wait for steady state
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+          echo "Service is stable."
+
+      # 6. Verify AIN health endpoint
+      - name: Verify AIN health
+        env:
+          AIN_ENABLED: ${{ github.event.inputs.ain_enabled }}
+        run: |
+          for i in 1 2 3 4 5 6; do
+            RESP=$(curl -sf https://forge.qrucible.ai/api/monitor/maestro/ain/health || true)
+            if [ -n "$RESP" ]; then
+              echo "Attempt $i OK:"
+              echo "$RESP" | jq '{subsystem, status, ain_enabled: .stats.ain_enabled, s3_enabled: .stats.s3_enabled, buffer_max: .stats.buffer_max}'
+              ENABLED=$(echo "$RESP" | jq -r '.stats.ain_enabled // "null"')
+              if [ "$ENABLED" = "$AIN_ENABLED" ]; then
+                echo "::notice::AIN ain_enabled=$ENABLED confirmed on prod."
+                exit 0
+              fi
+              echo "ain_enabled is $ENABLED — waiting (target=$AIN_ENABLED)..."
+            else
+              echo "Attempt $i: empty/non-2xx response, retrying in 10s..."
+            fi
+            sleep 10
+          done
+          echo "::error::AIN health did not report ain_enabled=$AIN_ENABLED within budget."
+          exit 1
+
+      # 7. Print rollback command
+      - name: Print rollback command
+        if: always()
+        run: |
+          echo "::notice::Rollback (if needed):"
+          echo "aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE \\"
+          echo "  --task-definition '${{ steps.snapshot.outputs.current_arn }}' --force-new-deployment"
