@@ -1,0 +1,153 @@
+name: "Flip HYDRATE_DIAG_* env on forge-app-test"
+# ================================================================
+# flip-hydrate-diag.yml — Patch the three HYDRATE_DIAG_* env vars
+# on forge-app-test and force a new deployment.
+#
+# Modeled exactly on flip-maestro-conductor.yml: snapshot the live
+# TD, jq-patch the forge-app container's environment block (preserving
+# every other env entry), register a new revision via aws ecs
+# register-task-definition, update-service to point the service at
+# the new revision, then wait for steady state.
+#
+# Pairs with forgenew commit 76c842e8 (PR #805) which switches the
+# hydrate Claude call to streaming. The env values raise the per-
+# attempt SDK budget from 60 s to 180 s and drop redundant retries
+# (atlas/decompose already uses this pattern at requestTimeout=180000,
+# maxRetries=0).
+#
+# Safe + idempotent: re-running with the same inputs produces the
+# same env block. Rollback ARN is printed at the end.
+# ================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      hydrate_timeout_ms:
+        description: "HYDRATE_DIAG_TIMEOUT_MS value (ms)"
+        required: true
+        default: "180000"
+        type: string
+      hydrate_max_retries:
+        description: "HYDRATE_DIAG_MAX_RETRIES value (0 = single attempt)"
+        required: true
+        default: "0"
+        type: string
+      hydrate_effort:
+        description: "HYDRATE_DIAG_EFFORT value"
+        required: true
+        default: "medium"
+        type: choice
+        options: ["low", "medium", "high"]
+
+env:
+  AWS_REGION: us-east-1
+  ECS_CLUSTER: forge-app-dev
+  ECS_SERVICE: forge-app-test
+
+jobs:
+  flip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: test
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 1. Snapshot current task-def for rollback
+      - name: Snapshot current task definition
+        id: snapshot
+        run: |
+          CUR_ARN=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' --output text)
+          echo "Current TD ARN: $CUR_ARN"
+          echo "current_arn=$CUR_ARN" >> "$GITHUB_OUTPUT"
+          aws ecs describe-task-definition --task-definition "$CUR_ARN" \
+            --query taskDefinition > /tmp/taskdef.json
+          jq '.revision' /tmp/taskdef.json
+
+      # 2. Patch env vars (desired state, not delta) using jq.
+      #    Preserves every other env entry on the forge-app container
+      #    by selecting out only the three keys we are setting and then
+      #    appending the new values.
+      - name: Build patched task definition
+        env:
+          HYDRATE_TIMEOUT_MS: ${{ github.event.inputs.hydrate_timeout_ms }}
+          HYDRATE_MAX_RETRIES: ${{ github.event.inputs.hydrate_max_retries }}
+          HYDRATE_EFFORT: ${{ github.event.inputs.hydrate_effort }}
+        run: |
+          jq --arg T "$HYDRATE_TIMEOUT_MS" --arg R "$HYDRATE_MAX_RETRIES" --arg E "$HYDRATE_EFFORT" '
+            .containerDefinitions |= (map(
+              if .name == "forge-app" then
+                .environment |= (
+                  (map(select(.name != "HYDRATE_DIAG_TIMEOUT_MS"
+                              and .name != "HYDRATE_DIAG_MAX_RETRIES"
+                              and .name != "HYDRATE_DIAG_EFFORT")))
+                  + [{"name":"HYDRATE_DIAG_TIMEOUT_MS","value":$T},
+                     {"name":"HYDRATE_DIAG_MAX_RETRIES","value":$R},
+                     {"name":"HYDRATE_DIAG_EFFORT","value":$E}]
+                )
+              else . end
+            ))
+            | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,
+                  .compatibilities,.registeredAt,.registeredBy)
+          ' /tmp/taskdef.json > /tmp/taskdef-new.json
+          echo "Patched forge-app HYDRATE_DIAG_* env (preview):"
+          jq '.containerDefinitions[] | select(.name=="forge-app") | .environment
+              | map(select(.name=="HYDRATE_DIAG_TIMEOUT_MS"
+                           or .name=="HYDRATE_DIAG_MAX_RETRIES"
+                           or .name=="HYDRATE_DIAG_EFFORT"))' \
+              /tmp/taskdef-new.json
+
+      # 3. Register new revision
+      - name: Register new task definition
+        id: register
+        run: |
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/taskdef-new.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "New revision: $NEW_ARN"
+          echo "new_arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
+          NEW_REV=$(echo "$NEW_ARN" | awk -F: '{print $NF}')
+          echo "new_revision=$NEW_REV" >> "$GITHUB_OUTPUT"
+
+      # 4. Deploy (force new tasks)
+      - name: Update service (force new deployment)
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+            --task-definition "${{ steps.register.outputs.new_arn }}" \
+            --force-new-deployment >/dev/null
+          echo "Update issued."
+
+      # 5. Wait for steady state (10 min budget)
+      - name: Wait for steady state
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+          echo "Service is stable."
+
+      # 6. Verify the live TD now carries the three keys with the
+      #    requested values. Mirrors the pattern used by
+      #    probe-forge-app-env.yml but filtered to the HYDRATE_DIAG_*
+      #    keys (the existing probe filters to MAESTRO/CONDUCTOR vars).
+      - name: Verify live env
+        run: |
+          LIVE_TD=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' --output text)
+          echo "Live TD now: $LIVE_TD"
+          aws ecs describe-task-definition --task-definition "$LIVE_TD" \
+            --query 'taskDefinition.containerDefinitions[?name==`forge-app`] | [0].environment[?name==`HYDRATE_DIAG_TIMEOUT_MS` || name==`HYDRATE_DIAG_MAX_RETRIES` || name==`HYDRATE_DIAG_EFFORT`].{n:name,v:value}' \
+            --output json
+
+      # 7. Print rollback command
+      - name: Print rollback command
+        if: always()
+        run: |
+          echo "::notice::Rollback (if needed):"
+          echo "aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE \\"
+          echo "  --task-definition '${{ steps.snapshot.outputs.current_arn }}' --force-new-deployment"
