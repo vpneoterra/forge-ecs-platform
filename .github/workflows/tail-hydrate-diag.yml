@@ -1,16 +1,13 @@
-name: Tail hydrate diag logs (last N min)
+name: Tail hydrate diag logs
 on:
   workflow_dispatch:
     inputs:
       minutes:
-        description: 'Look-back window in minutes'
+        description: Look-back window in minutes
         required: false
-        default: '15'
-      pattern:
-        description: 'CloudWatch filter pattern (omit to use default)'
-        required: false
-        default: '?ATLAS-HYDRATE-DIAG ?AXIOM-BRIDGE ?circuit ?breaker ?Anthropic ?timeout ?aborted ?429 ?Connection'
-permissions: {contents: read}
+        default: "20"
+permissions:
+  contents: read
 jobs:
   tail:
     runs-on: ubuntu-latest
@@ -20,30 +17,39 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
-      - name: Filter forge-app logs
+      - name: Filter forge-app logs for hydrate diagnostics
+        env:
+          MIN: ${{ inputs.minutes }}
         run: |
           set -e
-          MIN=${{ inputs.minutes }}
-          PAT='${{ inputs.pattern }}'
           NOW_MS=$(date +%s%3N)
           START_MS=$(( NOW_MS - MIN*60*1000 ))
-          echo "Window: $START_MS - $NOW_MS  ($MIN min lookback)"
-          echo "Pattern: $PAT"
-          echo
-          aws logs filter-log-events \
-            --log-group-name /forge/ecs/forge-app-test \
-            --start-time "$START_MS" \
-            --end-time "$NOW_MS" \
-            --filter-pattern "$PAT" \
-            --max-items 500 \
-            --output json | python3 -c "
-import json, sys, datetime
-d = json.load(sys.stdin)
+          echo "Window: $START_MS to $NOW_MS  (lookback ${MIN} min)"
+          for PAT in \
+              "ATLAS-HYDRATE-DIAG" \
+              "AXIOM-BRIDGE" \
+              "circuit breaker" \
+              "Request timed out" \
+              "APIConnectionError" \
+              "Anthropic"
+          do
+            echo
+            echo "===== pattern: $PAT ====="
+            aws logs filter-log-events \
+              --log-group-name /forge/ecs/forge-app-test \
+              --start-time "$START_MS" \
+              --end-time "$NOW_MS" \
+              --filter-pattern "$PAT" \
+              --max-items 100 \
+              --output json > /tmp/_lf.json || { echo "(filter failed)"; continue; }
+            python3 - <<'PY'
+import json, datetime
+d = json.load(open('/tmp/_lf.json'))
 events = d.get('events', [])
-print(f'matched events: {len(events)}')
-print()
-for e in events:
+print(f"matched: {len(events)}")
+for e in events[:60]:
     ts = datetime.datetime.utcfromtimestamp(e['timestamp']/1000).isoformat()+'Z'
     msg = e['message'].rstrip()
-    print(f'{ts} | {msg[:600]}')
-"
+    print(f"{ts} | {msg[:500]}")
+PY
+          done
