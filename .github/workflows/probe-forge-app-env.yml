@@ -1,0 +1,41 @@
+name: Probe forge-app live TD env
+on:
+  workflow_dispatch:
+    inputs:
+      revisions:
+        description: 'Comma-separated TD revisions to dump (e.g. 1052,1053,1055,1056,1057)'
+        required: false
+        default: '1052,1053,1055,1056,1057'
+permissions: {contents: read}
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      - name: Live service current TD + key envs
+        run: |
+          set -e
+          echo "===== LIVE SERVICE ====="
+          aws ecs describe-services --cluster forge-app-dev --services forge-app-test \
+            --query 'services[0].{taskDefinition:taskDefinition,running:runningCount,desired:desiredCount,deployments:deployments[].{status:status,td:taskDefinition,running:runningCount,createdAt:createdAt}}' --output json
+          echo
+          echo "===== ENV ON LIVE TD ====="
+          LIVE_TD=$(aws ecs describe-services --cluster forge-app-dev --services forge-app-test --query 'services[0].taskDefinition' --output text)
+          echo "Live TD: $LIVE_TD"
+          aws ecs describe-task-definition --task-definition "$LIVE_TD" \
+            --query 'taskDefinition.containerDefinitions[?name==`forge-app`].environment[?name==`MAESTRO_ENABLED` || name==`CONDUCTOR_ENABLED` || name==`CONDUCTOR_SHADOW_MODE` || name==`IMAGE_TAG`]' --output json
+      - name: Dump env across requested revisions
+        run: |
+          set -e
+          IFS=',' read -ra REVS <<< "${{ inputs.revisions }}"
+          for r in "${REVS[@]}"; do
+            ARN="forge-app-test:$r"
+            echo "===== TD $ARN ====="
+            aws ecs describe-task-definition --task-definition "$ARN" \
+              --query 'taskDefinition.{revision:revision,registeredAt:registeredAt,image:containerDefinitions[?name==`forge-app`].image,env:containerDefinitions[?name==`forge-app`].environment[?name==`MAESTRO_ENABLED` || name==`CONDUCTOR_ENABLED` || name==`CONDUCTOR_SHADOW_MODE` || name==`IMAGE_TAG`]}' --output json || echo "(missing)"
+            echo
+          done
