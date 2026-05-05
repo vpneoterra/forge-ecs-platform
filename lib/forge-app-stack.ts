@@ -260,6 +260,17 @@ export class ForgeAppStack extends cdk.Stack {
         // to toggle without a CDK deploy.
         MAESTRO_ENABLED: 'true',
         CONDUCTOR_ENABLED: 'true',
+        // -- Conductor Phase 4 cutover (shadow -> active) --
+        // Code default in server/axiom/conductor.js (`SHADOW_MODE = process.env
+        // .CONDUCTOR_SHADOW_MODE !== 'false'`) resolves to TRUE whenever the
+        // var is unset, so prior CDK deploys left every conductor_runs row
+        // with shadow_mode=true and recrystallization phases were never
+        // intercepting runMeridian. Persisted as 'false' on 2026-05-05 to
+        // complete the Phase 4 cutover that was missed when CONDUCTOR_ENABLED
+        // was flipped on 2026-04-22. The flip-maestro-conductor.yml workflow
+        // currently does not toggle this variable; update that workflow if
+        // runtime toggling without a CDK deploy is needed.
+        CONDUCTOR_SHADOW_MODE: 'false',
         // -- Maestro AIN (Augmented Intent Notes / L3 capture layer) --
         // Persisted as 'true' on 2026-05-04 to fix the production
         // "ain_enabled:false" symptom observed in monitoring run
