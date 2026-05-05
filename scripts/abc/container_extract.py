@@ -27,6 +27,7 @@ import tarfile
 import time
 import urllib.request
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -146,7 +147,7 @@ SURFACE_TYPE_COLS = {
 }
 
 
-def _parse_feat_yaml(path: Path) -> dict | None:
+def _parse_feat_yaml(path: Path | str) -> dict | None:
     """Parse an ABC feat YAML using pyyaml.
 
     feat YAML structure (per ABC docs):
@@ -194,21 +195,34 @@ def _parse_feat_yaml(path: Path) -> dict | None:
     }
 
 
+def _parse_feat_yaml_str(path: str) -> tuple[str, dict | None]:
+    """Process-pool worker wrapper. Returns (path, features-or-None)."""
+    return path, _parse_feat_yaml(path)
+
+
 def walk_extracted(dest: Path, fmt: str, cid: str) -> list[dict]:
     """Enumerate (part_id, file) pairs under `dest`.
 
     ABC convention: extracted layout is `<dest>/<part_id>/<part_id>_*.<ext>`
-    where part_id is an 8-digit prefix. For the `feat` format we also
-    parse each YAML inline and attach feature counts so the GitHub
-    Actions upsert step (which has no EFS access) can populate
-    public.abc_features without re-reading the files.
+    where part_id is an 8-digit prefix.
+
+    For `feat`: the file walk itself stays on the main thread (cheap)
+    but YAML parsing is delegated to a ProcessPoolExecutor sized to the
+    available vCPUs. Feat YAMLs average ~3 MiB and a single libyaml
+    parse takes ~1-2s, so a sequential walk of a 7 168-part chunk
+    blocks for 2-4 hours; with 4 workers it drops to 30-45 minutes.
     """
     rows: list[dict] = []
     if not dest.exists():
         return rows
     parts_seen = 0
-    feat_parsed = 0
     walk_started = time.time()
+
+    # First pass: enumerate files and produce skeleton rows. Track which
+    # rows still need feat features so we can fill them in after parsing.
+    feat_paths: list[str] = []
+    feat_row_index: dict[str, int] = {}  # path -> index in `rows`
+
     for d in sorted(dest.iterdir()):
         if not d.is_dir():
             continue
@@ -232,15 +246,35 @@ def walk_extracted(dest: Path, fmt: str, cid: str) -> list[dict]:
                 "bytes": size,
                 "filename": f.name,
             }
-            if fmt == "feat" and f.name.endswith(".yml"):
-                feat = _parse_feat_yaml(f)
-                if feat is not None:
-                    row["features"] = feat
-                    feat_parsed += 1
             rows.append(row)
-        if parts_seen % 500 == 0:
-            log(f"    walked {parts_seen} parts (feat parsed={feat_parsed}, +{time.time()-walk_started:.1f}s)")
-    log(f"    walked total {parts_seen} parts (feat parsed={feat_parsed}) in {time.time()-walk_started:.1f}s")
+            if fmt == "feat" and f.name.endswith(".yml"):
+                feat_row_index[str(f)] = len(rows) - 1
+                feat_paths.append(str(f))
+        if parts_seen % 1000 == 0:
+            log(f"    enumerated {parts_seen} parts (+{time.time()-walk_started:.1f}s)")
+    log(f"    enumerated total {parts_seen} parts in {time.time()-walk_started:.1f}s")
+
+    if not feat_paths:
+        return rows
+
+    # Parallel feat YAML parsing.
+    workers = max(1, (os.cpu_count() or 2))
+    log(f"    parsing {len(feat_paths)} feat YAMLs across {workers} processes")
+    parse_started = time.time()
+    feat_parsed = 0
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for path, feat in pool.map(_parse_feat_yaml_str, feat_paths, chunksize=16):
+            if feat is not None:
+                rows[feat_row_index[path]]["features"] = feat
+                feat_parsed += 1
+            # Periodic progress log every ~500 parses.
+            done = feat_parsed if feat is not None else feat_parsed
+            # (cheap: print every 500 path receipts regardless of success)
+            if (feat_parsed and feat_parsed % 500 == 0):
+                elapsed = time.time() - parse_started
+                rate = feat_parsed / max(elapsed, 0.001)
+                log(f"    parsed {feat_parsed}/{len(feat_paths)} feat YAMLs (+{elapsed:.1f}s, {rate:.1f}/s)")
+    log(f"    parsed {feat_parsed}/{len(feat_paths)} feat YAMLs in {time.time()-parse_started:.1f}s")
     return rows
 
 
