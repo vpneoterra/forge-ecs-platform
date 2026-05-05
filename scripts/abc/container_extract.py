@@ -115,14 +115,38 @@ def s3_cp(src: str, dst: str) -> None:
     )
 
 
-def extract_7z(archive: Path, dest: Path) -> None:
+def extract_7z(archive: Path, dest: Path) -> set[str]:
+    """Extract `archive` into `dest`. Returns the set of part_id prefixes
+    (8-digit names) at the top level of the archive — used by the walker
+    to scope enumeration to *this* chunk's parts when `dest` is shared
+    across chunks (which it is on EFS)."""
     dest.mkdir(parents=True, exist_ok=True)
     cpu = os.cpu_count() or 2
+
+    # First: list the archive's top-level entries so we know which part_ids
+    # this chunk contains. 7zz `l -ba` emits one row per file/dir without
+    # banner; the trailing path token is what we care about.
+    list_proc = subprocess.run(
+        [str(SEVENZIP_BIN), "l", "-ba", "-slt", str(archive)],
+        check=True, capture_output=True, text=True,
+    )
+    part_ids: set[str] = set()
+    for line in list_proc.stdout.splitlines():
+        if not line.startswith("Path = "):
+            continue
+        path = line[len("Path = "):].strip()
+        # top-level part dir is the first 8-digit token in the path
+        first = path.split("/", 1)[0]
+        m = PART_RE.match(first)
+        if m:
+            part_ids.add(m.group(1))
+
     cmd = [str(SEVENZIP_BIN), "x", "-y", f"-mmt{cpu}", f"-o{dest}", str(archive)]
     log(f"  ↦ {' '.join(shlex.quote(c) for c in cmd)}")
     t0 = time.time()
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
-    log(f"  ↦ extracted in {time.time() - t0:.1f}s")
+    log(f"  ↦ extracted in {time.time() - t0:.1f}s ({len(part_ids)} part_ids)")
+    return part_ids
 
 
 PART_RE = re.compile(r"^(\d{8})")
@@ -284,11 +308,15 @@ def _parse_feat_yaml_str(path: str) -> tuple[str, dict | None]:
     return path, _parse_feat_yaml(path)
 
 
-def walk_extracted(dest: Path, fmt: str, cid: str) -> list[dict]:
+def walk_extracted(dest: Path, fmt: str, cid: str, part_ids: set[str] | None = None) -> list[dict]:
     """Enumerate (part_id, file) pairs under `dest`.
 
     ABC convention: extracted layout is `<dest>/<part_id>/<part_id>_*.<ext>`
     where part_id is an 8-digit prefix.
+
+    `dest` is shared across chunks on EFS, so we MUST scope to the
+    `part_ids` extracted from this chunk's archive — otherwise enumeration
+    grows O(cumulative chunks) and walker time blows up linearly.
 
     For `feat`: the file walk itself stays on the main thread (cheap)
     but each YAML is scanned line-by-line in a ProcessPoolExecutor
@@ -306,7 +334,14 @@ def walk_extracted(dest: Path, fmt: str, cid: str) -> list[dict]:
     feat_paths: list[str] = []
     feat_row_index: dict[str, int] = {}  # path -> index in `rows`
 
-    for d in sorted(dest.iterdir()):
+    if part_ids is not None:
+        # O(parts_in_this_chunk) — direct lookup, no full directory scan.
+        candidates = (dest / pid for pid in sorted(part_ids))
+    else:
+        # Fallback: full enumeration (only safe when `dest` is per-chunk).
+        candidates = sorted(dest.iterdir())
+
+    for d in candidates:
         if not d.is_dir():
             continue
         m = PART_RE.match(d.name)
@@ -397,10 +432,10 @@ def main() -> int:
             local = workdir / fname
             s3_cp(f"s3://{bucket}/{s3_key}", str(local))
             try:
-                extract_7z(local, dest)
+                part_ids = extract_7z(local, dest)
             finally:
                 local.unlink(missing_ok=True)
-            rows = walk_extracted(dest, fmt, cid)
+            rows = walk_extracted(dest, fmt, cid, part_ids=part_ids)
             log(f"  ↦ walked {len(rows)} files for {fmt} chunk {cid}")
             all_rows.extend(rows)
 
