@@ -30,8 +30,7 @@ jobs:
           SUBNET=$(aws cloudformation list-exports \
             --query "Exports[?Name=='ForgePublicSubnetIds-dev'].Value" --output text | cut -d',' -f1)
           # find a feat yml, head it, also list a few sibling files
-          BOOTSTRAP="set -euo pipefail; cd /data/datasets/abc/v00/feat/extracted; F=\$(find ./00000017 -name '*.yml' | head -1); echo FILE=\$F; echo '=== HEAD 80 ==='; head -80 \"\$F\"; echo '=== WC ==='; wc -l \"\$F\"; echo '=== count regex ^- type ==='; grep -cE '^- type:' \"\$F\" || true; echo '=== count regex ^  - type ==='; grep -cE '^  - type:' \"\$F\" || true; echo '=== count regex   - type any indent ==='; grep -cE '^[[:space:]]*- type:' \"\$F\" || true; echo '=== count any line with type: ==='; grep -cE 'type:' \"\$F\" || true; echo '=== count any line with sharp: ==='; grep -cE 'sharp:' \"\$F\" || true; echo '=== first 8 type lines with line numbers ==='; grep -nE 'type:' \"\$F\" | head -8; echo '=== unique-after-trim line prefixes histogram ==='; awk '{ match(\$0, /^[[:space:]]*/); p=substr(\$0,1,RLENGTH+2); print p }' \"\$F\" | sort | uniq -c | sort -nr | head -10"
-
+          BOOTSTRAP="set -euo pipefail; cd /data/datasets/abc/v00/feat/extracted; FIRST=\$(find . -maxdepth 3 -name '*.yml' | head -1); echo \"FIRST=\$FIRST\"; echo '=== HEAD 80 ==='; head -80 \"\$FIRST\"; echo '=== TAIL 40 ==='; tail -40 \"\$FIRST\"; echo '=== WC ==='; wc -l \"\$FIRST\"; echo '=== NEIGHBOURS ==='; ls \$(dirname \$FIRST)"
           OVERRIDES=$(jq -nc --arg cmd "$BOOTSTRAP" '{
             cpu:"1024", memory:"2048",
             containerOverrides:[{name:"downloader", cpu:1024, memory:2048,

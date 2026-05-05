@@ -144,66 +144,93 @@ SURFACE_TYPE_COLS = {
 def _parse_feat_yaml(path: Path | str) -> dict | None:
     """Streaming line-based feat YAML scanner.
 
-    feat YAML structure (per ABC docs):
-      surfaces:
-        - type: Plane | Cylinder | Cone | Sphere | Torus |
-                Revolution | Extrusion | BSpline | Other
-          vert_indices: [ ... thousands of ints ... ]
-          vert_parameters: [ ... thousands of floats ... ]
-          face_indices:  [ ... ]
+    Real ABC feat YAML (pyyaml flow-dump output, observed on EFS):
       curves:
-        - sharp: true | false
-          vert_indices: [ ... ]
+      - direction: [1.0, 0.0, 0.0]
+        location: [266.7, 285.75, 0.0]
+        sharp: true
+        type: Line
+        vert_indices: [0, 512, 513, ...,
+          525, 526, 527, ...]   # flow style, multi-line continuation
+        vert_parameters: [-19.05, -18.51, ...,
+          ...]
+      - direction: [...]
+        ...
+      surfaces:
+      - type: Plane | Cylinder | Cone | Sphere | Torus | Revolution
+              | Extrusion | BSpline | Other
+        ...
+      - type: BSpline
+        poles:        # block-style nested sequence — each '- [..]' line
+        - [x, y, z]   # is NOT a new surface!
+        - [x, y, z]
+        knots:
+        - 0.0
+        - 0.5
 
-    We never load the full YAML object tree (those nested arrays balloon
-    pyyaml's internal state past hundreds of MB per file and OOM-killed
-    the parallel pool on 8 GiB Fargate tasks). Instead we read line-by-
-    line and only count `type:` / `sharp:` keys at the surface level of
-    each list item. Inline arrays use YAML flow style `[...]` and never
-    contain `type:` / `sharp:` tokens at the start of a stripped line,
-    so this is safe for the ABC schema.
-    Returns None on read failure.
+    The parser must be indent-aware: only `- ` items at the indent
+    column of the section's list items are counted as new surfaces /
+    curves. We never load the full object tree (heavy nested arrays
+    OOM'd pyyaml). Returns None on read failure.
     """
     counts: dict[str, int] = defaultdict(int)
     n_faces = 0
     n_edges = 0
     n_sharp = 0
     section: str | None = None  # 'surfaces' | 'curves' | None
+    item_indent = -1  # column at which top-level list items live
     in_item = False
     item_is_sharp = False
     try:
         with open(path, "rt", encoding="utf-8", errors="replace") as f:
             for raw in f:
                 line = raw.rstrip("\n")
-                if not line.strip():
+                stripped = line.strip()
+                if not stripped:
                     continue
+                # Compute leading-space indent.
+                indent = len(line) - len(line.lstrip(" "))
                 # Section headers at column 0.
-                if line.startswith("surfaces:"):
-                    section = "surfaces"
-                    in_item = False
-                    continue
-                if line.startswith("curves:"):
+                if indent == 0 and line.startswith("surfaces:"):
                     if in_item and section == "curves" and item_is_sharp:
                         n_sharp += 1
-                    section = "curves"
+                    section = "surfaces"
+                    item_indent = -1  # set on first '- ' encountered
                     in_item = False
                     item_is_sharp = False
                     continue
-                # Top-level non-section key — leave any open section.
-                if line and not line[0].isspace() and line.endswith(":"):
-                    section = None
+                if indent == 0 and line.startswith("curves:"):
+                    if in_item and section == "curves" and item_is_sharp:
+                        n_sharp += 1
+                    section = "curves"
+                    item_indent = -1
                     in_item = False
+                    item_is_sharp = False
                     continue
-                stripped = line.strip()
-                if stripped.startswith("- "):
-                    # New list item starts. Flush curve sharp flag.
+                # Other top-level key — leave the section.
+                if indent == 0 and section is not None and stripped.endswith(":") and not stripped.startswith("- "):
+                    if in_item and section == "curves" and item_is_sharp:
+                        n_sharp += 1
+                    section = None
+                    item_indent = -1
+                    in_item = False
+                    item_is_sharp = False
+                    continue
+                if section is None:
+                    continue
+                # Inside surfaces or curves.
+                is_dash_item = stripped.startswith("- ")
+                if is_dash_item and (item_indent < 0 or indent == item_indent):
+                    # New top-level item in this section.
+                    if item_indent < 0:
+                        item_indent = indent
                     if in_item and section == "curves" and item_is_sharp:
                         n_sharp += 1
                     in_item = True
                     item_is_sharp = False
                     if section == "surfaces":
                         n_faces += 1
-                    elif section == "curves":
+                    else:
                         n_edges += 1
                     rest = stripped[2:].strip()
                     if rest.startswith("type:"):
@@ -215,15 +242,22 @@ def _parse_feat_yaml(path: Path | str) -> dict | None:
                         v = rest.split(":", 1)[1].strip().lower()
                         if v in ("true", "1", "yes"):
                             item_is_sharp = True
-                elif in_item:
-                    if section == "surfaces" and stripped.startswith("type:"):
-                        t = stripped.split(":", 1)[1].strip()
-                        col = SURFACE_TYPE_COLS.get(t, "n_other")
-                        counts[col] += 1
-                    elif section == "curves" and stripped.startswith(("sharp:", "is_sharp:")):
-                        v = stripped.split(":", 1)[1].strip().lower()
-                        if v in ("true", "1", "yes"):
-                            item_is_sharp = True
+                elif in_item and indent > item_indent:
+                    # Continuation of current item: only look for type:/sharp:
+                    # at the field-indent column (item_indent + 2). Deeper
+                    # block-style nested sequences (poles, knots, etc.) are
+                    # ignored.
+                    if indent == item_indent + 2:
+                        if section == "surfaces" and stripped.startswith("type:"):
+                            t = stripped.split(":", 1)[1].strip()
+                            col = SURFACE_TYPE_COLS.get(t, "n_other")
+                            counts[col] += 1
+                        elif section == "curves" and stripped.startswith(("sharp:", "is_sharp:")):
+                            v = stripped.split(":", 1)[1].strip().lower()
+                            if v in ("true", "1", "yes"):
+                                item_is_sharp = True
+                # Continuation lines of flow arrays (start with digit, '-',
+                # bracket, or quote) at deeper indent are ignored.
         # Flush trailing curve.
         if in_item and section == "curves" and item_is_sharp:
             n_sharp += 1
