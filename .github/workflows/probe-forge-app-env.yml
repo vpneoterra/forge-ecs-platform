@@ -28,9 +28,21 @@ jobs:
           echo "Live TD: $LIVE_TD"
           echo '--- container names ---'
           aws ecs describe-task-definition --task-definition "$LIVE_TD" --query 'taskDefinition.containerDefinitions[].name' --output json
-          echo '--- ALL env on live TD primary container ---'
+          echo '--- ALL env (names only) on live TD ---'
           aws ecs describe-task-definition --task-definition "$LIVE_TD" \
-            --query 'taskDefinition.containerDefinitions[0].{name:name,env:environment[?name==`MAESTRO_ENABLED` || name==`CONDUCTOR_ENABLED` || name==`CONDUCTOR_SHADOW_MODE` || name==`IMAGE_TAG` || name==`ANTHROPIC_API_KEY`].{n:name,v:value}}' --output json
+            --query 'taskDefinition.containerDefinitions[0].environment[].name' --output json
+          echo '--- ALL secrets (names + valueFrom) on live TD ---'
+          aws ecs describe-task-definition --task-definition "$LIVE_TD" \
+            --query 'taskDefinition.containerDefinitions[0].secrets[].{n:name,v:valueFrom}' --output json
+          echo '--- compare TD 1056 vs 1057 secret/env names diff ---'
+          aws ecs describe-task-definition --task-definition forge-app-test:1056 --query 'taskDefinition.containerDefinitions[0].environment[].name' --output text | tr '\t' '\n' | sort > /tmp/env_1056
+          aws ecs describe-task-definition --task-definition forge-app-test:1057 --query 'taskDefinition.containerDefinitions[0].environment[].name' --output text | tr '\t' '\n' | sort > /tmp/env_1057
+          echo 'env-only-in-1056:'; comm -23 /tmp/env_1056 /tmp/env_1057
+          echo 'env-only-in-1057:'; comm -13 /tmp/env_1056 /tmp/env_1057
+          aws ecs describe-task-definition --task-definition forge-app-test:1056 --query 'taskDefinition.containerDefinitions[0].secrets[].name' --output text | tr '\t' '\n' | sort > /tmp/sec_1056
+          aws ecs describe-task-definition --task-definition forge-app-test:1057 --query 'taskDefinition.containerDefinitions[0].secrets[].name' --output text | tr '\t' '\n' | sort > /tmp/sec_1057
+          echo 'secrets-only-in-1056:'; comm -23 /tmp/sec_1056 /tmp/sec_1057
+          echo 'secrets-only-in-1057:'; comm -13 /tmp/sec_1056 /tmp/sec_1057
       - name: Dump env across requested revisions
         run: |
           set -e
