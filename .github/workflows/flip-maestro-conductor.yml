@@ -1,13 +1,20 @@
-name: "Flip MAESTRO_ENABLED / CONDUCTOR_ENABLED"
+name: "Flip MAESTRO_ENABLED / CONDUCTOR_ENABLED / CONDUCTOR_SHADOW_MODE"
 # ================================================================
-# flip-maestro-conductor.yml — Flip two env vars on forge-app-test
+# flip-maestro-conductor.yml — Flip three env vars on forge-app-test
 # and force a new deployment.
 #
 # Modeled on patch-dks-ingest-td.yml — registers a new task-def
-# revision via the AWS ECS API (CDK env block does not declare
-# MAESTRO_ENABLED / CONDUCTOR_ENABLED, so this is the intended
-# "runtime flip" pattern, consistent with the GEMMA_ENABLED comment
-# in lib/forge-app-stack.ts.
+# revision via the AWS ECS API. CDK env blocks are NOT read at
+# runtime by deploy-app.yml (the merge-from-.aws/task-definition-test.json
+# branch silently no-ops because that file lives in forgenew, not
+# forge-ecs-platform), so this workflow is the only reliable runtime
+# flip path for these vars.
+#
+# 2026-05-05: extended with CONDUCTOR_SHADOW_MODE to complete the
+# Phase 4 cutover that was missed when CONDUCTOR_ENABLED was flipped
+# on 2026-04-22. Code default in server/axiom/conductor.js is TRUE
+# (`SHADOW_MODE = process.env.CONDUCTOR_SHADOW_MODE !== 'false'`),
+# so prod ran in shadow for 13+ days before this var was added here.
 #
 # Safe + idempotent: re-running with the same inputs produces the
 # same env block. Rollback is printed at the end.
@@ -26,6 +33,12 @@ on:
         description: "CONDUCTOR_ENABLED value"
         required: true
         default: "true"
+        type: choice
+        options: ["true", "false"]
+      conductor_shadow_mode:
+        description: "CONDUCTOR_SHADOW_MODE value (false = Phase 4 active)"
+        required: true
+        default: "false"
         type: choice
         options: ["true", "false"]
 
@@ -65,14 +78,16 @@ jobs:
         env:
           MAESTRO_ENABLED: ${{ github.event.inputs.maestro_enabled }}
           CONDUCTOR_ENABLED: ${{ github.event.inputs.conductor_enabled }}
+          CONDUCTOR_SHADOW_MODE: ${{ github.event.inputs.conductor_shadow_mode }}
         run: |
-          jq --arg M "$MAESTRO_ENABLED" --arg C "$CONDUCTOR_ENABLED" '
+          jq --arg M "$MAESTRO_ENABLED" --arg C "$CONDUCTOR_ENABLED" --arg S "$CONDUCTOR_SHADOW_MODE" '
             .containerDefinitions |= (map(
               if .name == "forge-app" then
                 .environment |= (
-                  (map(select(.name != "MAESTRO_ENABLED" and .name != "CONDUCTOR_ENABLED")))
+                  (map(select(.name != "MAESTRO_ENABLED" and .name != "CONDUCTOR_ENABLED" and .name != "CONDUCTOR_SHADOW_MODE")))
                   + [{"name":"MAESTRO_ENABLED","value":$M},
-                     {"name":"CONDUCTOR_ENABLED","value":$C}]
+                     {"name":"CONDUCTOR_ENABLED","value":$C},
+                     {"name":"CONDUCTOR_SHADOW_MODE","value":$S}]
                 )
               else . end
             ))
@@ -81,7 +96,7 @@ jobs:
           ' /tmp/taskdef.json > /tmp/taskdef-new.json
           echo "Patched forge-app env (preview):"
           jq '.containerDefinitions[] | select(.name=="forge-app") | .environment
-              | map(select(.name=="MAESTRO_ENABLED" or .name=="CONDUCTOR_ENABLED"))' \
+              | map(select(.name=="MAESTRO_ENABLED" or .name=="CONDUCTOR_ENABLED" or .name=="CONDUCTOR_SHADOW_MODE"))' \
               /tmp/taskdef-new.json
 
       # 3. Register new revision
