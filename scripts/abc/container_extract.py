@@ -31,12 +31,6 @@ from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
-import yaml
-try:
-    from yaml import CSafeLoader as _SafeLoader  # libyaml C ext, ~10x faster
-except ImportError:
-    from yaml import SafeLoader as _SafeLoader  # pure-python fallback
-
 # Pinned 7-Zip version. Static linux-x64 binary, ~1.8 MiB compressed.
 SEVENZIP_VERSION = "26.01"
 SEVENZIP_URL = (
@@ -148,40 +142,96 @@ SURFACE_TYPE_COLS = {
 
 
 def _parse_feat_yaml(path: Path | str) -> dict | None:
-    """Parse an ABC feat YAML using pyyaml.
+    """Streaming line-based feat YAML scanner.
 
     feat YAML structure (per ABC docs):
       surfaces:
         - type: Plane | Cylinder | Cone | Sphere | Torus |
                 Revolution | Extrusion | BSpline | Other
-          ... (vert_indices, vert_parameters, face_indices, etc.)
+          vert_indices: [ ... thousands of ints ... ]
+          vert_parameters: [ ... thousands of floats ... ]
+          face_indices:  [ ... ]
       curves:
         - sharp: true | false
-          ...
-    pyyaml correctly handles nested arrays (vert_indices etc.) that
-    confuse line-based scanners. Returns None on parse / IO failure.
+          vert_indices: [ ... ]
+
+    We never load the full YAML object tree (those nested arrays balloon
+    pyyaml's internal state past hundreds of MB per file and OOM-killed
+    the parallel pool on 8 GiB Fargate tasks). Instead we read line-by-
+    line and only count `type:` / `sharp:` keys at the surface level of
+    each list item. Inline arrays use YAML flow style `[...]` and never
+    contain `type:` / `sharp:` tokens at the start of a stripped line,
+    so this is safe for the ABC schema.
+    Returns None on read failure.
     """
-    try:
-        with open(path, "rb") as f:
-            data = yaml.load(f, Loader=_SafeLoader) or {}
-    except (OSError, yaml.YAMLError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    surfaces = data.get("surfaces") or []
-    curves = data.get("curves") or []
     counts: dict[str, int] = defaultdict(int)
-    for s in surfaces:
-        t = (s.get("type") or "Other") if isinstance(s, dict) else "Other"
-        col = SURFACE_TYPE_COLS.get(t, "n_other")
-        counts[col] += 1
+    n_faces = 0
+    n_edges = 0
     n_sharp = 0
-    for c in curves:
-        if isinstance(c, dict) and (c.get("sharp") or c.get("is_sharp")):
+    section: str | None = None  # 'surfaces' | 'curves' | None
+    in_item = False
+    item_is_sharp = False
+    try:
+        with open(path, "rt", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                if not line.strip():
+                    continue
+                # Section headers at column 0.
+                if line.startswith("surfaces:"):
+                    section = "surfaces"
+                    in_item = False
+                    continue
+                if line.startswith("curves:"):
+                    if in_item and section == "curves" and item_is_sharp:
+                        n_sharp += 1
+                    section = "curves"
+                    in_item = False
+                    item_is_sharp = False
+                    continue
+                # Top-level non-section key — leave any open section.
+                if line and not line[0].isspace() and line.endswith(":"):
+                    section = None
+                    in_item = False
+                    continue
+                stripped = line.strip()
+                if stripped.startswith("- "):
+                    # New list item starts. Flush curve sharp flag.
+                    if in_item and section == "curves" and item_is_sharp:
+                        n_sharp += 1
+                    in_item = True
+                    item_is_sharp = False
+                    if section == "surfaces":
+                        n_faces += 1
+                    elif section == "curves":
+                        n_edges += 1
+                    rest = stripped[2:].strip()
+                    if rest.startswith("type:"):
+                        t = rest.split(":", 1)[1].strip()
+                        if section == "surfaces":
+                            col = SURFACE_TYPE_COLS.get(t, "n_other")
+                            counts[col] += 1
+                    elif rest.startswith(("sharp:", "is_sharp:")):
+                        v = rest.split(":", 1)[1].strip().lower()
+                        if v in ("true", "1", "yes"):
+                            item_is_sharp = True
+                elif in_item:
+                    if section == "surfaces" and stripped.startswith("type:"):
+                        t = stripped.split(":", 1)[1].strip()
+                        col = SURFACE_TYPE_COLS.get(t, "n_other")
+                        counts[col] += 1
+                    elif section == "curves" and stripped.startswith(("sharp:", "is_sharp:")):
+                        v = stripped.split(":", 1)[1].strip().lower()
+                        if v in ("true", "1", "yes"):
+                            item_is_sharp = True
+        # Flush trailing curve.
+        if in_item and section == "curves" and item_is_sharp:
             n_sharp += 1
+    except OSError:
+        return None
     return {
-        "n_faces":      len(surfaces),
-        "n_edges":      len(curves),
+        "n_faces":      n_faces,
+        "n_edges":      n_edges,
         "n_planar":     counts.get("n_planar", 0),
         "n_cylinder":   counts.get("n_cylinder", 0),
         "n_cone":       counts.get("n_cone", 0),
@@ -207,10 +257,9 @@ def walk_extracted(dest: Path, fmt: str, cid: str) -> list[dict]:
     where part_id is an 8-digit prefix.
 
     For `feat`: the file walk itself stays on the main thread (cheap)
-    but YAML parsing is delegated to a ProcessPoolExecutor sized to the
-    available vCPUs. Feat YAMLs average ~3 MiB and a single libyaml
-    parse takes ~1-2s, so a sequential walk of a 7 168-part chunk
-    blocks for 2-4 hours; with 4 workers it drops to 30-45 minutes.
+    but each YAML is scanned line-by-line in a ProcessPoolExecutor
+    sized to the available vCPUs. The scanner is O(file_size) in time
+    and O(1) in memory, so 4 workers comfortably fit in an 8 GiB task.
     """
     rows: list[dict] = []
     if not dest.exists():
@@ -262,18 +311,18 @@ def walk_extracted(dest: Path, fmt: str, cid: str) -> list[dict]:
     log(f"    parsing {len(feat_paths)} feat YAMLs across {workers} processes")
     parse_started = time.time()
     feat_parsed = 0
+    seen = 0
     with ProcessPoolExecutor(max_workers=workers) as pool:
         for path, feat in pool.map(_parse_feat_yaml_str, feat_paths, chunksize=16):
+            seen += 1
             if feat is not None:
                 rows[feat_row_index[path]]["features"] = feat
                 feat_parsed += 1
-            # Periodic progress log every ~500 parses.
-            done = feat_parsed if feat is not None else feat_parsed
-            # (cheap: print every 500 path receipts regardless of success)
-            if (feat_parsed and feat_parsed % 500 == 0):
+            # Periodic progress log every ~500 receipts.
+            if seen % 500 == 0:
                 elapsed = time.time() - parse_started
-                rate = feat_parsed / max(elapsed, 0.001)
-                log(f"    parsed {feat_parsed}/{len(feat_paths)} feat YAMLs (+{elapsed:.1f}s, {rate:.1f}/s)")
+                rate = seen / max(elapsed, 0.001)
+                log(f"    parsed {seen}/{len(feat_paths)} feat YAMLs (+{elapsed:.1f}s, {rate:.1f}/s)")
     log(f"    parsed {feat_parsed}/{len(feat_paths)} feat YAMLs in {time.time()-parse_started:.1f}s")
     return rows
 
