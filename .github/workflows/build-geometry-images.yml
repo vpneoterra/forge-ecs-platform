@@ -7,6 +7,13 @@ on:
         description: 'Specific image to build (leave empty for all)'
         required: false
         default: ''
+      source_ref:
+        # PRE-MERGE TESTING ONLY: build from a feature branch of the source repo
+        # (e.g. forgenew) before that branch is merged to main. Leave empty to
+        # use the source repo's default branch (the normal case).
+        description: 'Source repo ref (branch/tag/SHA). Empty = default branch.'
+        required: false
+        default: ''
   schedule:
     # Weekly Wednesday 6am UTC — refresh geometry base images
     - cron: '0 6 * * 3'
@@ -49,6 +56,13 @@ jobs:
             platforms: linux/amd64
             ecr_name: forge-neural-sdf
 
+          - name: forge-picogk
+            repo: forge-picogk
+            source_repo: forgenew
+            dockerfile: docker/picogk/Dockerfile
+            platforms: linux/amd64
+            ecr_name: forge-picogk
+
     steps:
       - name: Check if this image should build
         id: filter
@@ -85,6 +99,7 @@ jobs:
         if: steps.filter.outputs.should_build == 'true'
         with:
           repository: vpneoterra/${{ matrix.image.source_repo }}
+          ref: ${{ github.event.inputs.source_ref }}
           token: ${{ secrets.GH_PAT }}
           path: image-source
 

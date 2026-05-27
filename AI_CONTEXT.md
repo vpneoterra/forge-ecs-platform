@@ -101,8 +101,9 @@ mixedInstancesPolicy: {
 
 ## Geometry Platform
 
-Five capabilities, double-gated (service desiredCount + feature flag env var).
-All deploy OFF. Operator activates per runbook.
+Seven capabilities, double-gated (service desiredCount + feature flag env var).
+Most deploy OFF; PicoGK deploys ON (replaces the off-cluster Hetzner endpoint).
+Operator activates the rest per runbook.
 
 | # | Capability | Container | Flag | Status |
 |---|-----------|-----------|------|--------|
@@ -111,6 +112,8 @@ All deploy OFF. Operator activates per runbook.
 | 3 | Neural SDF Engine | forge-neural-sdf (:5100) EC2 GPU | NEURAL_SDF_ENABLED | Dormant (task def only) |
 | 4 | Visual ASG Editor | None (client-side JS) | ASG_EDITOR_ENABLED | Ready to activate |
 | 5 | Field-Driven TPMS | None (uses FluxTK) | FIELD_DRIVEN_ENABLED | Ready to activate |
+| 6 | FluxTK / BRAIDE Solver | forge-fluxtk (:8040) Fargate | FLUXTK_ENABLED | Ready to activate |
+| 7 | PicoGK Voxel Engine | forge-picogk (:8015) Fargate | PICOGK_ENABLED | Activates on deploy (replaces Hetzner) |
 
 Activation: `aws ecs update-service --cluster forge-geometry-{env} --service forge-brep --desired-count 1`
 then set `BREP_ENGINE_ENABLED=true` in forge-app env and restart.
