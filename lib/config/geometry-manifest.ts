@@ -248,9 +248,45 @@ export const CAP_FLUXTK: GeometryCapability = {
   phase: 2,  // Same phase as Field-Driven TPMS — FluxTK is a dependency for Cap 5
 };
 
+// ─── Capability 7: PicoGK Voxel Geometry Engine ─────────────────────────────
+export const CAP_PICOGK: GeometryCapability = {
+  id: 'picogk',
+  name: 'PicoGK Voxel Geometry Engine',
+  featureFlag: 'PICOGK_ENABLED',
+  defaultFlagValue: 'true',
+  requiresContainer: true,
+  requiresGpu: false,
+  taskName: 'forge-picogk',
+  ecrRepo: 'forge-picogk',
+  port: 8015,
+  healthCheckPath: '/health',
+  cpu: 2048,
+  memory: 4096,
+  activateOnDeploy: true,
+  endpointEnvVar: 'PICOGK_API_URL',
+  defaultEndpoint: 'http://forge-picogk.forge-geometry.local:8015',
+  appEnvVars: {
+    PICOGK_ENABLED: 'true',
+    PICOGK_API_URL: 'http://forge-picogk.forge-geometry.local:8015',
+  },
+  containerEnvVars: {
+    SERVICE_MODE: 'picogk',
+    LOG_LEVEL: 'INFO',
+    FORGE_PORT: '8015',
+    FORGE_TIMEOUT: '600',
+    PICOGK_VOXEL_SIZE: '0.2',
+  },
+  costDescription:
+    '~$0.10/hr active (Fargate 2vCPU/4GB Spot), ~$10/month always-on.',
+  description:
+    'PicoGK 2.1.0 voxel geometry kernel (lattices, booleans, TPMS, scientific implicits). .NET 9 + self-compiled picogk.26.1 native runtime + OpenVDB. Replaces the legacy Python shim and the off-cluster Hetzner endpoint.',
+  cloudMapName: 'forge-picogk',
+  phase: 1,
+};
+
 // ─── Aggregates ─────────────────────────────────────────────────────────────
 
-/** All six geometry capabilities */
+/** All seven geometry capabilities */
 export const GEOMETRY_CAPABILITIES: GeometryCapability[] = [
   CAP_BREP,
   CAP_GPU_SDF,
@@ -258,6 +294,7 @@ export const GEOMETRY_CAPABILITIES: GeometryCapability[] = [
   CAP_ASG_EDITOR,
   CAP_FIELD_TPMS,
   CAP_FLUXTK,
+  CAP_PICOGK,
 ];
 
 /** Capabilities that require an ECS container */

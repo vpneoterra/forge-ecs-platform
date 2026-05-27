@@ -43,6 +43,7 @@ import * as efs from 'aws-cdk-lib/aws-efs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Construct } from 'constructs';
 import { importSecretByName, ecsSecretByName } from './secret-lookup';
+import { CAP_PICOGK } from './config/geometry-manifest';
 
 export interface ForgeAppStackProps extends cdk.StackProps {
   forgeEnv: string;
@@ -287,7 +288,7 @@ export class ForgeAppStack extends cdk.Stack {
         // to toggle between write / shadow / off without a CDK deploy.
         CHORUS_FORGE_MODE: 'write',
         COMPUTE_HOST: '89.167.79.141',
-        PICOGK_API_URL: 'http://89.167.79.141:8015',
+        ...CAP_PICOGK.appEnvVars,
         SYSML_API_URL: 'http://89.167.79.141:8003',
         HETZNER_COMPUTE_URL: 'http://89.167.79.141:8001',
         LUCID_URL: 'https://api-lucid.qrucible.ai',

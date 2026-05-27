@@ -37,6 +37,7 @@ import {
   GeometryCapability,
   CAP_BREP,
   CAP_FLUXTK,
+  CAP_PICOGK,
   CAP_GPU_SDF,
   CAP_NEURAL_SDF,
 } from './config/geometry-manifest';
@@ -168,6 +169,16 @@ export class ForgeGeometryStack extends cdk.Stack {
       dnsNamespace,
     );
 
+    // ── Capability 7: PicoGK Voxel Geometry Engine (Fargate, CPU-only) ───────
+    this.createFargateService(
+      CAP_PICOGK,
+      props,
+      taskExecutionRole,
+      taskRole,
+      logGroups.get(CAP_PICOGK.id)!,
+      dnsNamespace,
+    );
+
     // ── Capability 2: GPU SDF Engine (EC2 GPU, desiredCount=0) ────────────────
     this.createGpuTaskDefinition(
       CAP_GPU_SDF,
@@ -207,6 +218,7 @@ export class ForgeGeometryStack extends cdk.Stack {
         'GEOMETRY PLATFORM — All capabilities deployed OFF.',
         'Cap 1 (B-Rep):        aws ecs update-service --cluster forge-geometry-' + props.forgeEnv + ' --service forge-brep --desired-count 1',
         'Cap 6 (FluxTK):       aws ecs update-service --cluster forge-geometry-' + props.forgeEnv + ' --service forge-fluxtk --desired-count 1',
+        'Cap PicoGK:           aws ecs update-service --cluster forge-geometry-' + props.forgeEnv + ' --service forge-picogk --desired-count 1',
         'Cap 2 (GPU SDF):      Task definition ready. Create EC2 GPU service when needed.',
         'Cap 3 (Neural SDF):   Task definition ready. Create EC2 GPU service when needed.',
         'Cap 4 (ASG Editor):   Set ASG_EDITOR_ENABLED=true in forge-app env.',
