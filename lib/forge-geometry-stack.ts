@@ -280,12 +280,14 @@ export class ForgeGeometryStack extends cdk.Stack {
 
     this.taskDefinitions.set(cap.id, td);
 
-    // Service starts with desiredCount=0 (dormant). Operator scales to 1 when activating.
+    // Capability manifest controls initial activation:
+    //   activateOnDeploy=false → desiredCount=0 (dormant; operator scales to 1 later)
+    //   activateOnDeploy=true  → desiredCount=1 (hot on deploy)
     const service = new ecs.FargateService(this, `Svc${cap.id.replace(/-/g, '')}`, {
       cluster: this.geometryCluster,
       taskDefinition: td,
       serviceName: cap.taskName!,
-      desiredCount: 0, // DORMANT — scale to 1 when activating Cap 1
+      desiredCount: cap.activateOnDeploy ? 1 : 0,
       assignPublicIp: false,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [props.ecsSecurityGroup],
