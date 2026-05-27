@@ -264,7 +264,7 @@ export const CAP_PICOGK: GeometryCapability = {
   healthCheckPath: '/health',
   cpu: 2048,
   memory: 4096,
-  activateOnDeploy: false, // TEMP: flip back to true after ECR+image populated
+  activateOnDeploy: true,
   endpointEnvVar: 'PICOGK_API_URL',
   defaultEndpoint: 'http://forge-picogk.forge-geometry.local:8015',
   appEnvVars: {
