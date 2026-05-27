@@ -125,7 +125,8 @@ export const CAP_GPU_SDF: GeometryCapability = {
   containerEnvVars: {
     SERVICE_MODE: 'sdf-gpu',
     LOG_LEVEL: 'INFO',
-    NVIDIA_VISIBLE_DEVICES: 'all',
+    // NVIDIA_VISIBLE_DEVICES is set automatically by ECS for containers with GPU
+    // resource requirements; specifying it manually is rejected by the API.
     NVIDIA_DRIVER_CAPABILITIES: 'compute,utility',
   },
   costDescription: '~$0.30/hr Spot (g5.xlarge A10G), ~$1.01/hr on-demand. $0 when dormant.',
@@ -160,7 +161,8 @@ export const CAP_NEURAL_SDF: GeometryCapability = {
   containerEnvVars: {
     SERVICE_MODE: 'neural-sdf',
     LOG_LEVEL: 'INFO',
-    NVIDIA_VISIBLE_DEVICES: 'all',
+    // NVIDIA_VISIBLE_DEVICES is set automatically by ECS for containers with GPU
+    // resource requirements; specifying it manually is rejected by the API.
     NVIDIA_DRIVER_CAPABILITIES: 'compute,utility',
     DEEPSDF_LATENT_DIM: '256',
   },
