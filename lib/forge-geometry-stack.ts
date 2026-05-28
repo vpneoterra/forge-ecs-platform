@@ -28,6 +28,9 @@ import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cwActions from 'aws-cdk-lib/aws-cloudwatch-actions';
+import * as sns from 'aws-cdk-lib/aws-sns';
 import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
 import { Construct } from 'constructs';
 import {
@@ -60,6 +63,8 @@ export class ForgeGeometryStack extends cdk.Stack {
   public readonly services: Map<string, ecs.BaseService>;
   /** The Fargate cluster for CPU geometry services */
   public readonly geometryCluster: ecs.Cluster;
+  /** SNS topic for geometry-platform CloudWatch alarms */
+  public readonly alarmTopic: sns.Topic;
 
   constructor(scope: Construct, id: string, props: ForgeGeometryStackProps) {
     super(scope, id, props);
@@ -104,9 +109,14 @@ export class ForgeGeometryStack extends cdk.Stack {
         imageScanOnPush: true,
         imageTagMutability: ecr.TagMutability.MUTABLE,
         removalPolicy: cdk.RemovalPolicy.RETAIN,
+        // NOTE: 30-day untagged retention. The task definition references images by
+        // floating ':latest' tag (NOT digest-pinned at synth time), so untagged manifests
+        // that get orphaned by a CI overwrite still need to live long enough that an
+        // active ECS task never has its underlying digest GC'd from under it. 7 days
+        // proved too aggressive in prod (see FluxTK 2026-05-24 outage).
         lifecycleRules: [
-          { description: 'Remove untagged after 7d', tagStatus: ecr.TagStatus.UNTAGGED, maxImageAge: cdk.Duration.days(7) },
-          { description: 'Keep last 5', maxImageCount: 5 },
+          { description: 'Remove untagged after 30d', tagStatus: ecr.TagStatus.UNTAGGED, maxImageAge: cdk.Duration.days(30) },
+          { description: 'Keep last 10 tagged', tagStatus: ecr.TagStatus.TAGGED, tagPatternList: ['*'], maxImageCount: 10 },
         ],
       });
       this.ecrRepos.set(cap.id, repo);
@@ -197,6 +207,32 @@ export class ForgeGeometryStack extends cdk.Stack {
       logGroups.get(CAP_NEURAL_SDF.id)!,
     );
 
+    // ── SNS alarm topic for the geometry platform ────────────────────────────
+    // Subscribers can be added out-of-band (operator email / PagerDuty / Slack webhook)
+    // via the AWS console or a separate stack — we only own the topic here.
+    this.alarmTopic = new sns.Topic(this, 'GeometryAlarmTopic', {
+      topicName: `forge-geometry-alarms-${props.forgeEnv}`,
+      displayName: `FORGE Geometry Platform Alarms (${props.forgeEnv})`,
+    });
+    new cdk.CfnOutput(this, 'GeometryAlarmTopicArn', {
+      value: this.alarmTopic.topicArn,
+      description: 'SNS topic ARN for geometry-platform CloudWatch alarms',
+      exportName: `ForgeGeometryAlarmTopic-${props.forgeEnv}`,
+    });
+
+    // ── CloudWatch alarms per Fargate service ────────────────────────────────
+    // Two alarms per service catch the FluxTK 2026-05-24 failure mode:
+    //   1. RunningTaskCount<1 for 5 min  — service desired but ECS can't place a task
+    //      (e.g. image pull failure from a GC'd digest, exhausted capacity, ENI limits).
+    //   2. Log-group IncomingBytes<1024 for 30 min — task is up but emitting nothing
+    //      (silent crash, deadlock, or zombie process).
+    for (const cap of CPU_CAPABILITIES) {
+      const service = this.services.get(cap.id);
+      if (!service) continue;
+      const logGroup = logGroups.get(cap.id)!;
+      this.createServiceHealthAlarms(cap.id, cap.taskName!, service, logGroup);
+    }
+
     // ── Outputs ───────────────────────────────────────────────────────────────
     new cdk.CfnOutput(this, 'GeometryClusterName', {
       value: this.geometryCluster.clusterName,
@@ -253,8 +289,22 @@ export class ForgeGeometryStack extends cdk.Stack {
 
     const repo = this.ecrRepos.get(cap.id)!;
 
+    // IMPORTANT: use fromRegistry with an explicit string URL instead of
+    // fromEcrRepository(repo, 'latest'). The L2 helper resolves ':latest' to
+    // an immutable '@sha256:<digest>' at CDK synth time and bakes it into the
+    // CFN template, so when CI overwrites ':latest' the task-def still pulls
+    // the old digest — which is then orphaned and eventually GC'd by ECR
+    // lifecycle, leaving the service unable to pull any image. With the
+    // string form, the task-def stores a literal floating tag and ECS pulls
+    // whichever digest ':latest' resolves to at task start. The execution
+    // role already grants the required ecr:GetAuthorizationToken /
+    // BatchGetImage permissions via AmazonECSTaskExecutionRolePolicy.
+    const imageUri = `${this.account}.dkr.ecr.${this.region}.amazonaws.com/${cap.ecrRepo}:latest`;
+    // Preserve CFN ordering: the task-def must come after the ECR repo construct.
+    td.node.addDependency(repo);
+
     const container = td.addContainer(`${cap.taskName}-container`, {
-      image: ecs.ContainerImage.fromEcrRepository(repo, 'latest'),
+      image: ecs.ContainerImage.fromRegistry(imageUri),
       essential: true,
       environment: {
         ...cap.containerEnvVars,
@@ -307,6 +357,76 @@ export class ForgeGeometryStack extends cdk.Stack {
     this.services.set(cap.id, service);
   }
 
+  // ── Per-service health alarms ───────────────────────────────────────────────
+  // Catches the two silent-failure modes observed in the FluxTK 2026-05-24 outage:
+  //   (a) service desired=1 but ECS cannot start a task (image pull fail, etc.)
+  //   (b) task running but emitting no logs (zombie / deadlocked process)
+  private createServiceHealthAlarms(
+    capId: string,
+    serviceName: string,
+    service: ecs.BaseService,
+    logGroup: logs.LogGroup,
+  ): void {
+    const safeId = capId.replace(/-/g, '');
+
+    // (a) RunningTaskCount<1 for 5 consecutive minutes.
+    // Uses the AWS/ECS namespace (always emitted, no Container Insights required).
+    const runningTasksMetric = new cloudwatch.Metric({
+      namespace: 'AWS/ECS',
+      metricName: 'RunningTaskCount',
+      dimensionsMap: {
+        ClusterName: this.geometryCluster.clusterName,
+        ServiceName: serviceName,
+      },
+      statistic: 'Maximum',
+      period: cdk.Duration.seconds(60),
+    });
+    const noTasksAlarm = new cloudwatch.Alarm(this, `AlarmNoTasks${safeId}`, {
+      alarmName: `forge-geometry-${serviceName}-no-running-tasks`,
+      alarmDescription:
+        `ECS service ${serviceName} has had 0 running tasks for 5 minutes. ` +
+        `Likely causes: image pull failure (orphaned digest), capacity exhaustion, ` +
+        `or task crash-loop. Investigate stopped-task reasons immediately.`,
+      metric: runningTasksMetric,
+      threshold: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+      evaluationPeriods: 5,
+      datapointsToAlarm: 5,
+      treatMissingData: cloudwatch.TreatMissingData.BREACHING,
+    });
+    noTasksAlarm.addAlarmAction(new cwActions.SnsAction(this.alarmTopic));
+    noTasksAlarm.addOkAction(new cwActions.SnsAction(this.alarmTopic));
+    // Force the alarm to depend on the service so it is created after the metric exists.
+    noTasksAlarm.node.addDependency(service);
+
+    // (b) Log IncomingBytes<1024 sum over 30 minutes (6 × 5-minute periods).
+    // Empty/near-empty log group while the service is supposedly running indicates
+    // a silent failure (e.g. process started but never connected, deadlocked solver).
+    const logBytesMetric = new cloudwatch.Metric({
+      namespace: 'AWS/Logs',
+      metricName: 'IncomingBytes',
+      dimensionsMap: {
+        LogGroupName: logGroup.logGroupName,
+      },
+      statistic: 'Sum',
+      period: cdk.Duration.seconds(300),
+    });
+    const silentLogsAlarm = new cloudwatch.Alarm(this, `AlarmSilentLogs${safeId}`, {
+      alarmName: `forge-geometry-${serviceName}-silent-logs`,
+      alarmDescription:
+        `Log group ${logGroup.logGroupName} received <1 KiB in 30 minutes. ` +
+        `Service may be running but not processing requests, or stuck in a zombie state.`,
+      metric: logBytesMetric,
+      threshold: 1024,
+      comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+      evaluationPeriods: 6,
+      datapointsToAlarm: 6,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING, // log group may not yet exist on first deploy
+    });
+    silentLogsAlarm.addAlarmAction(new cwActions.SnsAction(this.alarmTopic));
+    silentLogsAlarm.node.addDependency(logGroup);
+  }
+
   // ── GPU Task Definition (desiredCount=0 — task def only, no service) ────────
   // GPU services are NOT created as ECS services. Instead, we register the task
   // definition so it can be launched via RunTask (Step Functions or CLI) on
@@ -329,10 +449,15 @@ export class ForgeGeometryStack extends cdk.Stack {
 
     const repo = this.ecrRepos.get(cap.id)!;
 
+    // See note in createFargateService — string-form image URI prevents the
+    // synth-time '@sha256:<digest>' pin that caused the FluxTK outage.
+    const imageUri = `${this.account}.dkr.ecr.${this.region}.amazonaws.com/${cap.ecrRepo}:latest`;
+    td.node.addDependency(repo);
+
     // GPU resource requirement — CDK doesn't have a native L2 for this,
     // so we add it via escape hatch after container creation
     const container = td.addContainer(`${cap.taskName}-container`, {
-      image: ecs.ContainerImage.fromEcrRepository(repo, 'latest'),
+      image: ecs.ContainerImage.fromRegistry(imageUri),
       cpu: cap.cpu!,
       memoryLimitMiB: cap.memory!,
       essential: true,
