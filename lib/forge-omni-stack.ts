@@ -141,6 +141,13 @@ export class ForgeOmniStack extends cdk.Stack {
         DOTNET_ENVIRONMENT: 'Production',
         PORT: '5000',
         OMNI_DOMAIN: props.domainName,
+        // FluxTK + enrichment bridge service discovery. Both targets live in
+        // private Cloud Map zones already attached to this VPC -- no extra
+        // DNS work needed here. Keep these in sync with forge-app-stack.ts.
+        // RCA: FluxTK_ServiceDiscovery_RCA.md (2026-05-28).
+        FluxTK__BaseUrl: 'http://forge-fluxtk.forge-geometry.local:8040',
+        ENRICHMENT_BRIDGE_URL:
+          'http://forge-app-test.forge.local:3000/api/omni-enriched',
       },
       secrets,
       logging: ecs.LogDrivers.awsLogs({

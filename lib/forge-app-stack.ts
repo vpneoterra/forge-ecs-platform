@@ -497,6 +497,16 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       capacityProviderStrategies: [
         { capacityProvider: 'FARGATE_SPOT', weight: 1, base: 1 },
       ],
+      // Cloud Map registration so OMNI can reach the FORGE Node enrichment
+      // bridge at `forge-app-test.forge.local:3000`. Previously absent --
+      // forge-app-test had no private DNS record at all. Same pattern as
+      // the OMNI service below (line ~590). RCA: FluxTK_ServiceDiscovery_RCA.md.
+      cloudMapOptions: {
+        name: 'forge-app-test',
+        cloudMapNamespace: namespace,
+        dnsRecordType: servicediscovery.DnsRecordType.A,
+        dnsTtl: cdk.Duration.seconds(10),
+      },
     });
 
     this.serviceName = 'forge-app-test';
@@ -549,6 +559,18 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         DOTNET_ENVIRONMENT: 'Production',
         PORT: '5000',
         KNOWLEDGE_SERVICE_URL: 'http://dks-query.forge.local:8020',
+        // FluxTK conservation solver discovery. Cloud Map FQDN required because
+        // forge-fluxtk lives in `forge-geometry.local` namespace while OMNI lives
+        // in `forge.local` -- bare label `forge-fluxtk` would NXDOMAIN against the
+        // VPC DHCP search-domain `ec2.internal`. ASP.NET maps `FluxTK__BaseUrl`
+        // (double-underscore) -> configuration key `FluxTK:BaseUrl`.
+        // RCA: FluxTK_ServiceDiscovery_RCA.md (2026-05-28).
+        FluxTK__BaseUrl: 'http://forge-fluxtk.forge-geometry.local:8040',
+        // FORGE Node enrichment bridge (server/omni-enrichment-bridge.js) mounted
+        // at /api/omni-enriched in server.js. Was defaulting to localhost:3000
+        // which (a) doesn't exist in the OMNI task and (b) had a wrong path prefix.
+        ENRICHMENT_BRIDGE_URL:
+          'http://forge-app-test.forge.local:3000/api/omni-enriched',
       },
       secrets: {
         ANTHROPIC_API_KEY: secrets['ANTHROPIC_API_KEY'],
