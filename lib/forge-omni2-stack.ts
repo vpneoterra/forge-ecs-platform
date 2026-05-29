@@ -76,7 +76,6 @@ export class ForgeOmni2Stack extends cdk.Stack {
   public readonly serviceName: string;
   public readonly internalEndpoint: string;
   public readonly publicUrl: string;
-  public readonly targetGroup: elbv2.ApplicationTargetGroup;
 
   constructor(scope: Construct, id: string, props: ForgeOmni2StackProps) {
     super(scope, id, props);
@@ -91,6 +90,18 @@ export class ForgeOmni2Stack extends cdk.Stack {
     const hostedZone = route53.HostedZone.fromLookup(this, 'Omni2HostedZone', {
       domainName: props.hostedZoneDomain,
     });
+
+    // NOTE on ALB wiring: because props.httpsListener is the live listener
+    // owned by ForgeAppStack, the addTargets() call below contributes the
+    // OMNI2 target group + priority-30 host rule to the ForgeApp-dev stack
+    // (CDK attaches listener mutations to the listener's OWNING stack), and
+    // the omni2.qrucible.ai cert SAN is added there via the omni2DomainName
+    // prop. This is the same mechanism by which OMNI (prio 10) and LUCID
+    // (prio 20) rules live in ForgeApp-dev. It remains strictly additive:
+    // the OMNI service, its priority-10 rule, and the existing SANs are
+    // untouched -- only NEW resources are added. Deploy order: ForgeApp-dev
+    // (adds SAN + rule + target group) then ForgeOmni2-dev (service, cloud
+    // map, Route53).
 
     // -- Secret: ANTHROPIC_API_KEY (imported by bare name; never created) ----
     // Mirrors OMNI: OMNI2 uses the same Anthropic key binding.
@@ -234,27 +245,19 @@ export class ForgeOmni2Stack extends cdk.Stack {
     this.internalEndpoint = 'http://omni2.forge.local:5000';
     this.publicUrl = `https://${props.domainName}`;
 
-    // -- ALB target group (host-header routing: omni2.qrucible.ai) -----------
-    // Unlike LUCID, capture the returned target group so its ARN can be
-    // exported for the cutover (swap priority-10 host rule onto this TG).
-    this.targetGroup = props.httpsListener.addTargets('Omni2Target', {
-      targets: [service],
-      port: 5000,
-      protocol: elbv2.ApplicationProtocol.HTTP,
-      priority,
-      conditions: [
-        elbv2.ListenerCondition.hostHeaders([props.domainName]),
-      ],
-      healthCheck: {
-        path: '/api/health',
-        interval: cdk.Duration.seconds(30),
-        timeout: cdk.Duration.seconds(10),
-        healthyHttpCodes: '200',
-        unhealthyThresholdCount: 3,
-        healthyThresholdCount: 2,
-      },
-      deregistrationDelay: cdk.Duration.seconds(30),
-    });
+    // -- ALB attachment: handled OUT-OF-BAND (additive, CLI) -----------------
+    // We deliberately do NOT call props.httpsListener.addTargets() here.
+    // Because the HTTPS listener is owned by the (drifted, deploy-fragile)
+    // ForgeApp-dev stack, addTargets() would attach the OMNI2 target group +
+    // priority-30 rule + cert SAN to ForgeApp-dev, forcing a full ForgeApp
+    // update -- which currently diffs to DESTROY DKS resources and has a
+    // history of forge-app ECS circuit-breaker rollbacks. That is neither
+    // additive nor safe. Instead, OMNI2's ALB wiring (target group, SNI cert
+    // for omni2.qrucible.ai, priority-30 host rule, and service<->TG
+    // attachment) is created additively via AWS CLI against the live ALB,
+    // touching only NEW resources. See scripts/omni2-alb-wire.sh.
+    // `priority` (default 30) is documented here for that out-of-band step.
+    void priority;
 
     // -- Route 53 alias (omni2.qrucible.ai -> shared ALB) --------------------
     // The ACM cert on the shared ALB must include omni2.qrucible.ai as a SAN;
@@ -284,12 +287,6 @@ export class ForgeOmni2Stack extends cdk.Stack {
     new cdk.CfnOutput(this, 'Omni2ServiceName', {
       value: service.serviceName,
       description: 'ECS service name for OMNI2',
-    });
-    // Exported for the cutover: the priority-10 host rule for omni.qrucible.ai
-    // can be repointed onto this target group when OMNI2 is promoted.
-    new cdk.CfnOutput(this, 'Omni2TargetGroupArn', {
-      value: this.targetGroup.targetGroupArn,
-      description: 'OMNI2 ALB target group ARN (cutover: swap omni.* rule onto this)',
     });
   }
 }
