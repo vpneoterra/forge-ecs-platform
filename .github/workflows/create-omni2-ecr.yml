@@ -1,0 +1,35 @@
+name: Create OMNI2 ECR Repository
+
+# Strictly additive: creates a NEW, isolated ECR repo `forge-omni2`.
+# Never touches `forge-omni` / `omni`. Mirrors create-omni-ecr.yml.
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  create-ecr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create ECR repository
+        run: |
+          aws ecr create-repository \
+            --repository-name forge-omni2 \
+            --region ${{ env.AWS_REGION }} \
+            --image-scanning-configuration scanOnPush=true \
+            --image-tag-mutability MUTABLE \
+            --tags Key=Project,Value=OMNI2 Key=ManagedBy,Value=CDK Key=Owner,Value=vpneoterra \
+            2>/dev/null || echo "Repository 'forge-omni2' may already exist"
+
+          echo "ECR repository 'forge-omni2' ready:"
+          aws ecr describe-repositories --repository-names forge-omni2 --region ${{ env.AWS_REGION }} \
+            --query 'repositories[0].repositoryUri' --output text

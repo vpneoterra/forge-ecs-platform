@@ -1,0 +1,114 @@
+name: Build & Push OMNI2 Image
+
+# Strictly additive GATE-proving build for OMNI2.
+# - Checks out vpneoterra/forgenew @ feat/omni2 (branch input overridable).
+# - Builds docker/omni2 on linux/amd64 (PicoGK 2.x native build host).
+# - Pushes to the ISOLATED forge-omni2 ECR repo. NEVER touches forge-omni.
+# Mirrors build-images.yml (buildx, ECR login, :latest + :date + :sha8).
+
+on:
+  workflow_dispatch:
+    inputs:
+      forgenew_ref:
+        description: 'forgenew git ref to build (branch, tag, or SHA)'
+        required: false
+        default: 'feat/omni2'
+
+env:
+  AWS_REGION: us-east-1
+  IMAGE_NAME: forge-omni2
+
+jobs:
+  build:
+    name: Build OMNI2 (linux/amd64)
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout forgenew @ ref
+        uses: actions/checkout@v4
+        with:
+          repository: vpneoterra/forgenew
+          ref: ${{ github.event.inputs.forgenew_ref || 'feat/omni2' }}
+          token: ${{ secrets.GH_PAT }}
+          path: image-source
+
+      - name: Verify OMNI2 build context exists
+        run: |
+          if [ ! -f image-source/docker/omni2/Dockerfile ]; then
+            echo "::error::image-source/docker/omni2/Dockerfile not found on ref '${{ github.event.inputs.forgenew_ref || 'feat/omni2' }}'."
+            echo "::error::Phase 1 (merge omni2 into forgenew) must be present on this ref."
+            exit 1
+          fi
+          echo "OMNI2 Dockerfile found. Pinned SHAs (the GATE):"
+          grep -E 'PICOGK_SHA|PICOGK_RUNTIME_SHA|SHAPEKERNEL_SHA|LATTICELIB_SHA' image-source/docker/omni2/Dockerfile || true
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Ensure forge-omni2 ECR repo exists
+        run: |
+          aws ecr describe-repositories --repository-names ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }} >/dev/null 2>&1 \
+            || aws ecr create-repository \
+                 --repository-name ${{ env.IMAGE_NAME }} \
+                 --region ${{ env.AWS_REGION }} \
+                 --image-scanning-configuration scanOnPush=true \
+                 --image-tag-mutability MUTABLE \
+                 --tags Key=Project,Value=OMNI2 Key=ManagedBy,Value=CDK Key=Owner,Value=vpneoterra
+          echo "forge-omni2 repo ready."
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URI=$ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}
+          echo "ecr_uri=$ECR_URI" >> $GITHUB_OUTPUT
+          echo "build_date=$(date -u +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+          # short SHA of the forgenew checkout
+          SHA8=$(git -C image-source rev-parse --short=8 HEAD)
+          echo "git_sha=$SHA8" >> $GITHUB_OUTPUT
+
+      - name: Build and push OMNI2 (GATE)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./image-source/docker/omni2
+          file: ./image-source/docker/omni2/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.ecr_uri }}:latest
+            ${{ steps.meta.outputs.ecr_uri }}:${{ steps.meta.outputs.build_date }}
+            ${{ steps.meta.outputs.ecr_uri }}:${{ steps.meta.outputs.git_sha }}
+          cache-from: type=registry,ref=${{ steps.meta.outputs.ecr_uri }}:cache
+          cache-to: type=registry,ref=${{ steps.meta.outputs.ecr_uri }}:cache,mode=max
+          build-args: |
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+            GIT_SHA=${{ steps.meta.outputs.git_sha }}
+
+      - name: Build summary
+        if: always()
+        run: |
+          echo "## OMNI2 GATE Build" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| forgenew ref | ${{ github.event.inputs.forgenew_ref || 'feat/omni2' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ECR repo | ${{ env.IMAGE_NAME }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tags | latest, ${{ steps.meta.outputs.build_date }}, ${{ steps.meta.outputs.git_sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Result | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "GATE note: a green build proves PicoGK 2.x + ShapeKernel/LatticeLibrary compile and the native picogk.26.1.so links. Runtime picogkLoaded==true is still verified at container boot (Phase 5), not here." >> $GITHUB_STEP_SUMMARY
