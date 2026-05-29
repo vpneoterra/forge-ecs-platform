@@ -50,6 +50,7 @@ import { ForgeDataStack } from '../lib/forge-data-stack';
 import { ForgeComputeStack } from '../lib/forge-compute-stack';
 import { ForgeAppStack } from '../lib/forge-app-stack';
 import { ForgeLucidStack } from '../lib/forge-lucid-stack';
+import { ForgeOmni2Stack } from '../lib/forge-omni2-stack';
 import { ForgeOmniStack } from '../lib/forge-omni-stack';
 import { ForgeGemmaStack } from '../lib/forge-gemma-stack';
 import { ForgeOrchestrationStack } from '../lib/forge-orchestration-stack';
@@ -93,6 +94,11 @@ const enableHarnessAutoPause =
   (app.node.tryGetContext('enableHarnessAutoPause') as string | undefined) !== 'false';
 const omniDomain =
   (app.node.tryGetContext('omniDomain') as string | undefined) ?? 'omni.qrucible.ai';
+// OMNI2 (PicoGK 2.x) shadow service -- additive, coexists with OMNI.
+const deployOmni2 =
+  (app.node.tryGetContext('deployOmni2') as string | undefined) === 'true';
+const omni2Domain =
+  (app.node.tryGetContext('omni2Domain') as string | undefined) ?? 'omni2.qrucible.ai';
 
 const awsEnv: cdk.Environment = {
   account: process.env.CDK_DEFAULT_ACCOUNT ?? process.env.AWS_ACCOUNT_ID,
@@ -153,6 +159,10 @@ if (deployApp) {
     // ALB cert covers api-lucid.qrucible.ai before ForgeLucidStack
     // attaches its target group.
     lucidDomainName: deployLucid ? lucidDomain : undefined,
+    // When deployOmni2=true we pre-provision the ACM SAN so the shared ALB
+    // cert covers omni2.qrucible.ai before ForgeOmni2Stack attaches its
+    // target group. Additive: leaves the running OMNI service untouched.
+    omni2DomainName: deployOmni2 ? omni2Domain : undefined,
     tags: sharedTags,
   });
   appStack.addDependency(networkStack);
@@ -178,6 +188,29 @@ if (deployApp) {
       tags: sharedTags,
     });
     lucidStack.addDependency(appStack);
+  }
+
+  // -- OMNI2 Stack (PicoGK 2.x shadow on the shared ALB + cluster) ----------
+  // Strictly additive: a second OMNI running in parallel at omni2.qrucible.ai
+  // (priority 30, forge-omni2 ECR, omni2.forge.local). OMNI is untouched.
+  if (deployOmni2) {
+    const omni2Stack = new ForgeOmni2Stack(app, `ForgeOmni2-${env}`, {
+      env: awsEnv,
+      description: 'OMNI2 (PicoGK 2.x) -- Fargate shadow on shared ALB, Cloud Map, Route 53',
+      forgeEnv: env,
+      vpc: networkStack.vpc,
+      ecsSecurityGroup: networkStack.ecsSecurityGroup,
+      privateSubnets: networkStack.privateSubnets,
+      ecsCluster: appStack.ecsCluster,
+      alb: appStack.alb,
+      httpsListener: appStack.httpsListener,
+      cloudMapNamespace: appStack.cloudMapNamespace,
+      domainName: omni2Domain,
+      hostedZoneDomain: omni2Domain.split('.').slice(-2).join('.'),
+      listenerRulePriority: 30,
+      tags: sharedTags,
+    });
+    omni2Stack.addDependency(appStack);
   }
 
   // -- Monitoring Stack (observability for the app stack) --------------------

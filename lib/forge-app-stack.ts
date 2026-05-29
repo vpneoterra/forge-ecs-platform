@@ -67,6 +67,14 @@ export interface ForgeAppStackProps extends cdk.StackProps {
    * HTTPS listener without a separate certificate.
    */
   lucidDomainName?: string;
+  /**
+   * Optional public domain for OMNI2 (e.g. 'omni2.qrucible.ai').
+   * When provided, the shared ACM cert is issued with this hostname as a
+   * SAN so ForgeOmni2Stack can attach a target group to the same HTTPS
+   * listener without a separate certificate. Strictly additive: does not
+   * affect the running OMNI service or its priority-10 rule.
+   */
+  omni2DomainName?: string;
   tags?: Record<string, string>;
 }
 
@@ -434,6 +442,9 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
     const certSans: string[] = [props.omniDomainName];
     if (props.lucidDomainName) {
       certSans.push(props.lucidDomainName);
+    }
+    if (props.omni2DomainName) {
+      certSans.push(props.omni2DomainName);
     }
     const certificate = new acm.Certificate(this, 'ForgeAppCert', {
       domainName: props.domainName,
