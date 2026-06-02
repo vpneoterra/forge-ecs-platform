@@ -404,7 +404,8 @@ export const SOLVER_MANIFEST: SolverTask[] = [
       SERVICE_MODE: 'surrogate',
       LOG_LEVEL: 'INFO',
       SQS_QUEUE_NAME: 'forge-surrogate.fifo',
-      NVIDIA_VISIBLE_DEVICES: 'all',
+      // NVIDIA_VISIBLE_DEVICES is automatically managed by ECS for GPU tasks --
+      // setting it explicitly is rejected by ECS for tasks that declare a GPU resource.
       DYNAMODB_TABLE: 'forge-jobs',
       S3_BUCKET: 'forge-platform-data',
     },
