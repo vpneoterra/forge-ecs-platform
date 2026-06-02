@@ -56,13 +56,13 @@ export const SOLVER_MANIFEST: SolverTask[] = [
     name: 'forge-lightweight',
     imageRepo: 'forge-cluster-a-geometry',
     cpu: 2048,   // 2 vCPU
-    memory: 3840, // ~3.75 GB
+    memory: 4096, // 4 GB (was 3840; +256 MB for XOLVER analytical libs + .NET geometry)
     port: 8080,
     provider: 'A',
     healthCheckPath: '/health',
     essential: true,
     scalingMode: 'always-on',
-    description: 'All Cluster A geometry services + stellarator orchestrator',
+    description: 'Cluster A geometry + XOLVER analytical/property tier + .NET geometry',
     environment: {
       SERVICE_MODE: 'geometry',
       LOG_LEVEL: 'INFO',
@@ -70,6 +70,16 @@ export const SOLVER_MANIFEST: SolverTask[] = [
       PARAMAK_WORKERS: '1',
       PICOGK_WORKERS: '1',
       STELLARATOR_ORCHESTRATOR: 'true',
+      // -- XOLVER analytical tier (synchronous, used by X7 grading) --
+      COOLPROP_ENABLED: 'true',
+      FLUIDS_ENABLED: 'true',
+      HT_ENABLED: 'true',
+      OPENMDAO_ENABLED: 'true',
+      // -- .NET geometry on PicoGK runtime --
+      SHAPEKERNEL_ENABLED: 'true',
+      LATTICELIBRARY_ENABLED: 'true',
+      UNITSNET_ENABLED: 'true',
+      OPENGEODE_ENABLED: 'true',
       DYNAMODB_TABLE: 'forge-jobs',
       S3_BUCKET: 'forge-platform-data',
     },
@@ -78,11 +88,9 @@ export const SOLVER_MANIFEST: SolverTask[] = [
       { type: 's3', containerPath: '/forge/outputs', sourcePath: 'geometry/' },
     ],
     consolidatedServices: [
-      'CadQuery',
-      'Paramak',
-      'ParaStell',
-      'PicoGK',
-      'Stellarator Orchestrator',
+      'CadQuery', 'Paramak', 'ParaStell', 'PicoGK', 'Stellarator Orchestrator',
+      'CoolProp', 'fluids', 'ht', 'OpenMDAO',
+      'ShapeKernel', 'LatticeLibrary', 'UnitsNet', 'OpenGeode',
     ],
   },
   {
@@ -291,6 +299,120 @@ export const SOLVER_MANIFEST: SolverTask[] = [
       { type: 's3', containerPath: '/forge/outputs', sourcePath: 'stellarator-cad/' },
     ],
     consolidatedServices: ['Bluemira', 'ParaStell', 'Paramak'],
+  },
+
+  // -----------------------------------------------------------------
+  // XOLVER additions -- PROVIDER B (x86 Spot, scale-to-zero)
+  // -----------------------------------------------------------------
+  {
+    name: 'forge-em',
+    imageRepo: 'forge-em',
+    cpu: 16384,   // 16 vCPU
+    memory: 32768, // 32 GB
+    port: 8500,
+    provider: 'B',
+    healthCheckPath: '/health',
+    essential: true,
+    scalingMode: 'sqs-driven',
+    sqsQueueName: 'forge-em.fifo',
+    description: 'XOLVER electromagnetics: Palace, Elmer-EM, preCICE (EM<->thermal coupling).',
+    environment: {
+      SERVICE_MODE: 'em',
+      LOG_LEVEL: 'INFO',
+      SQS_QUEUE_NAME: 'forge-em.fifo',
+      OMP_NUM_THREADS: '16',
+      PALACE_PARALLEL: 'true',
+      PRECICE_ENABLED: 'true',
+      DYNAMODB_TABLE: 'forge-jobs',
+      S3_BUCKET: 'forge-platform-data',
+    },
+    volumes: [
+      { type: 'efs', containerPath: '/forge/workspace', sourcePath: '/em' },
+      { type: 's3', containerPath: '/forge/outputs', sourcePath: 'em/' },
+    ],
+    consolidatedServices: ['Palace', 'Elmer-EM', 'preCICE'],
+  },
+  {
+    name: 'forge-multibody',
+    imageRepo: 'forge-multibody',
+    cpu: 4096,   // 4 vCPU
+    memory: 8192, // 8 GB
+    port: 8600,
+    provider: 'B',
+    healthCheckPath: '/health',
+    essential: true,
+    scalingMode: 'sqs-driven',
+    sqsQueueName: 'forge-multibody.fifo',
+    description: 'XOLVER multibody/kinematics: MBDyn (+ contact/kinematic actions).',
+    environment: {
+      SERVICE_MODE: 'multibody',
+      LOG_LEVEL: 'INFO',
+      SQS_QUEUE_NAME: 'forge-multibody.fifo',
+      OMP_NUM_THREADS: '4',
+      DYNAMODB_TABLE: 'forge-jobs',
+      S3_BUCKET: 'forge-platform-data',
+    },
+    volumes: [
+      { type: 'efs', containerPath: '/forge/workspace', sourcePath: '/multibody' },
+      { type: 's3', containerPath: '/forge/outputs', sourcePath: 'multibody/' },
+    ],
+    consolidatedServices: ['MBDyn'],
+  },
+  {
+    name: 'forge-chemistry',
+    imageRepo: 'forge-chemistry',
+    cpu: 4096,   // 4 vCPU
+    memory: 8192, // 8 GB
+    port: 8700,
+    provider: 'B',
+    healthCheckPath: '/health',
+    essential: true,
+    scalingMode: 'sqs-driven',
+    sqsQueueName: 'forge-chemistry.fifo',
+    description: 'XOLVER chemistry: Cantera (kinetics/combustion) + electrochemical action.',
+    environment: {
+      SERVICE_MODE: 'chemistry',
+      LOG_LEVEL: 'INFO',
+      SQS_QUEUE_NAME: 'forge-chemistry.fifo',
+      OMP_NUM_THREADS: '4',
+      DYNAMODB_TABLE: 'forge-jobs',
+      S3_BUCKET: 'forge-platform-data',
+    },
+    volumes: [
+      { type: 'efs', containerPath: '/forge/workspace', sourcePath: '/chemistry' },
+      { type: 's3', containerPath: '/forge/outputs', sourcePath: 'chemistry/' },
+    ],
+    consolidatedServices: ['Cantera', 'electrochemical'],
+  },
+
+  // -----------------------------------------------------------------
+  // XOLVER addition -- PROVIDER C (GPU Spot, scale-to-zero)
+  // -----------------------------------------------------------------
+  {
+    name: 'forge-surrogate',
+    imageRepo: 'forge-surrogate',
+    cpu: 4096,    // 4 vCPU (paired with 1 GPU)
+    memory: 16384, // 16 GB
+    port: 8800,
+    provider: 'C',
+    healthCheckPath: '/health',
+    essential: true,
+    scalingMode: 'sqs-driven',
+    sqsQueueName: 'forge-surrogate.fifo',
+    description: 'XOLVER ML surrogates: NVIDIA PhysicsNeMo (Modulus successor) + DeepXDE (GPU).',
+    environment: {
+      SERVICE_MODE: 'surrogate',
+      LOG_LEVEL: 'INFO',
+      SQS_QUEUE_NAME: 'forge-surrogate.fifo',
+      NVIDIA_VISIBLE_DEVICES: 'all',
+      DYNAMODB_TABLE: 'forge-jobs',
+      S3_BUCKET: 'forge-platform-data',
+    },
+    volumes: [
+      { type: 'efs', containerPath: '/forge/workspace', sourcePath: '/surrogate' },
+      { type: 's3', containerPath: '/forge/outputs', sourcePath: 'surrogate/' },
+    ],
+    consolidatedServices: ['PhysicsNeMo', 'DeepXDE'],
   },
 ];
 

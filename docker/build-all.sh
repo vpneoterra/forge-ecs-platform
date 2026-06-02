@@ -29,6 +29,11 @@ declare -A IMAGE_REPOS=(
   ["forge-stellarator-config"]="forge-stellarator-config"
   ["forge-stellarator-coils"]="forge-stellarator-coils"
   ["forge-stellarator-cad"]="forge-stellarator-cad"
+  # XOLVER additions
+  ["forge-em"]="forge-em"
+  ["forge-multibody"]="forge-multibody"
+  ["forge-chemistry"]="forge-chemistry"
+  ["forge-surrogate"]="forge-surrogate"
 )
 
 declare -A IMAGE_PLATFORMS=(
@@ -40,6 +45,11 @@ declare -A IMAGE_PLATFORMS=(
   ["forge-fem-cfd"]="linux/amd64"
   ["forge-stellarator-coils"]="linux/amd64"
   ["forge-stellarator-cad"]="linux/amd64"
+  # XOLVER additions (all amd64; surrogate uses the NVIDIA NGC base)
+  ["forge-em"]="linux/amd64"
+  ["forge-multibody"]="linux/amd64"
+  ["forge-chemistry"]="linux/amd64"
+  ["forge-surrogate"]="linux/amd64"
 )
 
 # ── AWS setup ─────────────────────────────────────────────────────────────────

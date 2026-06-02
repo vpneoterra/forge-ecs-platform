@@ -38,17 +38,20 @@ export interface CapacityProviderConfig {
  */
 export const PROVIDER_A: CapacityProviderConfig = {
   name: 'ForgeProviderA',
-  instanceTypes: ['c6g.xlarge', 'c6g.large', 'm6g.xlarge', 'm7g.xlarge'],
+  // Primary bumped to c6g.2xlarge (8 vCPU/16 GB) to accommodate the always-on reservation
+  // forge-lightweight(2) + forge-devops(4) + forge-monitoring(1) = 7 vCPU + headroom for
+  // the XOLVER analytical tier and .NET geometry workers consolidated into forge-lightweight.
+  instanceTypes: ['c6g.2xlarge', 'c6g.xlarge', 'm6g.2xlarge', 'm7g.2xlarge'],
   spot: true,
   minCapacity: 1,
   maxCapacity: 2,
   targetCapacityPercent: 80,
   architecture: 'arm64',
   amiType: 'bottlerocket-arm64',
-  description: 'Graviton Spot for always-on services (geometry, devops, monitoring)',
-  estimatedSpotPricePerHour: 0.07,
-  estimatedMonthlyMin: 51,
-  estimatedMonthlyMax: 102,
+  description: 'Graviton Spot for always-on services (geometry, devops, monitoring, XOLVER analytical tier)',
+  estimatedSpotPricePerHour: 0.13,
+  estimatedMonthlyMin: 95,
+  estimatedMonthlyMax: 190,
 };
 
 /**
@@ -65,21 +68,22 @@ export const PROVIDER_B: CapacityProviderConfig = {
     'c5a.2xlarge',  // 8 vCPU, 16 GB (AMD)
     'c6i.2xlarge',  // 8 vCPU, 16 GB (Ice Lake)
     'm5.2xlarge',   // 8 vCPU, 32 GB (memory optimized)
-    'c5.4xlarge',   // 16 vCPU, 32 GB (for fem-cfd)
+    'c5.4xlarge',   // 16 vCPU, 32 GB (for fem-cfd, forge-em)
     'c5a.4xlarge',  // 16 vCPU, 32 GB (AMD)
     'c6i.4xlarge',  // 16 vCPU, 32 GB
     'm5.4xlarge',   // 16 vCPU, 64 GB (for large FEM jobs)
+    'c6i.8xlarge',  // 32 vCPU, 64 GB (for large coupled CFD/EM, XOLVER X6 bin-pack headroom)
   ],
   spot: true,
   minCapacity: 0,
-  maxCapacity: 3,
+  maxCapacity: 5,  // raised from 3 for concurrent heavy solves (XOLVER X5 fan-out)
   targetCapacityPercent: 100, // Aggressive bin-packing
   architecture: 'x86_64',
   amiType: 'bottlerocket-x86',
-  description: 'x86 Spot for heavy compute (HPC, FEM/CFD, stellarator solvers). Scale-to-zero.',
+  description: 'x86 Spot for heavy compute (HPC, FEM/CFD, EM, multibody, chemistry, stellarator). Scale-to-zero.',
   estimatedSpotPricePerHour: 0.40,
   estimatedMonthlyMin: 0,
-  estimatedMonthlyMax: 288,
+  estimatedMonthlyMax: 480,
 };
 
 /**
