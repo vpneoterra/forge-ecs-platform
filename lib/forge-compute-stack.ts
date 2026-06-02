@@ -62,11 +62,34 @@ export class ForgeComputeStack extends cdk.Stack {
     });
 
     // ── Cloud Map: forge.local ────────────────────────────────────────────────
-    const dnsNamespace = new servicediscovery.PrivateDnsNamespace(this, 'ForgeDns', {
-      name: 'forge.local',
-      vpc: props.vpc,
-      description: 'FORGE service discovery namespace',
-    });
+    // The `forge.local` namespace already exists in account 266087050444 (id
+    // ns-dcqpbkmnzbqgpiub) and is in active use by ForgeApp-dev services (omni,
+    // lucid, dks-query, etc.). Recreating it would collide with CloudFormation,
+    // and deleting it would break the running app. Import it via context if
+    // `existingNamespaceId` is provided; otherwise fall back to creating a new one.
+    const existingNamespaceId = this.node.tryGetContext('existingNamespaceId') as
+      | string
+      | undefined;
+    const existingNamespaceArn = this.node.tryGetContext('existingNamespaceArn') as
+      | string
+      | undefined;
+    const dnsNamespace: servicediscovery.IPrivateDnsNamespace = existingNamespaceId
+      ? servicediscovery.PrivateDnsNamespace.fromPrivateDnsNamespaceAttributes(
+          this,
+          'ForgeDns',
+          {
+            namespaceName: 'forge.local',
+            namespaceId: existingNamespaceId,
+            namespaceArn:
+              existingNamespaceArn ??
+              `arn:aws:servicediscovery:${this.region}:${this.account}:namespace/${existingNamespaceId}`,
+          },
+        )
+      : new servicediscovery.PrivateDnsNamespace(this, 'ForgeDns', {
+          name: 'forge.local',
+          vpc: props.vpc,
+          description: 'FORGE service discovery namespace',
+        });
 
     // ── CloudWatch Log Groups ─────────────────────────────────────────────────
     const logGroups = new Map<string, logs.LogGroup>();
@@ -442,6 +465,8 @@ export class ForgeComputeStack extends cdk.Stack {
       cpu: task.cpu,
       memoryLimitMiB: task.memory,
       essential: task.essential,
+      // GPU tasks (Provider C) reserve 1 GPU which also pins placement to the GPU ASG.
+      gpuCount: task.provider === 'C' ? 1 : undefined,
       environment: envVars,
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: task.name,
@@ -483,7 +508,7 @@ export class ForgeComputeStack extends cdk.Stack {
   private createAlwaysOnService(
     task: SolverTask,
     props: ForgeComputeStackProps,
-    dnsNamespace: servicediscovery.PrivateDnsNamespace,
+    dnsNamespace: servicediscovery.IPrivateDnsNamespace,
     capacityProvider: ecs.AsgCapacityProvider,
   ): ecs.Ec2Service {
     const td = this.taskDefinitions.get(task.name)!;

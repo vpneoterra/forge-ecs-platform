@@ -1,1 +1,12 @@
-{}
+{
+  "availability-zones:account=266087050444:region=us-east-1": [
+    "us-east-1a",
+    "us-east-1b",
+    "us-east-1c",
+    "us-east-1d",
+    "us-east-1e",
+    "us-east-1f"
+  ],
+  "ami:account=266087050444:filters.image-type.0=machine:filters.name.0=fck-nat-al2023-*-arm64-ebs:filters.state.0=available:owners.0=568608671756:region=us-east-1": "ami-05ce55eae55ab7696",
+  "ami:account=266087050444:filters.image-type.0=machine:filters.name.0=amzn2-ami-ecs-gpu-hvm-*-x86_64-ebs:filters.state.0=available:owners.0=amazon:region=us-east-1": "ami-02d30edd9041ded4f"
+}

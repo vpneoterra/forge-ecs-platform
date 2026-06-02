@@ -108,7 +108,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
         });
       }
 
-      return new sfnTasks.EcsRunTask(this, stateName, {
+      const runTask = new sfnTasks.EcsRunTask(this, stateName, {
         cluster: props.ecsCluster,
         taskDefinition: td,
         launchTarget: new sfnTasks.EcsEc2LaunchTarget(),
@@ -130,6 +130,21 @@ export class ForgeOrchestrationStack extends cdk.Stack {
           },
         ],
       });
+
+      // L1 escape hatch: attach a CapacityProviderStrategy so ECS managed scaling
+      // wakes the correct ASG from zero. The L2 EcsRunTask does not surface this field.
+      // GPU-required tasks (taskName === 'forge-surrogate') target Provider C; everything
+      // else that runs on EcsRunTask targets Provider B.
+      const providerName =
+        taskName === 'forge-surrogate' ? 'ForgeProviderC' : 'ForgeProviderB';
+      const cfn = runTask.node.defaultChild as cdk.CfnResource;
+      cfn.addPropertyOverride('Parameters.CapacityProviderStrategy', [
+        { CapacityProvider: providerName, Weight: 1, Base: 0 },
+      ]);
+      // LaunchType cannot coexist with CapacityProviderStrategy; remove the default.
+      cfn.addPropertyDeletionOverride('Parameters.LaunchType');
+
+      return runTask;
     };
 
     // ── CEM Loop State Machine ─────────────────────────────────────────────────
@@ -176,12 +191,34 @@ export class ForgeOrchestrationStack extends cdk.Stack {
       resultPath: '$.cfd_result',
     });
 
-    // State: Validate EM (parallel branch)
-    const cemValidateEm = new sfn.Pass(this, 'CemValidateEm', {
-      comment: 'EM validation via forge-hpc (PROCESS)',
-      result: sfn.Result.fromObject({ em_validated: true }),
-      resultPath: '$.em_result',
-    });
+    // State: Validate EM (parallel branch) -- dispatch to forge-em (Palace / Elmer-EM / preCICE).
+    // XOLVER X5: agent-adjudicated solver dispatch. WAIT_FOR_TASK_TOKEN means the worker
+    // returns the task token when it has written its observable to forge-jobs / S3.
+    const emQueue = props.sqsQueues.get('forge-em');
+    const cemValidateEm: sfn.IChainable = emQueue
+      ? new sfnTasks.SqsSendMessage(this, 'CemValidateEm', {
+          queue: emQueue,
+          messageBody: sfn.TaskInput.fromObject({
+            taskToken: sfn.JsonPath.taskToken,
+            job_id: sfn.JsonPath.stringAt('$.job_id'),
+            domain: 'electromagnetics',
+            solver: 'palace',
+            action: 'solve_em',
+            input_s3_key: sfn.JsonPath.stringAt('$.input_s3_key'),
+          }),
+          messageGroupId: sfn.JsonPath.stringAt('$.job_id'),
+          messageDeduplicationId: sfn.JsonPath.format(
+            '{}-em',
+            sfn.JsonPath.stringAt('$.job_id'),
+          ),
+          integrationPattern: sfn.IntegrationPattern.WAIT_FOR_TASK_TOKEN,
+          resultPath: '$.em_result',
+        })
+      : new sfn.Pass(this, 'CemValidateEm', {
+          comment: 'forge-em queue unavailable -- deploy ForgeCompute+deploySolvers=true',
+          result: sfn.Result.fromObject({ em_validated: false, reason: 'queue_missing' }),
+          resultPath: '$.em_result',
+        });
 
     // State: Validate (parallel)
     const cemValidate = new sfn.Parallel(this, 'CemValidate', {
