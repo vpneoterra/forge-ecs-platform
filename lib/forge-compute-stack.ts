@@ -562,8 +562,6 @@ export class ForgeComputeStack extends cdk.Stack {
   ): ecs.Ec2Service {
     const td = this.taskDefinitions.get(task.name)!;
 
-    const isDevops = task.name === 'forge-devops';
-
     const service = new ecs.Ec2Service(this, `Svc${task.name.replace(/-/g, '')}`, {
       cluster: this.ecsCluster,
       taskDefinition: td,
@@ -584,43 +582,20 @@ export class ForgeComputeStack extends cdk.Stack {
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [props.ecsSecurityGroup],
       // Cloud Map for service discovery.
-      // Non-devops always-on tasks register inline with SRV records.
-      // forge-devops is registered separately below (A record) so the
-      // CloudMap service can be REPLACED rather than modified in place.
-      cloudMapOptions: isDevops
-        ? undefined
-        : {
-            name: task.name,
-            cloudMapNamespace: dnsNamespace,
-            dnsRecordType: servicediscovery.DnsRecordType.SRV,
-            dnsTtl: cdk.Duration.seconds(10),
-          },
-    });
-
-    if (isDevops) {
       // forge-devops uses an A record (awsvpc task ENI IP) so the app can reach
       // BOTH the Nginx/Forgejo front at forge-devops.forge.local:80 AND the
       // SysML kernel at forge-devops.forge.local:9000 over the same hostname.
       // An SRV record would pin discovery to a single port; A records expose
-      // every container port, so we omit container/port on the association.
-      //
-      // AWS ServiceDiscovery does NOT allow changing a service's record type in
-      // place. The previously deployed service existed with SRV; using a NEW
-      // logical id (the V2 suffix) forces CloudFormation to REPLACE it with a
-      // fresh A-record service while keeping the SAME dns name 'forge-devops'.
-      const devopsCloudMap = new servicediscovery.Service(
-        this,
-        'SvcforgedevopsCloudmapServiceV2',
-        {
-          namespace: dnsNamespace,
-          name: task.name,
-          dnsRecordType: servicediscovery.DnsRecordType.A,
-          dnsTtl: cdk.Duration.seconds(10),
-          routingPolicy: servicediscovery.RoutingPolicy.MULTIVALUE,
-        },
-      );
-      service.associateCloudMapService({ service: devopsCloudMap });
-    }
+      // every container port. Other always-on tasks keep SRV.
+      cloudMapOptions: {
+        name: task.name,
+        cloudMapNamespace: dnsNamespace,
+        dnsRecordType: task.name === 'forge-devops'
+          ? servicediscovery.DnsRecordType.A
+          : servicediscovery.DnsRecordType.SRV,
+        dnsTtl: cdk.Duration.seconds(10),
+      },
+    });
 
     return service;
   }
