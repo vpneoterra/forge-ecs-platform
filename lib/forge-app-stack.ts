@@ -708,7 +708,19 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
           streamPrefix: 'dks-query',
         }),
         healthCheck: {
-          command: ['CMD-SHELL', 'wget -qO- http://localhost:8020/api/knowledge/stats || exit 1'],
+          // The dks-query image ships python3 but NOT wget/curl. The previous
+          // `wget -qO- ...` command exited 127 (command not found) on every
+          // probe, so the container was permanently marked UNHEALTHY and ECS
+          // killed each task before it could register in Cloud Map -- the
+          // service never had a healthy instance. This was latent because the
+          // service ran at desiredCount:0. Verified in-container:
+          // /api/knowledge/stats returns HTTP 200 immediately; there is no
+          // /ready endpoint on this image. Use python3+urllib (the only HTTP
+          // client present), matching the working forge-dks sidecar's probe.
+          command: [
+            'CMD-SHELL',
+            "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8020/api/knowledge/stats', timeout=5).status == 200 else 1)\" || exit 1",
+          ],
           interval: cdk.Duration.seconds(30),
           timeout: cdk.Duration.seconds(10),
           retries: 3,
@@ -722,7 +734,15 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       const dksQueryService = new ecs.FargateService(this, 'DksQueryService', {
         cluster: this.ecsCluster,
         taskDefinition: dksQueryTaskDef,
-        desiredCount: 0, // Start at 0 — scale up after images are pushed to ECR
+        // Run one task so the service registers an A record in Cloud Map.
+        // forge-omni + forge-app consume KNOWLEDGE_SERVICE_URL=
+        // http://dks-query.forge.local:8020; with desiredCount:0 the Cloud Map
+        // service had zero registered instances, so dks-query.forge.local did
+        // not resolve and OMNI's KnowledgeClient failed with SocketException
+        // "Name or service not known" on every /api/knowledge/bond-precedent
+        // call. The dks-query:latest image is present in ECR, so the original
+        // "start at 0 until images are pushed" rationale no longer applies.
+        desiredCount: 1,
         serviceName: 'dks-query',
         enableExecuteCommand: true,
         circuitBreaker: { rollback: true },
@@ -742,7 +762,10 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
 
       // dks-query auto-scaling
       const dksQueryScaling = dksQueryService.autoScaleTaskCount({
-        minCapacity: 0, // Allow scale-to-zero until images are ready
+        // Keep at least one task registered in Cloud Map at all times so
+        // dks-query.forge.local always resolves for OMNI's KnowledgeClient.
+        // Scale-to-zero is what produced the empty A record / DNS failure.
+        minCapacity: 1,
         maxCapacity: 3,
       });
 
