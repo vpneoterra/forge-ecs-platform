@@ -16,6 +16,10 @@ for _ in $(seq 1 60); do
   sleep 2
 done
 
+# Requests reach the kernel only over loopback from the FastAPI sidecar, so
+# allow any Host header (Play's AllowedHostsFilter otherwise 400s proxied
+# requests whose Host is rewritten to localhost:8003).
 exec /opt/sysml/bin/sysml-v2-api-services \
   -Dhttp.port="$HTTP_PORT" \
-  -Dpidfile.path=/dev/null
+  -Dpidfile.path=/dev/null \
+  -Dplay.filters.hosts.allowed.0="."

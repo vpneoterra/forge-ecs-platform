@@ -15,7 +15,8 @@ Do not refactor this into multiple containers.
 |--------------|---------------|--------------------|-------|
 | nginx        | **80**        | task port 80       | `/healthz` (ECS health), `/git/`→Forgejo, `/sysml/`→SysML, `/minio/`→MinIO |
 | sysml-api    | **9000**      | Cloud Map `:9000`  | FastAPI sidecar = `SYSML_API_PORT`; the public SysML surface |
-| sysml-java   | 8003          | (internal only)    | Official `Systems-Modeling/SysML-v2-API-Services` JAR (`SYSML_JAVA_PORT`) |
+| sysml-java   | 8003          | (internal only)    | Official `Systems-Modeling/SysML-v2-API-Services` Play dist (`SYSML_JAVA_PORT`) |
+| sysml-db     | 5432          | (internal only)    | Loopback Postgres backing the SysML kernel (ephemeral, `create-drop`) |
 | forgejo      | 3000          | nginx `/git/` + vhost `git.forge.local` | HTTP only; SSH optional |
 | minio        | 9090 / 9091   | nginx `/minio/`    | S3 API / console; data root `/forge/minio` |
 
@@ -88,14 +89,34 @@ aws codebuild start-build --project-name forge-devops-image
 > `repositoryName = task.name`). `forge-cluster-f-devops` is the source/imageRepo
 > name only. Both `build-all.sh` and `buildspec.yml` push to `forge-devops`.
 
-## Known caveat — SysML JAR at build time
+## SysML v2 kernel build (sbt, multi-stage)
 
-The official SysML v2 API Services project does not always publish a release JAR;
-the Dockerfile falls back to a Gradle `shadowJar` build from source. That fallback
-needs network egress to GitHub + Gradle and a JDK (this image uses a JRE base, so
-the Gradle path additionally relies on the cloned project's wrapper if the system
-`gradle` install is insufficient). **This has not been verified to succeed on
-arm64 in this sandbox (no Docker/AWS).** If the build fails at the SysML stage,
-the operator should either (a) supply a prebuilt `sysml-v2-api-services.jar` in
-the build context, or (b) switch the SysML stage to a JDK base image. Java
-bytecode itself is arch-independent, so a successfully-built JAR runs on Graviton.
+`Systems-Modeling/SysML-v2-API-Services` is a **Play Framework app built with
+sbt** — it is *not* a Gradle project and publishes no release JAR (the old
+release-JAR download 404'd and the `gradle shadowJar` fallback could never
+work). The Dockerfile now builds it correctly:
+
+- **Stage `sysml-builder`** (`eclipse-temurin:17-jdk-jammy` + sbt) clones the
+  upstream repo and runs `sbt stage`, producing a self-contained Play
+  distribution under `target/universal/stage/` with a
+  `bin/sysml-v2-api-services` launcher.
+- **Runtime stage** copies that staged dist into `/opt/sysml` and runs it on
+  the arm64 temurin JRE. Java bytecode is arch-independent, so the JDK build
+  on any arch runs natively on Graviton.
+- Pin a specific tag with `--build-arg SYSML_API_REF=<tag>` (default `master`).
+
+### Postgres decision
+
+The kernel hardcodes a Postgres connection in `conf/META-INF/persistence.xml`
+(`jdbc:postgresql://localhost:5432/sysml2`, user `postgres`) and uses Hibernate
+`hbm2ddl=create-drop`, so its model store is **rebuilt on every boot**. Rather
+than coupling `forge-devops` to the optional `ForgeDataStack` RDS instance
+(which can be skipped via `skipRds=true` in favour of external Supabase), we run
+a **loopback Postgres inside the image** (`program:sysml-db`, 127.0.0.1:5432).
+
+This keeps the consolidated single-image convention (like the embedded Forgejo
+and MinIO), works regardless of `skipRds`, and matches the kernel's ephemeral
+`create-drop` semantics — so the DB intentionally does **not** live on EFS. The
+FastAPI sidecar on :9000 is a thin proxy with no SysML logic of its own, so the
+real Java kernel is required for the `/api/...` and `/run` surfaces the FORGE
+SEL client calls.

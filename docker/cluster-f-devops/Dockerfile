@@ -44,13 +44,11 @@ WORKDIR /build
 RUN git clone --depth=1 --branch "${SYSML_API_REF}" \
       https://github.com/Systems-Modeling/SysML-v2-API-Services.git .
 
-# The upstream persistence.xml hardcodes the JDBC connection. Point it at the
-# loopback Postgres that runs alongside the kernel in the runtime image. The
-# kernel uses hbm2ddl create-drop, so the schema is rebuilt on each boot.
-RUN sed -i \
-      -e 's#jdbc:postgresql://localhost:5432/sysml2#jdbc:postgresql://127.0.0.1:5432/sysml2#' \
-      conf/META-INF/persistence.xml
-
+# Upstream persistence.xml already targets jdbc:postgresql://localhost:5432/sysml2
+# (user "postgres"), which is exactly the loopback Postgres the runtime image
+# provisions — no patching needed. The kernel uses hbm2ddl create-drop, so its
+# schema is rebuilt on each boot.
+#
 # Produce the Play dist launcher (target/universal/stage/bin/<name>).
 RUN sbt --batch --no-colors stage
 
@@ -128,10 +126,14 @@ ENV PGDATA=/var/lib/postgresql/data \
     SYSML_DB_USER=postgres \
     SYSML_DB_PASSWORD=mysecretpassword
 RUN set -eux; \
+    PGBIN="$(ls -d /usr/lib/postgresql/*/bin | head -n1)"; \
     mkdir -p "$PGDATA" /var/run/postgresql; \
     chown -R postgres:postgres "$PGDATA" /var/run/postgresql; \
-    su postgres -c "$(ls -d /usr/lib/postgresql/*/bin | head -n1)/initdb -D $PGDATA --auth=trust --username=$SYSML_DB_USER"; \
-    echo "listen_addresses = '127.0.0.1'" >> "$PGDATA/postgresql.conf"
+    su postgres -c "$PGBIN/initdb -D $PGDATA --auth=trust --username=$SYSML_DB_USER"; \
+    echo "listen_addresses = '127.0.0.1'" >> "$PGDATA/postgresql.conf"; \
+    su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w start"; \
+    su postgres -c "$PGBIN/createdb -O $SYSML_DB_USER $SYSML_DB_NAME"; \
+    su postgres -c "$PGBIN/pg_ctl -D $PGDATA -w stop"
 
 # ── Python sidecar venv (FastAPI health/metrics + proxy) ─────
 RUN python3.11 -m venv /opt/sidecar-venv
