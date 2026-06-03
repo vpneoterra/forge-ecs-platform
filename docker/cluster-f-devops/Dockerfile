@@ -19,14 +19,9 @@
 # Upstream Systems-Modeling/SysML-v2-API-Services is a Play Framework app
 # built with sbt (NOT Gradle, and no release JAR is published). We build the
 # Play dist with `sbt stage`, producing a self-contained launcher under
-# target/universal/stage/.
-#
-# Build on JDK 11, NOT 17: upstream pins sbt 1.2.8 (project/build.properties),
-# whose old Scala 2.12.7 meta-build crashes on JDK 17's module layer with
-# "/packages cannot be represented as URI". JDK 11 has no such issue. The
-# produced bytecode targets Java 8, so the dist runs fine on the JRE 17
-# runtime stage below.
-FROM --platform=linux/arm64 eclipse-temurin:11-jdk-jammy AS sysml-builder
+# target/universal/stage/. Java bytecode is arch-independent, so we build on
+# JDK17 and run on the arm64 temurin JRE runtime stage.
+FROM --platform=linux/arm64 eclipse-temurin:17-jdk-jammy AS sysml-builder
 
 ARG SYSML_API_REF=master
 ENV SBT_VERSION=1.9.9 \
@@ -126,11 +121,10 @@ COPY --from=sysml-builder /build/target/universal/stage /opt/sysml
 # The kernel's persistence.xml expects db "sysml2" / user "postgres". We
 # initialise a fresh cluster at build time; data is ephemeral (create-drop on
 # every kernel boot), so it intentionally does NOT live on EFS.
-# auth=trust on the loopback interface means the kernel's persistence.xml
-# password is never checked, so no DB password is baked into the image.
 ENV PGDATA=/var/lib/postgresql/data \
     SYSML_DB_NAME=sysml2 \
-    SYSML_DB_USER=postgres
+    SYSML_DB_USER=postgres \
+    SYSML_DB_PASSWORD=mysecretpassword
 RUN set -eux; \
     PGBIN="$(ls -d /usr/lib/postgresql/*/bin | head -n1)"; \
     mkdir -p "$PGDATA" /var/run/postgresql; \
