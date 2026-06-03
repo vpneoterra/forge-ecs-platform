@@ -31,6 +31,12 @@ declare -A IMAGE_REPOS=(
   ["forge-stellarator-cad"]="forge-stellarator-cad"
 )
 
+# Images whose build context lives IN THIS repo (no source-repo clone).
+# Maps image name -> context dir relative to repo root.
+declare -A LOCAL_CONTEXTS=(
+  ["forge-devops"]="docker/cluster-f-devops"
+)
+
 declare -A IMAGE_PLATFORMS=(
   ["forge-lightweight"]="linux/arm64"
   ["forge-devops"]="linux/arm64"
@@ -63,6 +69,22 @@ build_image() {
   local CLONE_DIR="${BUILD_DIR}/${SOURCE_REPO}"
   local BUILD_DATE
   BUILD_DATE=$(date -u +%Y%m%d-%H%M%S)
+
+  # Images with an in-repo build context skip the source-repo clone entirely.
+  if [[ -n "${LOCAL_CONTEXTS[$IMAGE_NAME]+set}" ]]; then
+    CLONE_DIR="${REPO_ROOT}/${LOCAL_CONTEXTS[$IMAGE_NAME]}"
+    info "Building ${IMAGE_NAME} from in-repo context ${LOCAL_CONTEXTS[$IMAGE_NAME]} (${PLATFORM})..."
+    docker buildx build \
+      --platform "${PLATFORM}" \
+      --tag "${ECR_URI}:latest" \
+      --tag "${ECR_URI}:${BUILD_DATE}" \
+      --push \
+      --build-arg BUILD_DATE="${BUILD_DATE}" \
+      "${CLONE_DIR}" \
+      && success "Pushed ${IMAGE_NAME}:latest" \
+      || { error "Build failed for ${IMAGE_NAME}"; return 1; }
+    return 0
+  fi
 
   info "Building ${IMAGE_NAME} from vpneoterra/${SOURCE_REPO} (${PLATFORM})..."
 
