@@ -37,6 +37,7 @@ export interface ForgeComputeStackProps extends cdk.StackProps {
   albSecurityGroup: ec2.SecurityGroup;
   dataBucket: s3.Bucket;
   efsFilesystem: efs.FileSystem;
+  efsAccessPoints: Record<string, efs.AccessPoint>;
   jobsTable: dynamodb.Table;
   ecrRepos: Map<string, ecr.Repository>;
   rdsEndpoint: string;
@@ -403,13 +404,20 @@ export class ForgeComputeStack extends cdk.Stack {
     // the first. The volume name is derived from the sourcePath.
     const efsMounts = task.volumes.filter(v => v.type === 'efs');
     efsMounts.forEach((mount, i) => {
+      const accessPoint = props.efsAccessPoints[mount.sourcePath];
+      if (!accessPoint) {
+        throw new Error(
+          `No EFS access point defined for sourcePath "${mount.sourcePath}" ` +
+            `(task "${task.name}"). Add it to ForgeDataStack.efsAccessPoints.`,
+        );
+      }
       td.addVolume({
         name: this.efsVolumeName(mount.sourcePath, i),
         efsVolumeConfiguration: {
           fileSystemId: props.efsFilesystem.fileSystemId,
-          rootDirectory: mount.sourcePath,
           transitEncryption: 'ENABLED',
           authorizationConfig: {
+            accessPointId: accessPoint.accessPointId,
             iam: 'ENABLED',
           },
         },
