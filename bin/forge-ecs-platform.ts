@@ -293,6 +293,7 @@ if (deploySolvers) {
     albSecurityGroup: networkStack.albSecurityGroup,
     dataBucket: dataStack.dataBucket,
     efsFilesystem: dataStack.efsFilesystem,
+    efsAccessPoints: dataStack.efsAccessPoints,
     jobsTable: dataStack.jobsTable,
     ecrRepos: dataStack.ecrRepos,
     rdsEndpoint: dataStack.rdsEndpoint,

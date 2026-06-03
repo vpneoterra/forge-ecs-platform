@@ -34,6 +34,7 @@ export interface ForgeDataStackProps extends cdk.StackProps {
 export class ForgeDataStack extends cdk.Stack {
   public readonly dataBucket: s3.Bucket;
   public readonly efsFilesystem: efs.FileSystem;
+  public readonly efsAccessPoints: Record<string, efs.AccessPoint> = {};
   public readonly ecrRepos: Map<string, ecr.Repository>;
   public readonly jobsTable: dynamodb.Table;
   /** RDS endpoint or empty string if skipRds=true */
@@ -104,7 +105,6 @@ export class ForgeDataStack extends cdk.Stack {
     });
 
     // EFS Access Points -- one per service group for isolation
-    const efsAccessPoints: Record<string, efs.AccessPoint> = {};
     const efsPaths = [
       '/geometry',
       '/forgejo',
@@ -120,7 +120,7 @@ export class ForgeDataStack extends cdk.Stack {
 
     for (const path of efsPaths) {
       const apId = path.replace(/^\//, '').replace(/-/g, '').replace('/', '');
-      efsAccessPoints[path] = new efs.AccessPoint(this, `EfsAp${apId}`, {
+      this.efsAccessPoints[path] = new efs.AccessPoint(this, `EfsAp${apId}`, {
         fileSystem: this.efsFilesystem,
         path,
         createAcl: { ownerGid: '1000', ownerUid: '1000', permissions: '750' },
