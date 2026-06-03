@@ -26,7 +26,6 @@ import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
 import { Construct } from 'constructs';
 import { SOLVER_MANIFEST, ALWAYS_ON_TASKS, SQS_DRIVEN_TASKS, SolverTask } from './config/solver-manifest';
 import { PROVIDER_A, PROVIDER_B, PROVIDER_C } from './config/capacity-providers';
-import { ecsSecretByName } from './secret-lookup';
 
 export interface ForgeComputeStackProps extends cdk.StackProps {
   forgeEnv: string;
@@ -393,24 +392,16 @@ export class ForgeComputeStack extends cdk.Stack {
       placementConstraints: [],
     });
 
-    // EFS volumes -- one named task volume per EFS mount declared in the
-    // manifest. Each maps to a distinct rootDirectory (the manifest's
-    // sourcePath) so tasks that declare multiple EFS subpaths (e.g.
-    // forge-devops: /forge/repos + /forge/minio) all get mounted, not just
-    // the first. The volume name is derived from the sourcePath.
-    const efsMounts = task.volumes.filter(v => v.type === 'efs');
-    efsMounts.forEach((mount, i) => {
-      td.addVolume({
-        name: this.efsVolumeName(mount.sourcePath, i),
-        efsVolumeConfiguration: {
-          fileSystemId: props.efsFilesystem.fileSystemId,
-          rootDirectory: mount.sourcePath,
-          transitEncryption: 'ENABLED',
-          authorizationConfig: {
-            iam: 'ENABLED',
-          },
+    // EFS volume mount
+    td.addVolume({
+      name: 'forge-efs',
+      efsVolumeConfiguration: {
+        fileSystemId: props.efsFilesystem.fileSystemId,
+        transitEncryption: 'ENABLED',
+        authorizationConfig: {
+          iam: 'ENABLED',
         },
-      });
+      },
     });
 
     // Build environment variables -- inject runtime config
@@ -476,79 +467,17 @@ export class ForgeComputeStack extends cdk.Stack {
       }),
     });
 
-    // Mount every EFS volume declared by the task (not just the first).
-    efsMounts.forEach((mount, i) => {
+    // Mount EFS volume (first EFS mount in task's volume list)
+    const efsMount = task.volumes.find(v => v.type === 'efs');
+    if (efsMount) {
       container.addMountPoints({
-        containerPath: mount.containerPath,
-        sourceVolume: this.efsVolumeName(mount.sourcePath, i),
-        readOnly: mount.readOnly ?? false,
+        containerPath: efsMount.containerPath,
+        sourceVolume: 'forge-efs',
+        readOnly: efsMount.readOnly ?? false,
       });
-    });
-
-    // Per-task extra wiring (secrets, additional ports). Kept surgical and
-    // idempotent so re-synths produce stable templates.
-    this.applyDevopsWiring(task, container, executionRole);
+    }
 
     return td;
-  }
-
-  /**
-   * Stable, CFN-safe task-volume name derived from an EFS sourcePath
-   * (e.g. '/forgejo' -> 'forge-efs-forgejo'). The index suffix guarantees
-   * uniqueness even if two mounts share a basename.
-   */
-  private efsVolumeName(sourcePath: string, index: number): string {
-    const slug = sourcePath.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'root';
-    return `forge-efs-${slug}-${index}`;
-  }
-
-  /**
-   * forge-devops-specific wiring:
-   *  - expose the SysML public port (SYSML_API_PORT, default 9000) in addition
-   *    to the primary Nginx port (80), so the app can reach the SysML kernel at
-   *    forge-devops.forge.local:9000 while git.forge.local / :80 serve Forgejo.
-   *  - inject MinIO root creds (forge/minio/root) and the Forgejo admin PAT
-   *    (forge/test/forgejo-pat) as Secrets-Manager-backed env vars (valueFrom),
-   *    never plaintext. Uses secret-lookup.ts so the task def gets a complete ARN.
-   *
-   * No-op for every other task, so the shared loop stays unchanged.
-   */
-  private applyDevopsWiring(
-    task: SolverTask,
-    container: ecs.ContainerDefinition,
-    executionRole: iam.Role,
-  ): void {
-    if (task.name !== 'forge-devops') return;
-
-    // Additional SysML port (the manifest's SYSML_API_PORT, default 9000).
-    const sysmlPort = Number(task.environment['SYSML_API_PORT'] ?? '9000');
-    container.addPortMappings({
-      containerPort: sysmlPort,
-      hostPort: sysmlPort,
-      protocol: ecs.Protocol.TCP,
-    });
-
-    // Secrets injected at runtime via valueFrom (see secret-lookup.ts). The
-    // MinIO root secret is a JSON blob with `username`/`password` keys; the
-    // Forgejo PAT is a plaintext secret.
-    container.addSecret(
-      'MINIO_ROOT_USER',
-      ecsSecretByName(this, 'DevopsMinioUser', 'forge/minio/root', 'username'),
-    );
-    container.addSecret(
-      'MINIO_ROOT_PASSWORD',
-      ecsSecretByName(this, 'DevopsMinioPassword', 'forge/minio/root', 'password'),
-    );
-    container.addSecret(
-      'FORGEJO_ADMIN_TOKEN',
-      ecsSecretByName(this, 'DevopsForgejoPat', 'forge/test/forgejo-pat'),
-    );
-
-    // The execution role already allows GetSecretValue on forge/* (see ctor),
-    // but grant explicitly on the looked-up ARNs as well for least-privilege
-    // clarity. importSecretByName returns ISecret tokens; the broad forge/*
-    // statement covers them, so no extra grant call is required here.
-    void executionRole;
   }
 
   private createAlwaysOnService(
@@ -578,18 +507,11 @@ export class ForgeComputeStack extends cdk.Stack {
       ],
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [props.ecsSecurityGroup],
-      // Cloud Map for service discovery.
-      // forge-devops uses an A record (awsvpc task ENI IP) so the app can reach
-      // BOTH the Nginx/Forgejo front at forge-devops.forge.local:80 AND the
-      // SysML kernel at forge-devops.forge.local:9000 over the same hostname.
-      // An SRV record would pin discovery to a single port; A records expose
-      // every container port. Other always-on tasks keep SRV.
+      // Cloud Map for service discovery
       cloudMapOptions: {
         name: task.name,
         cloudMapNamespace: dnsNamespace,
-        dnsRecordType: task.name === 'forge-devops'
-          ? servicediscovery.DnsRecordType.A
-          : servicediscovery.DnsRecordType.SRV,
+        dnsRecordType: servicediscovery.DnsRecordType.SRV,
         dnsTtl: cdk.Duration.seconds(10),
       },
     });
