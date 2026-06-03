@@ -26,7 +26,6 @@ import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
 import { Construct } from 'constructs';
 import { SOLVER_MANIFEST, ALWAYS_ON_TASKS, SQS_DRIVEN_TASKS, SolverTask } from './config/solver-manifest';
 import { PROVIDER_A, PROVIDER_B, PROVIDER_C } from './config/capacity-providers';
-import { ecsSecretByName } from './secret-lookup';
 
 export interface ForgeComputeStackProps extends cdk.StackProps {
   forgeEnv: string;
@@ -37,7 +36,6 @@ export interface ForgeComputeStackProps extends cdk.StackProps {
   albSecurityGroup: ec2.SecurityGroup;
   dataBucket: s3.Bucket;
   efsFilesystem: efs.FileSystem;
-  efsAccessPoints: Record<string, efs.AccessPoint>;
   jobsTable: dynamodb.Table;
   ecrRepos: Map<string, ecr.Repository>;
   rdsEndpoint: string;
@@ -64,13 +62,10 @@ export class ForgeComputeStack extends cdk.Stack {
     });
 
     // ── Cloud Map: forge.local ────────────────────────────────────────────────
-    // Import the existing forge.local namespace instead of creating a new one.
-    // Creating it would replace the live namespace and break
-    // forge-devops.forge.local service discovery for the running web app.
-    const dnsNamespace = servicediscovery.PrivateDnsNamespace.fromPrivateDnsNamespaceAttributes(this, 'ForgeDns', {
-      namespaceName: 'forge.local',
-      namespaceId: 'ns-dcqpbkmnzbqgpiub',
-      namespaceArn: `arn:aws:servicediscovery:${this.region}:${this.account}:namespace/ns-dcqpbkmnzbqgpiub`,
+    const dnsNamespace = new servicediscovery.PrivateDnsNamespace(this, 'ForgeDns', {
+      name: 'forge.local',
+      vpc: props.vpc,
+      description: 'FORGE service discovery namespace',
     });
 
     // ── CloudWatch Log Groups ─────────────────────────────────────────────────
@@ -397,31 +392,16 @@ export class ForgeComputeStack extends cdk.Stack {
       placementConstraints: [],
     });
 
-    // EFS volumes -- one named task volume per EFS mount declared in the
-    // manifest. Each maps to a distinct rootDirectory (the manifest's
-    // sourcePath) so tasks that declare multiple EFS subpaths (e.g.
-    // forge-devops: /forge/repos + /forge/minio) all get mounted, not just
-    // the first. The volume name is derived from the sourcePath.
-    const efsMounts = task.volumes.filter(v => v.type === 'efs');
-    efsMounts.forEach((mount, i) => {
-      const accessPoint = props.efsAccessPoints[mount.sourcePath];
-      if (!accessPoint) {
-        throw new Error(
-          `No EFS access point defined for sourcePath "${mount.sourcePath}" ` +
-            `(task "${task.name}"). Add it to ForgeDataStack.efsAccessPoints.`,
-        );
-      }
-      td.addVolume({
-        name: this.efsVolumeName(mount.sourcePath, i),
-        efsVolumeConfiguration: {
-          fileSystemId: props.efsFilesystem.fileSystemId,
-          transitEncryption: 'ENABLED',
-          authorizationConfig: {
-            accessPointId: accessPoint.accessPointId,
-            iam: 'ENABLED',
-          },
+    // EFS volume mount
+    td.addVolume({
+      name: 'forge-efs',
+      efsVolumeConfiguration: {
+        fileSystemId: props.efsFilesystem.fileSystemId,
+        transitEncryption: 'ENABLED',
+        authorizationConfig: {
+          iam: 'ENABLED',
         },
-      });
+      },
     });
 
     // Build environment variables -- inject runtime config
@@ -487,85 +467,23 @@ export class ForgeComputeStack extends cdk.Stack {
       }),
     });
 
-    // Mount every EFS volume declared by the task (not just the first).
-    efsMounts.forEach((mount, i) => {
+    // Mount EFS volume (first EFS mount in task's volume list)
+    const efsMount = task.volumes.find(v => v.type === 'efs');
+    if (efsMount) {
       container.addMountPoints({
-        containerPath: mount.containerPath,
-        sourceVolume: this.efsVolumeName(mount.sourcePath, i),
-        readOnly: mount.readOnly ?? false,
+        containerPath: efsMount.containerPath,
+        sourceVolume: 'forge-efs',
+        readOnly: efsMount.readOnly ?? false,
       });
-    });
-
-    // Per-task extra wiring (secrets, additional ports). Kept surgical and
-    // idempotent so re-synths produce stable templates.
-    this.applyDevopsWiring(task, container, executionRole);
+    }
 
     return td;
-  }
-
-  /**
-   * Stable, CFN-safe task-volume name derived from an EFS sourcePath
-   * (e.g. '/forgejo' -> 'forge-efs-forgejo'). The index suffix guarantees
-   * uniqueness even if two mounts share a basename.
-   */
-  private efsVolumeName(sourcePath: string, index: number): string {
-    const slug = sourcePath.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'root';
-    return `forge-efs-${slug}-${index}`;
-  }
-
-  /**
-   * forge-devops-specific wiring:
-   *  - expose the SysML public port (SYSML_API_PORT, default 9000) in addition
-   *    to the primary Nginx port (80), so the app can reach the SysML kernel at
-   *    forge-devops.forge.local:9000 while git.forge.local / :80 serve Forgejo.
-   *  - inject MinIO root creds (forge/minio/root) and the Forgejo admin PAT
-   *    (forge/test/forgejo-pat) as Secrets-Manager-backed env vars (valueFrom),
-   *    never plaintext. Uses secret-lookup.ts so the task def gets a complete ARN.
-   *
-   * No-op for every other task, so the shared loop stays unchanged.
-   */
-  private applyDevopsWiring(
-    task: SolverTask,
-    container: ecs.ContainerDefinition,
-    executionRole: iam.Role,
-  ): void {
-    if (task.name !== 'forge-devops') return;
-
-    // Additional SysML port (the manifest's SYSML_API_PORT, default 9000).
-    const sysmlPort = Number(task.environment['SYSML_API_PORT'] ?? '9000');
-    container.addPortMappings({
-      containerPort: sysmlPort,
-      hostPort: sysmlPort,
-      protocol: ecs.Protocol.TCP,
-    });
-
-    // Secrets injected at runtime via valueFrom (see secret-lookup.ts). The
-    // MinIO root secret is a JSON blob with `username`/`password` keys; the
-    // Forgejo PAT is a plaintext secret.
-    container.addSecret(
-      'MINIO_ROOT_USER',
-      ecsSecretByName(this, 'DevopsMinioUser', 'forge/minio/root', 'username'),
-    );
-    container.addSecret(
-      'MINIO_ROOT_PASSWORD',
-      ecsSecretByName(this, 'DevopsMinioPassword', 'forge/minio/root', 'password'),
-    );
-    container.addSecret(
-      'FORGEJO_ADMIN_TOKEN',
-      ecsSecretByName(this, 'DevopsForgejoPat', 'forge/test/forgejo-pat'),
-    );
-
-    // The execution role already allows GetSecretValue on forge/* (see ctor),
-    // but grant explicitly on the looked-up ARNs as well for least-privilege
-    // clarity. importSecretByName returns ISecret tokens; the broad forge/*
-    // statement covers them, so no extra grant call is required here.
-    void executionRole;
   }
 
   private createAlwaysOnService(
     task: SolverTask,
     props: ForgeComputeStackProps,
-    dnsNamespace: servicediscovery.IPrivateDnsNamespace,
+    dnsNamespace: servicediscovery.PrivateDnsNamespace,
     capacityProvider: ecs.AsgCapacityProvider,
   ): ecs.Ec2Service {
     const td = this.taskDefinitions.get(task.name)!;
@@ -589,10 +507,7 @@ export class ForgeComputeStack extends cdk.Stack {
       ],
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [props.ecsSecurityGroup],
-      // Cloud Map for service discovery. forge-devops and all always-on tasks
-      // register inline with SRV records (MULTIVALUE). The app reaches
-      // forge-devops.forge.local on :80 and :9000 via the A record that CloudMap
-      // auto-publishes for the SRV instance.
+      // Cloud Map for service discovery
       cloudMapOptions: {
         name: task.name,
         cloudMapNamespace: dnsNamespace,

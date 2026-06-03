@@ -93,10 +93,8 @@ export function ecsSecretByName(
   scope: Construct,
   id: string,
   secretName: string,
-  jsonField?: string,
 ): ecs.Secret {
   return ecs.Secret.fromSecretsManager(
     importSecretByName(scope, id, secretName),
-    jsonField,
   );
 }
