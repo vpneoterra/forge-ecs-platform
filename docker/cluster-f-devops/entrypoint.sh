@@ -20,8 +20,12 @@ export NGINX_WORKERS FORGEJO_HTTP_PORT SYSML_API_PORT SYSML_JAVA_PORT \
        MINIO_API_PORT MINIO_CONSOLE_PORT FORGEJO_DOMAIN FORGEJO_ROOT_URL
 
 # ── EFS-backed data roots ────────────────────────────────────
+# /forge/repos and /forge/minio are EFS access-point mounts whose enforced
+# POSIX identity is uid=1000 gid=1000. The git (uid 1000) and minio (uid 1000)
+# processes match that identity, so no chown is needed — and a chown here would
+# fail (EPERM) against the access point. mkdir -p is a safe no-op on the
+# already-mounted dirs.
 mkdir -p /forge/repos /forge/minio
-chown -R git:git /forge/repos || true
 
 # ── Render nginx.conf ────────────────────────────────────────
 envsubst '${NGINX_WORKERS} ${FORGEJO_HTTP_PORT} ${SYSML_API_PORT} ${MINIO_API_PORT} ${FORGEJO_DOMAIN}' \

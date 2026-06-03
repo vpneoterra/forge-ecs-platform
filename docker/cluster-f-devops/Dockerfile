@@ -101,7 +101,17 @@ RUN set -eux; \
     chmod +x /usr/local/bin/forgejo; \
     /usr/local/bin/forgejo --version
 # Dedicated git user for Forgejo (data lives on EFS at /forge/repos).
-RUN useradd --system --create-home --home-dir /var/lib/forgejo --shell /bin/bash git
+# The EFS access points for /forge/repos and /forge/minio enforce a fixed
+# POSIX identity uid=1000 gid=1000 (createAcl + posixUser, see
+# lib/forge-data-stack.ts), so the processes that own those mounts MUST run as
+# uid/gid 1000 or the access point rejects all writes. We create group "forge"
+# (gid 1000) and "git" (uid 1000) to match. minio also runs as this identity
+# (see supervisord.conf). jammy ships an "ubuntu" account at uid 1000, so drop
+# it first to free the id before claiming it for git.
+RUN set -eux; \
+    if id -u ubuntu >/dev/null 2>&1; then userdel -r ubuntu 2>/dev/null || userdel ubuntu; fi; \
+    groupadd -g 1000 forge; \
+    useradd -u 1000 -g 1000 --create-home --home-dir /var/lib/forgejo --shell /bin/bash git
 
 # ── MinIO server + client (arm64) ────────────────────────────
 RUN set -eux; \
