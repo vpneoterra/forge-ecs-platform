@@ -189,6 +189,43 @@ export class ForgeDataStack extends cdk.Stack {
       this.ecrRepos.set(task.name, repo);
     }
 
+    // ── TRANSITIONAL: retain solver ECR exports ───────────────────────────────
+    // The forge-em / forge-multibody / forge-chemistry / forge-surrogate solvers
+    // were removed from SOLVER_MANIFEST, so CDK no longer creates their ECR
+    // Repository constructs and would drop the auto-generated cross-stack exports.
+    // ForgeCompute-dev is STILL deployed importing them, and CloudFormation hard-
+    // fails any ForgeData-dev update that removes an export with a live importer.
+    // Re-declare the exact exports (repos physically still exist in ECR, RETAIN)
+    // so the deploy can proceed: ForgeData publishes EFS-AP exports while keeping
+    // these, then ForgeCompute stops importing them.
+    // TRANSITIONAL: retain solver ECR exports until ForgeCompute-dev stops
+    // importing them; remove in a follow-up once `aws cloudformation list-imports`
+    // shows no importers.
+    this.exportValue('forge-em', {
+      name: 'ForgeData-dev:ExportsOutputRefEcrRepoforgeemDDF5C6F065104DDB',
+    });
+    this.exportValue('forge-multibody', {
+      name: 'ForgeData-dev:ExportsOutputRefEcrRepoforgemultibodyDCC2FE6B25B5C224',
+    });
+    this.exportValue('forge-chemistry', {
+      name: 'ForgeData-dev:ExportsOutputRefEcrRepoforgechemistry2FBEE812C3AA0EA4',
+    });
+    this.exportValue('forge-surrogate', {
+      name: 'ForgeData-dev:ExportsOutputRefEcrRepoforgesurrogate407D06A47F5EEE34',
+    });
+    this.exportValue('arn:aws:ecr:us-east-1:266087050444:repository/forge-em', {
+      name: 'ForgeData-dev:ExportsOutputFnGetAttEcrRepoforgeemDDF5C6F0Arn566A5A93',
+    });
+    this.exportValue('arn:aws:ecr:us-east-1:266087050444:repository/forge-multibody', {
+      name: 'ForgeData-dev:ExportsOutputFnGetAttEcrRepoforgemultibodyDCC2FE6BArnF427486F',
+    });
+    this.exportValue('arn:aws:ecr:us-east-1:266087050444:repository/forge-chemistry', {
+      name: 'ForgeData-dev:ExportsOutputFnGetAttEcrRepoforgechemistry2FBEE812Arn4D6C9A32',
+    });
+    this.exportValue('arn:aws:ecr:us-east-1:266087050444:repository/forge-surrogate', {
+      name: 'ForgeData-dev:ExportsOutputFnGetAttEcrRepoforgesurrogate407D06A4ArnC7BBB08B',
+    });
+
     // ── RDS PostgreSQL (optional) ─────────────────────────────────────────────
     // t4g.micro: cheapest RDS instance -- $12/month.
     // Shared by forge-devops (Forgejo + SysON) with separate databases.
