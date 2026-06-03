@@ -63,13 +63,10 @@ export class ForgeComputeStack extends cdk.Stack {
     });
 
     // ── Cloud Map: forge.local ────────────────────────────────────────────────
-    // Import the existing forge.local namespace instead of creating a new one.
-    // Creating it would replace the live namespace and break
-    // forge-devops.forge.local service discovery for the running web app.
-    const dnsNamespace = servicediscovery.PrivateDnsNamespace.fromPrivateDnsNamespaceAttributes(this, 'ForgeDns', {
-      namespaceName: 'forge.local',
-      namespaceId: 'ns-dcqpbkmnzbqgpiub',
-      namespaceArn: `arn:aws:servicediscovery:${this.region}:${this.account}:namespace/ns-dcqpbkmnzbqgpiub`,
+    const dnsNamespace = new servicediscovery.PrivateDnsNamespace(this, 'ForgeDns', {
+      name: 'forge.local',
+      vpc: props.vpc,
+      description: 'FORGE service discovery namespace',
     });
 
     // ── CloudWatch Log Groups ─────────────────────────────────────────────────
@@ -557,7 +554,7 @@ export class ForgeComputeStack extends cdk.Stack {
   private createAlwaysOnService(
     task: SolverTask,
     props: ForgeComputeStackProps,
-    dnsNamespace: servicediscovery.IPrivateDnsNamespace,
+    dnsNamespace: servicediscovery.PrivateDnsNamespace,
     capacityProvider: ecs.AsgCapacityProvider,
   ): ecs.Ec2Service {
     const td = this.taskDefinitions.get(task.name)!;
