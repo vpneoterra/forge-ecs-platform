@@ -118,6 +118,11 @@ export class ForgeAppStack extends cdk.Stack {
       this, 'OmniRepo', 'forge-omni',
     );
 
+    // forge-dks sidecar (DKS runtime co-located with forge-app on :1444)
+    const dksEcrRepo = ecr.Repository.fromRepositoryName(
+      this, 'ForgeDksRepo', 'forge-dks',
+    );
+
     // -- Feature flags --------------------------------------------------------
     // Runtime toggle for the autonomous pipeline (BullMQ on Redis). Disabling
     // this flag omits the redis-url secret entirely from the container env
@@ -147,6 +152,16 @@ export class ForgeAppStack extends cdk.Stack {
       'lucid-token',
       'database-url',
       'rodin-api-key',
+      // Live :1444 reconciliation -- secrets that were absent from CDK. Each
+      // env-var name equals <name>.replace('-','_').toUpperCase(), so the loop
+      // below wires them automatically (DEEP_ENDPOINT, DEEP_HF_TOKEN,
+      // DEVSTRAL_HF_TOKEN, DEVSTRAL_STAGING_ENDPOINT, FORGEJO_PAT, GH_TOKEN).
+      'deep-endpoint',
+      'deep-hf-token',
+      'devstral-hf-token',
+      'devstral-staging-endpoint',
+      'forgejo-pat',
+      'gh-token',
     ];
     // Autonomous Pipeline v2: Upstash Redis for BullMQ. Only include when
     // the pipeline is enabled, so disabling the flag is a clean CDK-only
@@ -190,6 +205,16 @@ export class ForgeAppStack extends cdk.Stack {
       );
     }
 
+    // Vertex SA JSON: live :1444 exposes it ONLY under the env var
+    // GEMMA_VERTEX_SA_KEY_JSON (not VERTEX_SA_JSON), so it is resolved here
+    // rather than via the secretNames loop, which would emit a VERTEX_SA_JSON
+    // key absent from live. Wired into the forge-app container `secrets` below.
+    const vertexSaForgeApp = ecsSecretByName(
+      this,
+      'SecretvertexsajsonForgeApp',
+      'forge/test/vertex-sa-json',
+    );
+
     // -- CloudWatch Log Group ------------------------------------------------
     const logGroup = new logs.LogGroup(this, 'ForgeAppLogGroup', {
       logGroupName: '/forge/ecs/forge-app-test',
@@ -216,6 +241,7 @@ export class ForgeAppStack extends cdk.Stack {
     }));
     // Allow pulling from ECR
     ecrRepo.grantPull(executionRole);
+    dksEcrRepo.grantPull(executionRole);
 
     // -- Task Role (runtime) --------------------------------------------------
     const taskRole = new iam.Role(this, 'TaskRole', {
@@ -230,12 +256,13 @@ export class ForgeAppStack extends cdk.Stack {
     }));
 
     // -- Fargate Task Definition ----------------------------------------------
-    // Pipeline v2: Upsized from 256/512 to 512/1024 for GLB buffer processing
-    // (~100-200 MB peak during ICP topology transfer + quality gate)
+    // Sized to match the live forge-app-test:1444 task def (cpu 1024 / mem
+    // 3072). The prior 512/1024 was undersized for the full forge-app + DKS
+    // sidecar + monitor co-location and contributed to runtime instability.
     const taskDef = new ecs.FargateTaskDefinition(this, 'ForgeAppTaskDef', {
       family: 'forge-app-test',
-      cpu: 512,
-      memoryLimitMiB: 1024,
+      cpu: 1024,
+      memoryLimitMiB: 3072,
       executionRole,
       taskRole,
       runtimePlatform: {
@@ -287,8 +314,12 @@ export class ForgeAppStack extends cdk.Stack {
         // invocations do not clobber the runtime flip. Re-run the flip workflow
         // to toggle between write / shadow / off without a CDK deploy.
         CHORUS_FORGE_MODE: 'write',
-        COMPUTE_HOST: '89.167.79.141',
+        COMPUTE_HOST: 'omni.qrucible.ai',
         ...CAP_PICOGK.appEnvVars,
+        // PICOGK_API_URL: live :1444 serves PicoGK off the raw compute host,
+        // not the forge-geometry.local Cloud Map name from CAP_PICOGK. Override
+        // the spread default to match live. (Override must follow the spread.)
+        PICOGK_API_URL: 'http://89.167.79.141:8015',
         // SEL (server/sel/config/sel-config.js) reads SEL_SYSML_API_BASE_URL
         // first, falling back to SYSML_API_URL. Both must target the in-cluster
         // SysML v2 kernel on port 8003 via its Cloud Map name -- not the :9000
@@ -299,9 +330,9 @@ export class ForgeAppStack extends cdk.Stack {
         LUCID_URL: 'https://api-lucid.qrucible.ai',
         FREECAD_MCP_URL: 'http://89.167.79.141:8016',
         OMNI_API_URL: 'http://omni.forge.local:5000',
-        OMNI_HOST: 'omni.forge.local',
+        OMNI_HOST: 'omni.qrucible.ai',
         OMNI_PORT: '5000',
-        DKS_ENABLED: 'false',
+        DKS_ENABLED: 'true',
         KNOWLEDGE_SERVICE_URL: 'http://dks-query.forge.local:8020',
         // -- Gemma 4 self-hosted inference (Model Router) --
         // When GEMMA_ENABLED=false (default), all LLM calls route to Claude.
@@ -339,7 +370,7 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         FIELD_DRIVEN_MIN_THICKNESS_MM: '0.3',
         FIELD_DRIVEN_MAX_THICKNESS_MM: '5.0',
         // Capability 6: FluxTK / BRAIDE Network Solver
-        FLUXTK_ENABLED: 'false',
+        FLUXTK_ENABLED: 'true',
         FLUXTK_API_URL: 'http://forge-fluxtk.forge-geometry.local:8040',
         // -- Autonomous Pipeline v2 configuration --
         PIPELINE_ENABLED: pipelineEnabled ? 'true' : 'false',
@@ -348,6 +379,134 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         PIPELINE_BUDGET_CAP_USD: '5.00',
         PIPELINE_TRIPO_CONCURRENCY: '5',
         PIPELINE_FLUX_CONCURRENCY: '10',
+        // -- Live :1444 reconciliation (108 keys) --------------------------------
+        // Every value below is copied verbatim from the live forge-app-test:1444
+        // task definition (.taskdef_groundtruth/live_1444_forge-app_env.json).
+        // These were absent from CDK, so cdk deploy produced a task def that
+        // failed the app's [FORGE F-4] required-env gate and boot-refused.
+        // -- Argus / Atlas / Axiom --
+        ARGUS_ENABLED: 'true',
+        ATLAS_AUDIT_ENABLED: 'true',
+        AXIOM_AI_TELEMETRY_ENABLED: 'true',
+        AXIOM_CEM_LOOP_VALIDATE: 'true',
+        AXIOM_INTERNAL_KEY: 'axiom-forge-internal-2026',
+        AXIOM_LOG_LEVEL: 'info',
+        AXIOM_PREDISPATCH_CHECK: 'true',
+        AXIOM_SPEC_DIMENSIONAL: 'true',
+        AXIOM_TOKEN_BUDGET_DAY: '200000',
+        AXIOM_USE_MOCK: 'false',
+        // -- Assets / CDN / S3 --
+        ASSET_CDN_BASE: 'https://d9va7rcq7bqjn.cloudfront.net',
+        ASSET_RECONCILER_ENABLED: 'true',
+        ASSET_RECONCILER_TICK_MS: '60000',
+        AWS_S3_BUCKET_CEM_ASSETS: 'forge-cem-assets',
+        AWS_S3_REGION: 'us-east-1',
+        // -- Conductor --
+        CONDUCTOR_DEADLETTER_ENABLED: 'true',
+        CONDUCTOR_LEASES_ENABLED: 'true',
+        CONDUCTOR_VERDICTS_ENABLED: 'true',
+        // -- Darwin --
+        DARWIN_CIRCUIT_BREAKER_THRESHOLD: '0.05',
+        DARWIN_ENABLED: 'true',
+        DARWIN_HEPH_BRIDGE: 'false',
+        DARWIN_JUDGE_MODEL: 'claude-sonnet-4-20250514',
+        DARWIN_MAX_BRANCHES_PER_DAY: '3',
+        DARWIN_MIN_SAMPLE_SIZE: '10',
+        DARWIN_RESEARCHER_MODEL: 'claude-sonnet-4-20250514',
+        // -- Deep / Devstral / DKS --
+        DEEP_ENABLED: 'true',
+        DEVSTRAL_ENABLED: 'true',
+        DKS_SERVICE_URL: 'http://localhost:8020',
+        // -- Forgejo / Forge core --
+        FORGEJO_URL: 'http://forge-devops.forge.local/git',
+        FORGE_ADMIT_COST_BUDGET_USD_PER_MIN: '5.0',
+        FORGE_ADMIT_MAX: '16',
+        FORGE_ADMIT_SLOW_LANE_MS: '60000',
+        FORGE_ARCHETYPE_BINDER: 'true',
+        FORGE_AUTO_CLASP_ON_DECOMPOSE: 'true',
+        FORGE_AUTO_EMIT_BOM_READY: 'true',
+        FORGE_AUTO_EMIT_PROGRAM_READY: 'true',
+        FORGE_AUTO_W3_ON_SP_ACTIVATED: 'true',
+        FORGE_AUTO_W4_ON_SP_ACTIVATED: 'true',
+        FORGE_AUTO_W5_ON_SP_ACTIVATED: 'true',
+        FORGE_BRIEF_PREFLIGHT_STRICT: 'false',
+        FORGE_COMPOSE_QUALITY_ENABLED: 'true',
+        FORGE_DEEP_ENRICHMENT: 'true',
+        FORGE_DEEP_SPATIAL_ASSEMBLY: 'true',
+        FORGE_DEFAULT_NEXUS_LOOP_MODE: 'write',
+        FORGE_DEFAULT_PROGRAM_LOOP_MODE: 'write',
+        FORGE_DYNAMIC_ADMIT: 'true',
+        FORGE_FEATURE_FLAG_STORE_URL: '',
+        FORGE_GENERATION_STAGE_MACHINE: 'true',
+        FORGE_GIT_BASE_BRANCH: 'hephaestus',
+        FORGE_HONEST_BANNERS: 'true',
+        FORGE_LAZY_START_ALL_EVENTS: 'true',
+        FORGE_LEGACY_SP_ACTIVATED_BOMGEN: 'false',
+        FORGE_NEXUS_LOOP_GLOBAL_DISABLE: 'false',
+        FORGE_SWEEP_AUTO_DRIVE: 'true',
+        FRAMES_EMIT_ENABLED: 'true',
+        // -- Gemma / Vertex --
+        GEMMA_PROVIDER: 'vertex',
+        GEMMA_VERTEX_CB_RECOVERY_MS: '60000',
+        GEMMA_VERTEX_CB_THRESHOLD: '5',
+        GEMMA_VERTEX_ENDPOINT_ID: 'mg-endpoint-8f11b5ef-4cd2-414e-a238-0f3b4904d17f',
+        GEMMA_VERTEX_MODE: 'openai_shim',
+        GEMMA_VERTEX_MODEL: 'gemma-4-26b-a4b-mg-one-click-deploy',
+        GEMMA_VERTEX_PROJECT: 'mindful-vial-493123-a5',
+        GEMMA_VERTEX_PROJECT_NUMBER: '945884688373',
+        GEMMA_VERTEX_REGION: 'us-central1',
+        GEMMA_VERTEX_TIMEOUT_MS: '20000',
+        // -- GitHub --
+        GITHUB_OWNER: 'vpneoterra',
+        GITHUB_REPO: 'forgenew',
+        // -- Hydrate diagnostics --
+        HYDRATE_DIAG_EFFORT: 'medium',
+        HYDRATE_DIAG_MAX_RETRIES: '0',
+        HYDRATE_DIAG_TIMEOUT_MS: '180000',
+        // -- Image / diag --
+        IMAGE_TAG: '8a9a4078705e0a692a58aa12b560c8c6a0eef4a1',
+        INTERNAL_DIAG_TOKEN: '1234',
+        KEYSTONE_HF_ENDPOINT: 'https://mfto106x86m937qp.us-east-1.aws.endpoints.huggingface.cloud',
+        // -- Maestro --
+        MAESTRO_BACKEND: 'pgboss',
+        MAESTRO_HARNESS_ENABLED: 'true',
+        MAESTRO_HARNESS_MONITOR_ONLY: 'false',
+        MAESTRO_PERIODIC_SWEEP_ENABLED: 'true',
+        MAESTRO_RETRY_FAILED_SP: 'false',
+        MAESTRO_SAGA_BACKEND_GPU_LEASE_ENABLED: 'false',
+        MAESTRO_SAGA_BACKEND_IR_REVERT_ENABLED: 'false',
+        MAESTRO_SAGA_BACKEND_MESH_BLOB_ENABLED: 'false',
+        MAESTRO_SAGA_BACKEND_SOLVER_KILL_ENABLED: 'false',
+        MAESTRO_SERVER_DRIVERS_ENABLED: 'true',
+        MAESTRO_STALE_ACTIVE_MS: '600000',
+        MAESTRO_SWEEP_MS: '30000',
+        MAESTRO_SYSTEM_USER_ID: '83480f67-e6f2-4876-9abc-d32e5471fd4a',
+        MAESTRO_V2_HEARTBEATS_ENABLED: 'true',
+        // -- MCP --
+        MCP_APPS_ENABLED: 'true',
+        MCP_ELICIT_ENABLED: 'false',
+        MCP_ELICIT_TIMEOUT_MS: '300000',
+        MCP_GATEWAY_ENABLED: 'true',
+        MCP_REGIONS_TEMPLATE_DIR: 'concertmaster/catalog/region_templates',
+        MCP_SERVER_ENABLED: 'true',
+        MCP_SSE_VIEW_STATE_ENABLED: 'false',
+        MCP_SUPABASE_SERVICE_ROLE_KEY: '',
+        MCP_UNIFIED_WORKFLOW_ENABLED: 'true',
+        // -- Meridian / Nexus / Omni / Pantheon --
+        MERIDIAN_PHASE_TIMEOUT_MS: '300000',
+        NEXUS_SCHEDULER_CONCURRENCY: '2',
+        NEXUS_SCHEDULER_ENABLED: 'true',
+        NEXUS_SCHEDULER_POLL_MS: '2000',
+        OMNI_FIDELITY_GATE_ENFORCE: 'true',
+        PANTHEON_MAX_ROUNDS: '1',
+        // -- Qrucible --
+        QRUCIBLE_API_URL: 'https://ip.qrucible.ai',
+        QRUCIBLE_BACKEND_URL: 'https://ip.qrucible.ai',
+        // -- UI engine phases --
+        UI_ENG_PHASE_1_ENABLED: 'true',
+        UI_ENG_PHASE_2_ENABLED: 'true',
+        UI_ENG_PHASE_3_ENABLED: 'true',
+        UI_ENG_PHASE_4_ENABLED: 'true',
       },
       secrets: {
         ...secrets,
@@ -355,6 +514,12 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         DKS_DATABASE_URL: dksSecrets['DKS_DATABASE_URL'],
         DKS_SUPABASE_URL: dksSecrets['DKS_SUPABASE_URL'],
         DKS_SUPABASE_SERVICE_KEY: dksSecrets['DKS_SUPABASE_SERVICE_KEY'],
+        // Live :1444 secrets whose env-var name differs from the secret short
+        // name. Reuse the already-resolved ecs.Secret objects so no duplicate
+        // AwsCustomResource lookup is created for the same underlying secret.
+        GEMMA_VERTEX_SA_KEY_JSON: vertexSaForgeApp, // forge/test/vertex-sa-json
+        FORGEJO_TOKEN: secrets['FORGEJO_PAT'],               // same secret as FORGEJO_PAT
+        SUPABASE_SERVICE_ROLE_KEY: secrets['SUPABASE_SERVICE_KEY'], // same as SUPABASE_SERVICE_KEY
       },
       logging: ecs.LogDrivers.awsLogs({
         logGroup,
@@ -371,13 +536,59 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
 
     container.addPortMappings({ containerPort: 3000 });
 
+    // -- forge-dks sidecar -- DKS runtime co-located with forge-app -----------
+    // Present in the live forge-app-test:1444 task def but entirely absent from
+    // CDK, so cdk deploy dropped it. essential:false so a DKS crash does not
+    // kill the main task. Env + secrets copied verbatim from
+    // .taskdef_groundtruth/live_1444_dks_full.json. The two secrets reuse the
+    // already-resolved ecs.Secret objects (dks-database-url, anthropic-api-key)
+    // to avoid duplicate AwsCustomResource lookups.
+    taskDef.addContainer('forge-dks', {
+      image: ecs.ContainerImage.fromEcrRepository(dksEcrRepo, 'latest'),
+      essential: false,
+      environment: {
+        DKS_RUNLOG_S3_PREFIX: 'monitor-logs/',
+        DKS_LOG_LEVEL: 'INFO',
+        DKS_RUNLOG_ENABLED: '1',
+        AWS_REGION: 'us-east-1',
+        DKS_RUNLOG_S3_BUCKET: 'forge-cem-assets',
+        DKS_CONFIDENCE_THRESHOLD: '0.6',
+      },
+      secrets: {
+        DATABASE_URL: dksSecrets['DKS_DATABASE_URL'], // forge/test/dks-database-url
+        ANTHROPIC_API_KEY: secrets['ANTHROPIC_API_KEY'],
+      },
+      logging: ecs.LogDrivers.awsLogs({
+        logGroup,
+        streamPrefix: 'forge-dks',
+      }),
+      healthCheck: {
+        // Live command has a nested-unescaped-quote bug; use the correctly
+        // escaped urllib equivalent (same intent: probe localhost:8020/ready).
+        command: [
+          'CMD-SHELL',
+          'python3 -c "import urllib.request; urllib.request.urlopen(\'http://localhost:8020/ready\')" || exit 1',
+        ],
+        interval: cdk.Duration.seconds(30),
+        timeout: cdk.Duration.seconds(10),
+        retries: 5,
+        startPeriod: cdk.Duration.seconds(120),
+      },
+    });
+
     // -- Monitoring sidecar -- polls internal endpoints, pushes custom metrics --
     // essential: false so a sidecar crash does not kill the main task
     taskDef.addContainer('forge-monitor-sidecar', {
       image: ecs.ContainerImage.fromRegistry('amazon/cloudwatch-agent:latest'),
       essential: false,
       environment: {
-        FORGE_APP_URL: 'http://localhost:3000',
+        // CW_CONFIG_CONTENT drives the CloudWatch agent to actually emit
+        // metrics (statsd -> Forge/ECS namespace). Copied verbatim from the
+        // live forge-app-test:1444 task def
+        // (.taskdef_groundtruth/live_1444_monitor.json). The prior FORGE_APP_URL
+        // stub did nothing -- the agent had no config and emitted no metrics.
+        CW_CONFIG_CONTENT:
+          '{"agent": {"metrics_collection_interval": 60, "omit_hostname": true, "debug": false}, "metrics": {"namespace": "Forge/ECS", "append_dimensions": {"ClusterName": "forge-app-dev", "ServiceName": "forge-app-test"}, "metrics_collected": {"statsd": {"service_address": ":8125", "metrics_collection_interval": 60, "metrics_aggregation_interval": 60}}}}',
       },
       logging: ecs.LogDrivers.awsLogs({
         logGroup,
