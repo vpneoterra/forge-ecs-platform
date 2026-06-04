@@ -289,7 +289,12 @@ export class ForgeAppStack extends cdk.Stack {
         CHORUS_FORGE_MODE: 'write',
         COMPUTE_HOST: '89.167.79.141',
         ...CAP_PICOGK.appEnvVars,
-        SYSML_API_URL: 'http://89.167.79.141:8003',
+        // SEL (server/sel/config/sel-config.js) reads SEL_SYSML_API_BASE_URL
+        // first, falling back to SYSML_API_URL. Both must target the in-cluster
+        // SysML v2 kernel on port 8003 via its Cloud Map name -- not the :9000
+        // Uvicorn front and not a raw public IP. Inert until the kernel boots.
+        SEL_SYSML_API_BASE_URL: 'http://forge-devops.forge.local:8003',
+        SYSML_API_URL: 'http://forge-devops.forge.local:8003',
         HETZNER_COMPUTE_URL: 'http://89.167.79.141:8001',
         LUCID_URL: 'https://api-lucid.qrucible.ai',
         FREECAD_MCP_URL: 'http://89.167.79.141:8016',
