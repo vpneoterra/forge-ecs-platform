@@ -104,6 +104,18 @@ export const SOLVER_MANIFEST: SolverTask[] = [
       MINIO_ROOT_USER_SECRET: 'forge/minio/root',
       SYSML_API_PORT: '9000',
       SYSONS_PORT: '9001',
+      // sysml-java kernel runs on eclipse-temurin JDK 17. Guice/cglib do deep
+      // reflection into java.lang.ClassLoader.defineClass, which JDK 16+ strong
+      // encapsulation blocks (InaccessibleObjectException), crash-looping the
+      // kernel on every boot. supervisord launches it as
+      // `java $JAVA_OPTS -jar sysml-v2-api-services.jar`, so the --add-opens
+      // flags belong here. This task-def value overrides the image's Dockerfile
+      // JAVA_OPTS default; the -Xmx/UseContainerSupport flags are preserved.
+      JAVA_OPTS:
+        '-Xmx1024m -XX:+UseContainerSupport ' +
+        '--add-opens java.base/java.lang=ALL-UNNAMED ' +
+        '--add-opens java.base/java.lang.reflect=ALL-UNNAMED ' +
+        '--add-opens java.base/java.util=ALL-UNNAMED',
       DYNAMODB_TABLE: 'forge-jobs',
       S3_BUCKET: 'forge-platform-data',
       // DB_HOST resolved at runtime via Cloud Map / SSM
