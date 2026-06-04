@@ -502,16 +502,12 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       capacityProviderStrategies: [
         { capacityProvider: 'FARGATE_SPOT', weight: 1, base: 1 },
       ],
-      // Cloud Map registration so OMNI can reach the FORGE Node enrichment
-      // bridge at `forge-app-test.forge.local:3000`. Previously absent --
-      // forge-app-test had no private DNS record at all. Same pattern as
-      // the OMNI service below (line ~590). RCA: FluxTK_ServiceDiscovery_RCA.md.
-      cloudMapOptions: {
-        name: 'forge-app-test',
-        cloudMapNamespace: namespace,
-        dnsRecordType: servicediscovery.DnsRecordType.A,
-        dnsTtl: cdk.Duration.seconds(10),
-      },
+      // Cloud Map registration for forge-app-test is managed OUT-OF-BAND
+      // (srv-oxqi6vvrhy44u2jr, created 2026-05-28 per
+      // FluxTK_ServiceDiscovery_RCA.md / PR #58). A CDK-managed cloudMapOptions
+      // here collides with that pre-existing service ('already exists') and
+      // deadlocks deploy, so it is intentionally omitted. See drift
+      // reconciliation Option B.
     });
 
     this.serviceName = 'forge-app-test';
