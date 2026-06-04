@@ -51,18 +51,30 @@ export function importSecretByName(
   id: string,
   secretName: string,
 ): secretsmanager.ISecret {
+  // The physicalResourceId MUST vary every synth. With a constant ID the
+  // serialized custom-resource properties never change, so CloudFormation sees
+  // no diff and skips re-invoking describeSecret -- permanently caching the
+  // suffix captured on first deploy. When a secret is rotated/recreated
+  // out-of-band its 6-char suffix changes, the cached ARN goes dead, and every
+  // ECS task referencing it fails with ResourceNotFoundException -> circuit
+  // breaker -> rollback. Date.now() (evaluated at synth time) forces a new ID
+  // each deploy, so CFN re-invokes the lookup and fetches the CURRENT ARN.
   const lookup = new AwsCustomResource(scope, `${id}Lookup`, {
     onCreate: {
       service: 'SecretsManager',
       action: 'describeSecret',
       parameters: { SecretId: secretName },
-      physicalResourceId: PhysicalResourceId.of(`${secretName}-arn-lookup`),
+      physicalResourceId: PhysicalResourceId.of(
+        `${secretName}-arn-lookup-${Date.now()}`,
+      ),
     },
     onUpdate: {
       service: 'SecretsManager',
       action: 'describeSecret',
       parameters: { SecretId: secretName },
-      physicalResourceId: PhysicalResourceId.of(`${secretName}-arn-lookup`),
+      physicalResourceId: PhysicalResourceId.of(
+        `${secretName}-arn-lookup-${Date.now()}`,
+      ),
     },
     // DescribeSecret requires the partial ARN in the resource policy. We use
     // a wildcard on the suffix so the IAM check passes regardless of the
