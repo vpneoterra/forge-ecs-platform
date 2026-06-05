@@ -23,6 +23,7 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as autoscaling from 'aws-cdk-lib/aws-autoscaling';
 import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
 import { SOLVER_MANIFEST, ALWAYS_ON_TASKS, SQS_DRIVEN_TASKS, SolverTask } from './config/solver-manifest';
 import { PROVIDER_A, PROVIDER_B, PROVIDER_C } from './config/capacity-providers';
@@ -47,6 +48,7 @@ export class ForgeComputeStack extends cdk.Stack {
   public readonly taskDefinitions: Map<string, ecs.Ec2TaskDefinition>;
   public readonly sqsQueues: Map<string, sqs.Queue>;
   public readonly services: Map<string, ecs.Ec2Service>;
+  private readonly sysmlApplicationSecret: secretsmanager.ISecret;
 
   constructor(scope: Construct, id: string, props: ForgeComputeStackProps) {
     super(scope, id, props);
@@ -96,6 +98,28 @@ export class ForgeComputeStack extends cdk.Stack {
       actions: ['secretsmanager:GetSecretValue', 'ssm:GetParameters', 'kms:Decrypt'],
       resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:forge/*`],
     }));
+
+    // ── SysML v2 Play application secret ──────────────────────────────────────
+    // The forge-devops kernel runs the upstream SysML-v2-API-Services Play
+    // Framework app. In prod mode Play requires play.http.secret.key to be set
+    // (it reads ${?APPLICATION_SECRET}); a missing/blank value throws a
+    // Configuration error in HttpConfiguration.getSecretConfiguration and the
+    // process exits 255, crash-looping under supervisord. Provision a random
+    // 64-char secret here and inject it via the ECS secrets mechanism below so
+    // the value never lands in env/process args.
+    const sysmlApplicationSecret = new secretsmanager.Secret(this, 'SysmlApplicationSecret', {
+      secretName: `forge/${props.forgeEnv}/sysml-application-secret`,
+      description: 'Play framework play.http.secret.key for the SysML v2 API kernel (forge-devops)',
+      generateSecretString: {
+        passwordLength: 64,
+        excludePunctuation: true,
+      },
+    });
+    this.sysmlApplicationSecret = sysmlApplicationSecret;
+    // The shared execution role is resource-scoped to forge/* (above), which
+    // already covers this secret; grantRead additionally scopes the secret's
+    // KMS key decrypt grant to the role explicitly.
+    sysmlApplicationSecret.grantRead(taskExecutionRole);
 
     // ── ECS Task Role (runtime permissions) ───────────────────────────────────
     const taskRole = new iam.Role(this, 'TaskRole', {
@@ -439,6 +463,14 @@ export class ForgeComputeStack extends cdk.Stack {
 
     const logGroup = logGroups.get(task.name);
 
+    // Container secrets injected via the ECS secrets mechanism (valueFrom
+    // Secrets Manager), never as plaintext env or -D java args.
+    const secrets: { [key: string]: ecs.Secret } = {};
+    if (task.name === 'forge-devops') {
+      // Play reads play.http.secret.key from ${?APPLICATION_SECRET}.
+      secrets['APPLICATION_SECRET'] = ecs.Secret.fromSecretsManager(this.sysmlApplicationSecret);
+    }
+
     // Main container
     const container = td.addContainer(`${task.name}-container`, {
       image: imageUri,
@@ -446,6 +478,7 @@ export class ForgeComputeStack extends cdk.Stack {
       memoryLimitMiB: task.memory,
       essential: task.essential,
       environment: envVars,
+      secrets: Object.keys(secrets).length > 0 ? secrets : undefined,
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: task.name,
         logGroup,
