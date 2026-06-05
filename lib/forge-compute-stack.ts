@@ -524,14 +524,16 @@ export class ForgeComputeStack extends cdk.Stack {
   ): ecs.Ec2Service {
     const td = this.taskDefinitions.get(task.name)!;
 
-    // forge-devops carries no Cloud Map service discovery in this step. AWS
-    // Cloud Map forbids two services with the same name in a namespace at once
-    // and forbids changing a service's DNS record type in place, so the old
-    // SRV ServiceDiscovery::Service and the A-record one cannot coexist during
-    // a single replacement deploy. This step removes forge-devops from Cloud
-    // Map entirely so CFN deletes the old SRV logical resource and clears the
-    // ECS ServiceRegistries entry; the A-record service is reintroduced in a
-    // follow-up deploy once the old state is gone. Other services keep SRV.
+    // forge-devops publishes an A record: consumers reach the SysML kernel by
+    // name on the fixed nginx port 80 (http://forge-devops.forge.local), and
+    // Node's fetch() only does an A/AAAA lookup -- it never consults SRV. An
+    // SRV-only record yields ENODATA on resolve4 and breaks the SEL projection
+    // bootstrap. Other services keep SRV (no fixed consumer port).
+    //
+    // forge-devops uses an explicit Service construct (logical id
+    // SvcforgedevopsCloudmapServiceA) rather than the implicit cloudMapOptions
+    // path. The prior SRV service was already removed in the preceding deploy,
+    // so creating the A-record service no longer collides on name/physical id.
     const isDevops = task.name === 'forge-devops';
 
     const service = new ecs.Ec2Service(this, `Svc${task.name.replace(/-/g, '')}`, {
@@ -553,8 +555,8 @@ export class ForgeComputeStack extends cdk.Stack {
       ],
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [props.ecsSecurityGroup],
-      // SRV services use the implicit cloudMapOptions path. forge-devops gets
-      // no Cloud Map service discovery in this step (see comment above).
+      // SRV services use the implicit cloudMapOptions path. forge-devops is
+      // associated below to its explicit A-record service instead.
       cloudMapOptions: isDevops ? undefined : {
         name: task.name,
         cloudMapNamespace: dnsNamespace,
@@ -562,6 +564,17 @@ export class ForgeComputeStack extends cdk.Stack {
         dnsTtl: cdk.Duration.seconds(10),
       },
     });
+
+    if (isDevops) {
+      const devopsCloudMap = new servicediscovery.Service(this, 'SvcforgedevopsCloudmapServiceA', {
+        namespace: dnsNamespace,
+        name: task.name,
+        dnsRecordType: servicediscovery.DnsRecordType.A,
+        dnsTtl: cdk.Duration.seconds(10),
+        customHealthCheck: { failureThreshold: 1 },
+      });
+      service.associateCloudMapService({ service: devopsCloudMap });
+    }
 
     return service;
   }
