@@ -153,13 +153,24 @@ export class ForgeLucidStack extends cdk.Stack {
     const forgeUrl = importSecret(this, 'LucidForgeUrl', 'FORGE_URL');
 
     // -- CloudWatch log group ------------------------------------------------
-    // Import the log group by name instead of creating it. A prior failed
-    // stack CREATE retained the log group (by design -- crash logs must
-    // outlive a rollback), so a fresh CREATE cannot allocate the same name.
-    // Importing is the idempotent path: if the group doesn't exist yet, the
-    // first ECS task write creates it; retention is managed out-of-band.
+    // 'dev' (legacy blue) keeps importing the existing /forge/ecs/lucid-dev
+    // group byte-for-byte: it was provisioned out-of-band before this stack
+    // owned it, and importing avoids adopting/duplicating/destroying the live
+    // group. Any other env (e.g. 'dev2') has no pre-existing group, so the
+    // stack must CREATE and own it -- otherwise the awslogs driver fails
+    // CreateLogStream (ResourceNotFoundException) and the task dies before
+    // start -> circuit breaker -> rollback. Mirrors the env-scope idiom and
+    // retention/removalPolicy used by sibling ECS log groups (forge-app,
+    // forge-omni, forge-geometry).
+    const legacyEnv = props.forgeEnv === 'dev';
     const logGroupName = `/forge/ecs/lucid-${props.forgeEnv}`;
-    const logGroup = logs.LogGroup.fromLogGroupName(this, 'LucidLogGroup', logGroupName);
+    const logGroup = legacyEnv
+      ? logs.LogGroup.fromLogGroupName(this, 'LucidLogGroup', logGroupName)
+      : new logs.LogGroup(this, 'LucidLogGroup', {
+          logGroupName,
+          retention: logs.RetentionDays.ONE_WEEK,
+          removalPolicy: cdk.RemovalPolicy.DESTROY,
+        });
 
     // -- Task roles ----------------------------------------------------------
     const executionRole = new iam.Role(this, 'LucidExecutionRole', {
