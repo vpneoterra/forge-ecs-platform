@@ -51,6 +51,11 @@ on:
         required: false
         type: boolean
         default: false
+      deploySolvers:
+        description: 'Deploy solver/compute stacks (ForgeData + ForgeCompute + ForgeOrchestration; includes SysML kernel)'
+        required: false
+        type: boolean
+        default: false
       lucidActiveMode:
         description: 'LUCID active mode'
         required: false
@@ -194,6 +199,7 @@ jobs:
             -c deployGemma=${{ github.event.inputs.deployGemma || 'false' }} \
             -c deployGeometry=${{ inputs.deployGeometry || 'false' }} \
             -c deployLucid=${{ inputs.deployLucid || 'false' }} \
+            -c deploySolvers=${{ inputs.deploySolvers || 'false' }} \
             -c lucidActiveMode=${{ github.event.inputs.lucidActiveMode || 'code' }} \
             -c lucidImageTag=${{ github.event.inputs.lucidImageTag || 'latest' }} \
             -c lucidImageDigest=${{ github.event.inputs.lucidImageDigest || '' }} \
@@ -212,6 +218,7 @@ jobs:
             -c deployGemma=${{ github.event.inputs.deployGemma || 'false' }} \
             -c deployGeometry=${{ inputs.deployGeometry || 'false' }} \
             -c deployLucid=${{ inputs.deployLucid || 'false' }} \
+            -c deploySolvers=${{ inputs.deploySolvers || 'false' }} \
             -c lucidActiveMode=${{ github.event.inputs.lucidActiveMode || 'code' }} \
             -c lucidImageTag=${{ github.event.inputs.lucidImageTag || 'latest' }} \
             -c lucidImageDigest=${{ github.event.inputs.lucidImageDigest || '' }} \
