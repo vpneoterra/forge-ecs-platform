@@ -85,6 +85,14 @@ export class ForgeAppStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: ForgeAppStackProps) {
     super(scope, id, props);
 
+    // 'dev' keeps the legacy physical names that the live stack already uses;
+    // any other env (e.g. 'dev2', 'prod') gets an env-suffixed name so two
+    // environments can run in parallel without CloudFormation name collisions.
+    const legacyEnv = props.forgeEnv === 'dev';
+    const albName = legacyEnv ? 'forge-test-alb' : `forge-${props.forgeEnv}-alb`;
+    const appLogGroup = legacyEnv ? '/forge/ecs/forge-app-test' : `/forge/ecs/forge-app-${props.forgeEnv}`;
+    const appServiceName = legacyEnv ? 'forge-app-test' : `forge-app-${props.forgeEnv}`;
+
     // -- Route 53 Hosted Zone (lookup existing) --------------------------------
     // The user has already moved qrucible.ai nameservers to Route 53.
     // We look up the existing hosted zone rather than creating a new one.
@@ -217,7 +225,7 @@ export class ForgeAppStack extends cdk.Stack {
 
     // -- CloudWatch Log Group ------------------------------------------------
     const logGroup = new logs.LogGroup(this, 'ForgeAppLogGroup', {
-      logGroupName: '/forge/ecs/forge-app-test',
+      logGroupName: appLogGroup,
       retention: logs.RetentionDays.ONE_WEEK,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
@@ -620,7 +628,7 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
 
     // -- Application Load Balancer --------------------------------------------
     this.alb = new elbv2.ApplicationLoadBalancer(this, 'ForgeTestAlb', {
-      loadBalancerName: 'forge-test-alb',
+      loadBalancerName: albName,
       vpc: props.vpc,
       internetFacing: true,
       securityGroup: props.albSecurityGroup,
@@ -704,7 +712,7 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       cluster: this.ecsCluster,
       taskDefinition: taskDef,
       desiredCount: 1,
-      serviceName: 'forge-app-test',
+      serviceName: appServiceName,
       enableExecuteCommand: true,
       circuitBreaker: { rollback: true },
       assignPublicIp: false, // Private subnet, uses NAT for outbound
@@ -721,7 +729,7 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       // reconciliation Option B.
     });
 
-    this.serviceName = 'forge-app-test';
+    this.serviceName = appServiceName;
 
     // Register forge-app as default target group (all traffic not matched by host rules)
     httpsListener.addTargets('ForgeAppTarget', {
