@@ -40,6 +40,7 @@ import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
 import * as efs from 'aws-cdk-lib/aws-efs';
+import * as datasync from 'aws-cdk-lib/aws-datasync';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Construct } from 'constructs';
 import { importSecretByName, ecsSecretByName } from './secret-lookup';
@@ -57,6 +58,23 @@ export interface ForgeAppStackProps extends cdk.StackProps {
   omniDomainName: string;   // e.g., 'omni.qrucible.ai'
   hostedZoneDomain: string; // e.g., 'qrucible.ai'
   deployDks?: boolean;
+  /**
+   * One-time DataSync EFS->EFS migration of the DKS dataset from the live
+   * source EFS into the dev2 destination EFS. Gated (default off) and nested
+   * under deployDks (the destination EFS only exists when deployDks is true).
+   * The task never auto-starts; the operator runs start-task-execution.
+   */
+  migrateDks?: boolean;
+  /** Source live EFS filesystem id (e.g. fs-...) — migrateDks input. */
+  dksSrcEfsId?: string;
+  /** Source EFS access point id (e.g. fsap-...) — migrateDks input. */
+  dksSrcAccessPointId?: string;
+  /** Source subnet id for the DataSync source ENI (same VPC/AZ as a source mount target). */
+  dksSrcSubnetId?: string;
+  /** Source EFS mount-target SG id — documentation only (lives in the live stack, not CDK-managed here). */
+  dksSrcEfsSgId?: string;
+  /** SG id for the DataSync source ENI; the operator must add 2049 ingress on dksSrcEfsSgId from it. */
+  dksSrcDataSyncSgId?: string;
   /** Gemma self-hosted inference endpoint (from ForgeGemmaStack NLB) */
   gemmaEndpoint?: string;
   /** Enable Gemma routing in the forge-app task definition */
@@ -898,6 +916,127 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         createAcl: { ownerUid: '1000', ownerGid: '1000', permissions: '755' },
         posixUser: { uid: '1000', gid: '1000' },
       });
+
+      // ── One-time DataSync EFS→EFS migration (gated, never auto-starts) ───────
+      // Copies the live DKS dataset from the source EFS (live env) into this
+      // env's fresh destination EFS (dksEfs). Defined only when migrateDks=true;
+      // a normal deploy produces zero DataSync resources. Nested under deployDks
+      // because the destination location needs dksEfs / dksAccessPoint.
+      if (props.migrateDks) {
+        if (!props.dksSrcEfsId || !props.dksSrcAccessPointId || !props.dksSrcSubnetId) {
+          throw new Error(
+            'migrateDks=true requires context inputs dksSrcEfsId, dksSrcAccessPointId, ' +
+              'and dksSrcSubnetId (the live source EFS, its access point, and a subnet ' +
+              'in the source EFS VPC/AZ for the DataSync source ENI).',
+          );
+        }
+
+        const account = cdk.Stack.of(this).account;
+        const region = cdk.Stack.of(this).region;
+
+        // Dedicated SG for the DataSync ENIs (destination side). The dev2 EFS
+        // already allows its default port from props.ecsSecurityGroup; we grant
+        // this dedicated SG explicit 2049 ingress so the migration ENI is not
+        // overloaded onto the ECS task SG identity.
+        const dataSyncSg = new ec2.SecurityGroup(this, 'DksMigrateDataSyncSg', {
+          vpc: props.vpc,
+          description: 'DataSync ENIs for the one-time DKS EFS->EFS migration',
+          allowAllOutbound: true,
+        });
+        dksEfs.connections.allowDefaultPortFrom(dataSyncSg, 'DataSync migration ENI -> dev2 DKS EFS');
+
+        const sgArn = (sgId: string) =>
+          `arn:aws:ec2:${region}:${account}:security-group/${sgId}`;
+        const subnetArn = (subnetId: string) =>
+          `arn:aws:ec2:${region}:${account}:subnet/${subnetId}`;
+
+        // a. Destination location — the dev2 dksEfs, mounted via its access point
+        //    (AP forces posix 1000/1000 and /dks-data root, preserved automatically).
+        const dstLocation = new datasync.CfnLocationEFS(this, 'DksMigrateDstLocation', {
+          efsFilesystemArn: dksEfs.fileSystemArn,
+          accessPointArn: dksAccessPoint.accessPointArn,
+          inTransitEncryption: 'TLS1_2',
+          ec2Config: {
+            securityGroupArns: [sgArn(dataSyncSg.securityGroupId)],
+            subnetArn: subnetArn(props.privateSubnets[0].subnetId),
+          },
+        });
+
+        // b. Source location — the LIVE source EFS, built from context inputs.
+        //    The source EFS ARN/AP ARN are derived from the passed ids, not hardcoded.
+        //    MANUAL PREREQUISITE (operator, before start-task-execution): the source
+        //    mount-target SG (props.dksSrcEfsSgId, e.g. sg-0121eeb2e30a5a3c4) lives in
+        //    the live dev stack and is NOT CDK-managed here, so it cannot be mutated
+        //    from this stack. Add a 2049 (NFS) ingress rule on it FROM the DataSync
+        //    source ENI SG (props.dksSrcDataSyncSgId) so the source ENI can mount.
+        const srcDataSyncSgArns = props.dksSrcDataSyncSgId
+          ? [sgArn(props.dksSrcDataSyncSgId)]
+          : [sgArn(dataSyncSg.securityGroupId)];
+        const srcEfsArn = `arn:aws:elasticfilesystem:${region}:${account}:file-system/${props.dksSrcEfsId}`;
+        const srcApArn = `arn:aws:elasticfilesystem:${region}:${account}:access-point/${props.dksSrcAccessPointId}`;
+        const srcLocation = new datasync.CfnLocationEFS(this, 'DksMigrateSrcLocation', {
+          efsFilesystemArn: srcEfsArn,
+          accessPointArn: srcApArn,
+          inTransitEncryption: 'TLS1_2',
+          ec2Config: {
+            securityGroupArns: srcDataSyncSgArns,
+            subnetArn: subnetArn(props.dksSrcSubnetId),
+          },
+        });
+
+        // CloudWatch log group + resource policy so DataSync can write task logs.
+        const dksMigrateLogGroup = new logs.LogGroup(this, 'DksMigrateLogGroup', {
+          logGroupName: `/aws/datasync/dks-migrate-${props.forgeEnv}`,
+          retention: logs.RetentionDays.ONE_WEEK,
+          removalPolicy: cdk.RemovalPolicy.DESTROY,
+        });
+        // DataSync writes to CloudWatch Logs via a log-group resource policy
+        // (the service principal must be granted PutLogEvents on the group).
+        new logs.CfnResourcePolicy(this, 'DksMigrateLogPolicy', {
+          policyName: `dks-migrate-datasync-${props.forgeEnv}`,
+          policyDocument: JSON.stringify({
+            Version: '2012-10-17',
+            Statement: [
+              {
+                Sid: 'DataSyncLogsToCloudWatch',
+                Effect: 'Allow',
+                Principal: { Service: 'datasync.amazonaws.com' },
+                Action: ['logs:PutLogEvents', 'logs:CreateLogStream'],
+                Resource: `${dksMigrateLogGroup.logGroupArn}:*`,
+              },
+            ],
+          }),
+        });
+
+        // c. The migration task. Does NOT auto-start.
+        const dksMigrateTask = new datasync.CfnTask(this, 'DksMigrateTask', {
+          name: `dks-migrate-${props.forgeEnv}`,
+          sourceLocationArn: srcLocation.ref,
+          destinationLocationArn: dstLocation.ref,
+          cloudWatchLogGroupArn: dksMigrateLogGroup.logGroupArn,
+          options: {
+            verifyMode: 'POINT_IN_TIME_CONSISTENT',
+            overwriteMode: 'ALWAYS',
+            preserveDeletedFiles: 'PRESERVE',
+            posixPermissions: 'PRESERVE',
+            transferMode: 'CHANGED',
+            logLevel: 'TRANSFER',
+          },
+        });
+
+        new cdk.CfnOutput(this, 'DksMigrateTaskArn', {
+          value: dksMigrateTask.ref,
+          description: 'DataSync task ARN — operator runs `aws datasync start-task-execution` against this.',
+        });
+        new cdk.CfnOutput(this, 'DksMigrateSrcLocationArn', {
+          value: srcLocation.ref,
+          description: 'DataSync source EFS location ARN (live source).',
+        });
+        new cdk.CfnOutput(this, 'DksMigrateDstLocationArn', {
+          value: dstLocation.ref,
+          description: 'DataSync destination EFS location ARN (this env dksEfs).',
+        });
+      }
 
       // dks-query task definition
       const dksQueryTaskDef = new ecs.FargateTaskDefinition(this, 'DksQueryTaskDef', {

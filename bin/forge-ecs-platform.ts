@@ -17,6 +17,11 @@
  *   deployApp     "true" to deploy ForgeAppStack (Fargate web app)
  *   deployOmni    "true" to deploy ForgeOmniStack (OMNI PicoGK Fargate)
  *   deployDks     "true" to deploy DKS (Design Knowledge System) in ForgeAppStack
+ *   migrateDks    "true" to define a one-time DataSync EFS->EFS migration task
+ *                 (gated; nested under deployDks; never auto-starts). Requires the
+ *                 dksSrc* context inputs below to identify the live source EFS.
+ *   dksSrcEfsId / dksSrcAccessPointId / dksSrcSubnetId / dksSrcEfsSgId / dksSrcDataSyncSgId
+ *                 Source-side identifiers for the migrateDks DataSync source location.
  *   deployGemma   "true" to deploy Gemma GPU inference stack (g6.2xlarge + NLB)
  *   deployGeometry "true" to deploy Geometry Platform stack (B-Rep, GPU SDF, Neural SDF)
  *   deployLucid   "true" to deploy LUCID (multi-mode AI workspace) on the shared ALB
@@ -75,6 +80,13 @@ const appDomain =
   (app.node.tryGetContext('appDomain') as string | undefined) ?? 'forge.qrucible.ai';
 const deployDks =
   (app.node.tryGetContext('deployDks') as string | undefined) === 'true';
+const migrateDks =
+  (app.node.tryGetContext('migrateDks') as string | undefined) === 'true';
+const dksSrcEfsId = app.node.tryGetContext('dksSrcEfsId') as string | undefined;
+const dksSrcAccessPointId = app.node.tryGetContext('dksSrcAccessPointId') as string | undefined;
+const dksSrcSubnetId = app.node.tryGetContext('dksSrcSubnetId') as string | undefined;
+const dksSrcEfsSgId = app.node.tryGetContext('dksSrcEfsSgId') as string | undefined;
+const dksSrcDataSyncSgId = app.node.tryGetContext('dksSrcDataSyncSgId') as string | undefined;
 const deployOmni =
   (app.node.tryGetContext('deployOmni') as string | undefined) === 'true';
 const deployGemma =
@@ -147,6 +159,12 @@ if (deployApp) {
     omniDomainName: omniDomain,
     hostedZoneDomain: appDomain.split('.').slice(-2).join('.'), // e.g., 'qrucible.ai'
     deployDks,
+    migrateDks,
+    dksSrcEfsId,
+    dksSrcAccessPointId,
+    dksSrcSubnetId,
+    dksSrcEfsSgId,
+    dksSrcDataSyncSgId,
     deployGemma,
     gemmaEndpoint: gemmaStack?.gemmaEndpoint,
     // When deployLucid=true we pre-provision the ACM SAN so the shared
