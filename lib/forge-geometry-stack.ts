@@ -73,6 +73,15 @@ export class ForgeGeometryStack extends cdk.Stack {
     this.taskDefinitions = new Map();
     this.services = new Map();
 
+    // 'dev' keeps the legacy flat physical names that the live blue stack
+    // already uses; any other env (e.g. 'dev2') gets an env-suffixed name so
+    // its account-unique resources (ECR repos, log groups, ECS service/task
+    // families, alarms) don't collide with dev at change-set validation.
+    // Same legacyEnv precedent as lib/forge-app-stack.ts. Scopes physical-name
+    // PROPERTIES only; construct logical IDs are unchanged.
+    const legacyEnv = props.forgeEnv === 'dev';
+    const scoped = (base: string) => (legacyEnv ? base : `${base}-${props.forgeEnv}`);
+
     // ── ECS Cluster (Fargate + EC2 GPU) ───────────────────────────────────────
     // Reuses the forge-app pattern: Fargate for CPU, references existing Provider C for GPU
     this.geometryCluster = new ecs.Cluster(this, 'GeometryCluster', {
@@ -94,7 +103,7 @@ export class ForgeGeometryStack extends cdk.Stack {
     const logGroups = new Map<string, logs.LogGroup>();
     for (const cap of CONTAINER_CAPABILITIES) {
       const lg = new logs.LogGroup(this, `LogGroup${cap.id.replace(/-/g, '')}`, {
-        logGroupName: `/forge/ecs/${cap.taskName}`,
+        logGroupName: `/forge/ecs/${scoped(cap.taskName!)}`,
         retention: logs.RetentionDays.ONE_WEEK,
         removalPolicy: cdk.RemovalPolicy.DESTROY,
       });
@@ -104,7 +113,7 @@ export class ForgeGeometryStack extends cdk.Stack {
     // ── ECR Repositories ──────────────────────────────────────────────────────
     for (const cap of CONTAINER_CAPABILITIES) {
       const repo = new ecr.Repository(this, `Ecr${cap.id.replace(/-/g, '')}`, {
-        repositoryName: cap.ecrRepo!,
+        repositoryName: scoped(cap.ecrRepo!),
         encryption: ecr.RepositoryEncryption.AES_256,
         imageScanOnPush: true,
         imageTagMutability: ecr.TagMutability.MUTABLE,
@@ -167,6 +176,7 @@ export class ForgeGeometryStack extends cdk.Stack {
       taskRole,
       logGroups.get(CAP_BREP.id)!,
       dnsNamespace,
+      scoped(CAP_BREP.taskName!),
     );
 
     // ── Capability 6: FluxTK / BRAIDE Network Solver (Fargate, CPU-only) ─────
@@ -177,6 +187,7 @@ export class ForgeGeometryStack extends cdk.Stack {
       taskRole,
       logGroups.get(CAP_FLUXTK.id)!,
       dnsNamespace,
+      scoped(CAP_FLUXTK.taskName!),
     );
 
     // ── Capability 7: PicoGK Voxel Geometry Engine (Fargate, CPU-only) ───────
@@ -187,6 +198,7 @@ export class ForgeGeometryStack extends cdk.Stack {
       taskRole,
       logGroups.get(CAP_PICOGK.id)!,
       dnsNamespace,
+      scoped(CAP_PICOGK.taskName!),
     );
 
     // ── Capability 2: GPU SDF Engine (EC2 GPU, desiredCount=0) ────────────────
@@ -196,6 +208,7 @@ export class ForgeGeometryStack extends cdk.Stack {
       taskExecutionRole,
       taskRole,
       logGroups.get(CAP_GPU_SDF.id)!,
+      scoped(CAP_GPU_SDF.taskName!),
     );
 
     // ── Capability 3: Neural SDF Engine (EC2 GPU, desiredCount=0) ─────────────
@@ -205,6 +218,7 @@ export class ForgeGeometryStack extends cdk.Stack {
       taskExecutionRole,
       taskRole,
       logGroups.get(CAP_NEURAL_SDF.id)!,
+      scoped(CAP_NEURAL_SDF.taskName!),
     );
 
     // ── SNS alarm topic for the geometry platform ────────────────────────────
@@ -230,7 +244,7 @@ export class ForgeGeometryStack extends cdk.Stack {
       const service = this.services.get(cap.id);
       if (!service) continue;
       const logGroup = logGroups.get(cap.id)!;
-      this.createServiceHealthAlarms(cap.id, cap.taskName!, service, logGroup);
+      this.createServiceHealthAlarms(cap.id, scoped(cap.taskName!), service, logGroup);
     }
 
     // ── Outputs ───────────────────────────────────────────────────────────────
@@ -252,9 +266,9 @@ export class ForgeGeometryStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'ActivationGuide', {
       value: [
         'GEOMETRY PLATFORM — All capabilities deployed OFF.',
-        'Cap 1 (B-Rep):        aws ecs update-service --cluster forge-geometry-' + props.forgeEnv + ' --service forge-brep --desired-count 1',
-        'Cap 6 (FluxTK):       aws ecs update-service --cluster forge-geometry-' + props.forgeEnv + ' --service forge-fluxtk --desired-count 1',
-        'Cap PicoGK:           aws ecs update-service --cluster forge-geometry-' + props.forgeEnv + ' --service forge-picogk --desired-count 1',
+        'Cap 1 (B-Rep):        aws ecs update-service --cluster forge-geometry-' + props.forgeEnv + ' --service ' + scoped(CAP_BREP.taskName!) + ' --desired-count 1',
+        'Cap 6 (FluxTK):       aws ecs update-service --cluster forge-geometry-' + props.forgeEnv + ' --service ' + scoped(CAP_FLUXTK.taskName!) + ' --desired-count 1',
+        'Cap PicoGK:           aws ecs update-service --cluster forge-geometry-' + props.forgeEnv + ' --service ' + scoped(CAP_PICOGK.taskName!) + ' --desired-count 1',
         'Cap 2 (GPU SDF):      Task definition ready. Create EC2 GPU service when needed.',
         'Cap 3 (Neural SDF):   Task definition ready. Create EC2 GPU service when needed.',
         'Cap 4 (ASG Editor):   Set ASG_EDITOR_ENABLED=true in forge-app env.',
@@ -274,9 +288,10 @@ export class ForgeGeometryStack extends cdk.Stack {
     taskRole: iam.Role,
     logGroup: logs.LogGroup,
     dnsNamespace: servicediscovery.PrivateDnsNamespace,
+    scopedName: string,
   ): void {
     const td = new ecs.FargateTaskDefinition(this, `Td${cap.id.replace(/-/g, '')}`, {
-      family: cap.taskName!,
+      family: scopedName,
       cpu: cap.cpu!,
       memoryLimitMiB: cap.memory!,
       executionRole,
@@ -299,7 +314,12 @@ export class ForgeGeometryStack extends cdk.Stack {
     // whichever digest ':latest' resolves to at task start. The execution
     // role already grants the required ecr:GetAuthorizationToken /
     // BatchGetImage permissions via AmazonECSTaskExecutionRolePolicy.
-    const imageUri = `${this.account}.dkr.ecr.${this.region}.amazonaws.com/${cap.ecrRepo}:latest`;
+    // Image URI references the SAME scoped repo name so it's internally
+    // consistent. For non-dev envs the scoped repo (e.g. forge-brep-dev2) is
+    // intentionally EMPTY until CI pushes images; this does not block CREATE
+    // because every geometry service deploys dormant (desiredCount=0,
+    // activateOnDeploy=false), so no task is started against the empty repo.
+    const imageUri = `${this.account}.dkr.ecr.${this.region}.amazonaws.com/${scopedName}:latest`;
     // Preserve CFN ordering: the task-def must come after the ECR repo construct.
     td.node.addDependency(repo);
 
@@ -336,7 +356,7 @@ export class ForgeGeometryStack extends cdk.Stack {
     const service = new ecs.FargateService(this, `Svc${cap.id.replace(/-/g, '')}`, {
       cluster: this.geometryCluster,
       taskDefinition: td,
-      serviceName: cap.taskName!,
+      serviceName: scopedName,
       desiredCount: cap.activateOnDeploy ? 1 : 0,
       assignPublicIp: false,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
@@ -438,10 +458,11 @@ export class ForgeGeometryStack extends cdk.Stack {
     executionRole: iam.Role,
     taskRole: iam.Role,
     logGroup: logs.LogGroup,
+    scopedName: string,
   ): void {
     // GPU tasks use EC2 launch type on Provider C instances
     const td = new ecs.Ec2TaskDefinition(this, `Td${cap.id.replace(/-/g, '')}`, {
-      family: cap.taskName!,
+      family: scopedName,
       networkMode: ecs.NetworkMode.AWS_VPC,
       executionRole,
       taskRole,
@@ -450,8 +471,10 @@ export class ForgeGeometryStack extends cdk.Stack {
     const repo = this.ecrRepos.get(cap.id)!;
 
     // See note in createFargateService — string-form image URI prevents the
-    // synth-time '@sha256:<digest>' pin that caused the FluxTK outage.
-    const imageUri = `${this.account}.dkr.ecr.${this.region}.amazonaws.com/${cap.ecrRepo}:latest`;
+    // synth-time '@sha256:<digest>' pin that caused the FluxTK outage. Uses the
+    // SAME scoped repo name (non-dev repos are intentionally empty until CI
+    // pushes; GPU tasks run only via operator RunTask, so CREATE is not blocked).
+    const imageUri = `${this.account}.dkr.ecr.${this.region}.amazonaws.com/${scopedName}:latest`;
     td.node.addDependency(repo);
 
     // GPU resource requirement — CDK doesn't have a native L2 for this,
