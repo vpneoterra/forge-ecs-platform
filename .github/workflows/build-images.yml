@@ -34,6 +34,9 @@ jobs:
             repo: forge-cluster-f-devops
             dockerfile: Dockerfile
             platforms: linux/arm64
+            # Build context lives in THIS repo (docker/cluster-f-devops),
+            # not in a separate source repo. Pushes to ECR repo `forge-devops`.
+            local_context: docker/cluster-f-devops
 
           - name: forge-monitoring
             repo: forge-cluster-c-observability
@@ -91,11 +94,18 @@ jobs:
             echo "should_build=false" >> $GITHUB_OUTPUT
           fi
 
+      # Source-repo checkout (skipped for images whose context is in this repo).
       - uses: actions/checkout@v4
-        if: steps.filter.outputs.should_build == 'true'
+        if: steps.filter.outputs.should_build == 'true' && matrix.image.local_context == ''
         with:
           repository: vpneoterra/${{ matrix.image.repo }}
           token: ${{ secrets.GH_PAT }}
+          path: image-source
+
+      # In-repo checkout for images built from a local context (e.g. forge-devops).
+      - uses: actions/checkout@v4
+        if: steps.filter.outputs.should_build == 'true' && matrix.image.local_context != ''
+        with:
           path: image-source
 
       - name: Set up QEMU (for multi-arch builds)
@@ -129,12 +139,24 @@ jobs:
           echo "build_date=$(date -u +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
           echo "git_sha=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
 
+      - name: Resolve build context
+        if: steps.filter.outputs.should_build == 'true'
+        id: ctx
+        run: |
+          if [ -n "${{ matrix.image.local_context }}" ]; then
+            echo "context=./image-source/${{ matrix.image.local_context }}" >> $GITHUB_OUTPUT
+            echo "file=./image-source/${{ matrix.image.local_context }}/${{ matrix.image.dockerfile }}" >> $GITHUB_OUTPUT
+          else
+            echo "context=./image-source" >> $GITHUB_OUTPUT
+            echo "file=./image-source/${{ matrix.image.dockerfile }}" >> $GITHUB_OUTPUT
+          fi
+
       - name: Build and push
         if: steps.filter.outputs.should_build == 'true'
         uses: docker/build-push-action@v5
         with:
-          context: ./image-source
-          file: ./image-source/${{ matrix.image.dockerfile }}
+          context: ${{ steps.ctx.outputs.context }}
+          file: ${{ steps.ctx.outputs.file }}
           platforms: ${{ matrix.image.platforms }}
           push: true
           tags: |
