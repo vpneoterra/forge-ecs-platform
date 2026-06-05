@@ -51,6 +51,11 @@ export class ForgeMonitoringStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: ForgeMonitoringStackProps) {
     super(scope, id, props);
 
+    // 'dev' keeps the legacy flat physical names that the live blue stack already owns.
+    // All other envs (dev2, prod, ...) append `-${forgeEnv}` so account-unique names never collide.
+    const legacyEnv = props.forgeEnv === 'dev';
+    const scoped = (base: string) => (legacyEnv ? base : `${base}-${props.forgeEnv}`);
+
     // ── A. SNS Alert Topic ────────────────────────────────────────────────────
     // The topic is provisioned out-of-band (pre-existing from an earlier
     // deploy that rolled back) and is imported here by ARN so CDK does not
@@ -89,7 +94,7 @@ export class ForgeMonitoringStack extends cdk.Stack {
     // fresh managed resource without a naming collision. The v1 alarm can be
     // deleted from the console when convenient.
     const fivexxAlarm = new cloudwatch.Alarm(this, 'Forge5xxAlarm', {
-      alarmName: 'forge-app-5xx-rate-v2',
+      alarmName: scoped('forge-app-5xx-rate-v2'),
       alarmDescription: 'FORGE ALB: >10 HTTP 5xx responses in a 60-second window (2 consecutive)',
       metric: fivexxMetric,
       threshold: 10,
@@ -156,7 +161,7 @@ exports.handler = async (event) => {
     // The clusterArn detail field contains the full ARN; we filter by matching
     // the cluster ARN prefix so this rule only fires for our cluster.
     const ecsStateRule = new events.Rule(this, 'EcsStateChangeRule', {
-      ruleName: 'forge-ecs-state-change',
+      ruleName: scoped('forge-ecs-state-change'),
       description: 'Route FORGE ECS task state changes to alert Lambda',
       eventPattern: {
         source: ['aws.ecs'],

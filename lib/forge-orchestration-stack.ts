@@ -45,6 +45,11 @@ export class ForgeOrchestrationStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: ForgeOrchestrationStackProps) {
     super(scope, id, props);
 
+    // 'dev' keeps the legacy flat physical names that the live blue stack already owns.
+    // All other envs (dev2, prod, ...) append `-${forgeEnv}` so account-unique names never collide.
+    const legacyEnv = props.forgeEnv === 'dev';
+    const scoped = (base: string) => (legacyEnv ? base : `${base}-${props.forgeEnv}`);
+
     // ── SNS Alert Topic ───────────────────────────────────────────────────────
     this.alertTopic = new sns.Topic(this, 'AlertTopic', {
       topicName: `forge-alerts-${props.forgeEnv}`,
@@ -157,7 +162,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
     // State: Solve -- run geometry (always-on, no RunTask needed -- send via SQS to forge-lightweight)
     const cemSolveSqsSend = new sfnTasks.SqsSendMessage(this, 'CemSolve', {
       queue: props.sqsQueues.get('forge-hpc') || new sqs.Queue(this, 'FallbackQueue', {
-        queueName: 'forge-cem-fallback.fifo',
+        queueName: `${scoped('forge-cem-fallback')}.fifo`,
         fifo: true,
       }),
       messageBody: sfn.TaskInput.fromJsonPathAt('$'),
@@ -168,7 +173,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
     // State: Validate CFD (parallel branch)
     const cemValidateCfd = new sfnTasks.SqsSendMessage(this, 'CemValidateCfd', {
       queue: props.sqsQueues.get('forge-fem-cfd') || new sqs.Queue(this, 'FallbackQueueCfd', {
-        queueName: 'forge-cem-cfd-fallback.fifo',
+        queueName: `${scoped('forge-cem-cfd-fallback')}.fifo`,
         fifo: true,
       }),
       messageBody: sfn.TaskInput.fromJsonPathAt('$'),
@@ -240,7 +245,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
       .next(cemIterateChoice);
 
     const cemLogGroup = new logs.LogGroup(this, 'CemStateMachineLogs', {
-      logGroupName: '/forge/stepfunctions/cem-loop',
+      logGroupName: scoped('/forge/stepfunctions/cem-loop'),
       retention: logs.RetentionDays.ONE_WEEK,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
@@ -265,7 +270,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
     // Phase 1: Config -- pyQSC/pyQIC/DESC (via SQS -> forge-stellarator-config)
     const stPhase1 = new sfnTasks.SqsSendMessage(this, 'StPhase1Config', {
       queue: props.sqsQueues.get('forge-stellarator-config') || new sqs.Queue(this, 'FallbackStConfig', {
-        queueName: 'forge-st-config-fallback.fifo',
+        queueName: `${scoped('forge-st-config-fallback')}.fifo`,
         fifo: true,
       }),
       messageBody: sfn.TaskInput.fromObject({
@@ -283,7 +288,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
     // Phase 2: Equilibrium -- VMEC++ (via SQS -> forge-hpc)
     const stPhase2 = new sfnTasks.SqsSendMessage(this, 'StPhase2Equilibrium', {
       queue: props.sqsQueues.get('forge-hpc') || new sqs.Queue(this, 'FallbackStHpc', {
-        queueName: 'forge-st-hpc-fallback.fifo',
+        queueName: `${scoped('forge-st-hpc-fallback')}.fifo`,
         fifo: true,
       }),
       messageBody: sfn.TaskInput.fromObject({
@@ -302,7 +307,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
     // Phase 3: Coil optimization -- SIMSOPT (via SQS -> forge-stellarator-coils)
     const stPhase3 = new sfnTasks.SqsSendMessage(this, 'StPhase3Coils', {
       queue: props.sqsQueues.get('forge-stellarator-coils') || new sqs.Queue(this, 'FallbackStCoils', {
-        queueName: 'forge-st-coils-fallback.fifo',
+        queueName: `${scoped('forge-st-coils-fallback')}.fifo`,
         fifo: true,
       }),
       messageBody: sfn.TaskInput.fromObject({
@@ -320,7 +325,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
     // Phase 4: CAD generation -- Bluemira/ParaStell (via SQS -> forge-stellarator-cad)
     const stPhase4 = new sfnTasks.SqsSendMessage(this, 'StPhase4Cad', {
       queue: props.sqsQueues.get('forge-stellarator-cad') || new sqs.Queue(this, 'FallbackStCad', {
-        queueName: 'forge-st-cad-fallback.fifo',
+        queueName: `${scoped('forge-st-cad-fallback')}.fifo`,
         fifo: true,
       }),
       messageBody: sfn.TaskInput.fromObject({
@@ -338,7 +343,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
     // Phase 5: HPC neutronics -- OpenMC
     const stPhase5 = new sfnTasks.SqsSendMessage(this, 'StPhase5Hpc', {
       queue: props.sqsQueues.get('forge-hpc') || new sqs.Queue(this, 'FallbackStHpc2', {
-        queueName: 'forge-st-hpc2-fallback.fifo',
+        queueName: `${scoped('forge-st-hpc2-fallback')}.fifo`,
         fifo: true,
       }),
       messageBody: sfn.TaskInput.fromObject({
@@ -357,7 +362,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
     // Phase 6: FEM analysis -- Elmer (thermal/structural)
     const stPhase6 = new sfnTasks.SqsSendMessage(this, 'StPhase6Fem', {
       queue: props.sqsQueues.get('forge-fem-cfd') || new sqs.Queue(this, 'FallbackStFem', {
-        queueName: 'forge-st-fem-fallback.fifo',
+        queueName: `${scoped('forge-st-fem-fallback')}.fifo`,
         fifo: true,
       }),
       messageBody: sfn.TaskInput.fromObject({
@@ -424,7 +429,7 @@ export class ForgeOrchestrationStack extends cdk.Stack {
       .next(new sfn.Succeed(this, 'StComplete'));
 
     const stLogGroup = new logs.LogGroup(this, 'StStateMachineLogs', {
-      logGroupName: '/forge/stepfunctions/stellarator-pipeline',
+      logGroupName: scoped('/forge/stepfunctions/stellarator-pipeline'),
       retention: logs.RetentionDays.ONE_WEEK,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });

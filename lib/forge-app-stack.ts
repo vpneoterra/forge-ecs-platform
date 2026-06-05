@@ -108,6 +108,7 @@ export class ForgeAppStack extends cdk.Stack {
     // any other env (e.g. 'dev2', 'prod') gets an env-suffixed name so two
     // environments can run in parallel without CloudFormation name collisions.
     const legacyEnv = props.forgeEnv === 'dev';
+    const scoped = (base: string) => (legacyEnv ? base : `${base}-${props.forgeEnv}`);
     const albName = legacyEnv ? 'forge-test-alb' : `forge-${props.forgeEnv}-alb`;
     const appLogGroup = legacyEnv ? '/forge/ecs/forge-app-test' : `/forge/ecs/forge-app-${props.forgeEnv}`;
     const appServiceName = legacyEnv ? 'forge-app-test' : `forge-app-${props.forgeEnv}`;
@@ -292,7 +293,7 @@ export class ForgeAppStack extends cdk.Stack {
     // 3072). The prior 512/1024 was undersized for the full forge-app + DKS
     // sidecar + monitor co-location and contributed to runtime instability.
     const taskDef = new ecs.FargateTaskDefinition(this, 'ForgeAppTaskDef', {
-      family: 'forge-app-test',
+      family: scoped('forge-app-test'),
       cpu: 1024,
       memoryLimitMiB: 3072,
       executionRole,
@@ -672,7 +673,7 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
     // name is exported so the monitoring stack and ops workflows can reference
     // it without a cross-stack circular dependency.
     const accessLogBucket = new s3.Bucket(this, 'AlbAccessLogs', {
-      bucketName: `forge-alb-access-logs-${this.account}-${this.region}`,
+      bucketName: scoped(`forge-alb-access-logs-${this.account}-${this.region}`),
       lifecycleRules: [{
         expiration: cdk.Duration.days(90),
       }],
@@ -779,13 +780,13 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
 
     // -- OMNI Service (Fargate Spot with Cloud Map) ----------------------------
     const omniLogGroup = new logs.LogGroup(this, 'OmniLogGroup', {
-      logGroupName: '/forge/ecs/forge-omni',
+      logGroupName: scoped('/forge/ecs/forge-omni'),
       retention: logs.RetentionDays.ONE_WEEK,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
     const omniTaskDef = new ecs.FargateTaskDefinition(this, 'OmniTaskDef', {
-      family: 'forge-omni',
+      family: scoped('forge-omni'),
       // Bumped 4096/8192 -> 8192/16384 after Tier 3 Run 1 OOM at 3 concurrent
       // heavy SDF renders (CylindricalVessel + HollowTube + IBeam). See
       // FORGE_OMNI_MEMORY_MEMO.md. Pairs with substrate-side concurrency cap.
@@ -892,13 +893,13 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
 
       // Log groups
       const dksQueryLogGroup = new logs.LogGroup(this, 'DksQueryLogGroup', {
-        logGroupName: '/forge/ecs/dks-query',
+        logGroupName: scoped('/forge/ecs/dks-query'),
         retention: logs.RetentionDays.ONE_WEEK,
         removalPolicy: cdk.RemovalPolicy.DESTROY,
       });
 
       const dksIngestLogGroup = new logs.LogGroup(this, 'DksIngestLogGroup', {
-        logGroupName: '/forge/ecs/dks-ingest',
+        logGroupName: scoped('/forge/ecs/dks-ingest'),
         retention: logs.RetentionDays.ONE_WEEK,
         removalPolicy: cdk.RemovalPolicy.DESTROY,
       });
@@ -1046,7 +1047,7 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
 
       // dks-query task definition
       const dksQueryTaskDef = new ecs.FargateTaskDefinition(this, 'DksQueryTaskDef', {
-        family: 'dks-query',
+        family: scoped('dks-query'),
         cpu: 512,
         memoryLimitMiB: 1024,
         executionRole,
@@ -1148,7 +1149,7 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
 
       // dks-ingest task definition (standalone — no service, launched via run-task)
       const dksIngestTaskDef = new ecs.FargateTaskDefinition(this, 'DksIngestTaskDef', {
-        family: 'dks-ingest',
+        family: scoped('dks-ingest'),
         cpu: 4096,
         memoryLimitMiB: 8192,
         executionRole,
@@ -1253,7 +1254,7 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
 
       // dks-download task definition (lightweight — for downloading datasets to EFS)
       const dksDownloadTaskDef = new ecs.FargateTaskDefinition(this, 'DksDownloadTaskDef', {
-        family: 'dks-download',
+        family: scoped('dks-download'),
         cpu: 1024,
         memoryLimitMiB: 2048,
         executionRole,
@@ -1302,7 +1303,7 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       });
 
       new cdk.CfnOutput(this, 'DksQueryLogGroupOutput', {
-        value: '/forge/ecs/dks-query',
+        value: scoped('/forge/ecs/dks-query'),
         description: 'DKS Query CloudWatch log group',
       });
 
@@ -1312,7 +1313,7 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       });
 
       new cdk.CfnOutput(this, 'DksIngestLogGroupOutput', {
-        value: '/forge/ecs/dks-ingest',
+        value: scoped('/forge/ecs/dks-ingest'),
         description: 'DKS Ingest CloudWatch log group',
       });
 
