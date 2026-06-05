@@ -728,15 +728,10 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       comment: 'FORGE app ALB -- managed by CDK',
     });
 
-    // omni.qrucible.ai → same ALB (host-header routing separates traffic)
-    new route53.ARecord(this, 'OmniAlbAlias', {
-      zone: hostedZone,
-      recordName: props.omniDomainName,
-      target: route53.RecordTarget.fromAlias(
-        new route53Targets.LoadBalancerTarget(this.alb),
-      ),
-      comment: 'OMNI API ALB -- managed by CDK',
-    });
+    // omni public DNS alias intentionally NOT created here. The standalone
+    // ForgeOmni stack is the sole owner of the omniDomainName Route53 alias.
+    // The embedded omni stays reachable internally via Cloud Map (omni.<ns>)
+    // and externally via the OmniTarget host-header rule on the shared ALB.
 
     // -- Fargate Service -------------------------------------------------------
     const service = new ecs.FargateService(this, 'ForgeAppService', {
