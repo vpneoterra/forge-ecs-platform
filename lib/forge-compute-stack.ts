@@ -55,6 +55,11 @@ export class ForgeComputeStack extends cdk.Stack {
 
     const isProd = props.forgeEnv === 'prod';
 
+    // 'dev' keeps the legacy flat physical names that the live blue stack already owns.
+    // All other envs (dev2, prod, ...) append `-${forgeEnv}` so account-unique names never collide.
+    const legacyEnv = props.forgeEnv === 'dev';
+    const scoped = (base: string) => (legacyEnv ? base : `${base}-${props.forgeEnv}`);
+
     // ── ECS Cluster ───────────────────────────────────────────────────────────
     this.ecsCluster = new ecs.Cluster(this, 'ForgeCluster', {
       clusterName: `forge-${props.forgeEnv}`,
@@ -77,7 +82,7 @@ export class ForgeComputeStack extends cdk.Stack {
     const logGroups = new Map<string, logs.LogGroup>();
     for (const task of SOLVER_MANIFEST) {
       const lg = new logs.LogGroup(this, `LogGroup${task.name.replace(/-/g, '')}`, {
-        logGroupName: `/forge/ecs/${task.name}`,
+        logGroupName: scoped(`/forge/ecs/${task.name}`),
         retention: logs.RetentionDays.ONE_WEEK, // 7-day retention = low cost
         removalPolicy: cdk.RemovalPolicy.DESTROY,
       });
@@ -342,14 +347,14 @@ export class ForgeComputeStack extends cdk.Stack {
 
       // Dead-letter queue -- receives messages that fail after 3 attempts
       const dlq = new sqs.Queue(this, `Dlq${task.name.replace(/-/g, '')}`, {
-        queueName: `${task.sqsQueueName.replace('.fifo', '-dlq')}.fifo`,
+        queueName: `${scoped(task.sqsQueueName.replace('.fifo', '-dlq'))}.fifo`,
         fifo: true,
         retentionPeriod: cdk.Duration.days(14), // Keep failed jobs 14 days
         encryption: sqs.QueueEncryption.SQS_MANAGED,
       });
 
       const queue = new sqs.Queue(this, `Queue${task.name.replace(/-/g, '')}`, {
-        queueName: task.sqsQueueName,
+        queueName: `${scoped(task.sqsQueueName.replace('.fifo', ''))}.fifo`,
         fifo: true,
         contentBasedDeduplication: true,
         visibilityTimeout: cdk.Duration.hours(6), // Long timeout for HPC jobs
