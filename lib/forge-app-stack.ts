@@ -353,11 +353,16 @@ export class ForgeAppStack extends cdk.Stack {
         // the spread default to match live. (Override must follow the spread.)
         PICOGK_API_URL: 'http://89.167.79.141:8015',
         // SEL (server/sel/config/sel-config.js) reads SEL_SYSML_API_BASE_URL
-        // first, falling back to SYSML_API_URL. Both must target the in-cluster
-        // SysML v2 kernel on port 8003 via its Cloud Map name -- not the :9000
-        // Uvicorn front and not a raw public IP. Inert until the kernel boots.
-        SEL_SYSML_API_BASE_URL: 'http://forge-devops.forge.local:8003',
-        SYSML_API_URL: 'http://forge-devops.forge.local:8003',
+        // first, falling back to SYSML_API_URL. The kernel publishes ONLY port 80
+        // (nginx) via Cloud Map (forge-devops.forge.local, A-record -> nginx:80);
+        // Play (:8003) and the FastAPI sidecar (:9000) are internal-only. nginx
+        // routes /sysml/ -> sidecar:9000 (strips /sysml/); the sidecar's
+        // /api/{path} route proxies to Play:8003 (strips /api). So a SEL raw path
+        // like /branches/main/commits against this base lands on Play as
+        // /branches/main/commits via the only published (:80) surface. Inert until
+        // the kernel boots; transport touches on the hydrate path are swallowed.
+        SEL_SYSML_API_BASE_URL: 'http://forge-devops.forge.local/sysml/api',
+        SYSML_API_URL: 'http://forge-devops.forge.local/sysml/api',
         HETZNER_COMPUTE_URL: 'http://89.167.79.141:8001',
         LUCID_URL: 'https://api-lucid.qrucible.ai',
         FREECAD_MCP_URL: 'http://89.167.79.141:8016',
@@ -372,6 +377,7 @@ export class ForgeAppStack extends cdk.Stack {
         // -- Rodin BBox 3D artifact --
 RODIN_BBOX_ENABLED: 'true',
 FRAMES_PROGRAM_BBOX_ENABLED: 'true',
+FORGE_BBOX_SEL_HYDRATE: 'true',
 RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         // Flip to 'true' AFTER the GPU instance + NLB are verified healthy.
         GEMMA_ENABLED: props.deployGemma ? 'false' : 'false', // Always deploy as disabled; flip via env update
