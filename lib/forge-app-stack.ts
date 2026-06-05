@@ -44,6 +44,7 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Construct } from 'constructs';
 import { importSecretByName, ecsSecretByName } from './secret-lookup';
 import { CAP_PICOGK } from './config/geometry-manifest';
+import { vpcSecondOctet } from './config/network-config';
 
 export interface ForgeAppStackProps extends cdk.StackProps {
   forgeEnv: string;
@@ -608,7 +609,7 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
 
       const albSubnet2 = new ec2.PublicSubnet(this, 'AlbSubnet2', {
         vpcId: props.vpc.vpcId,
-        cidrBlock: '10.0.128.0/24',  // High range to avoid existing subnets
+        cidrBlock: `10.${vpcSecondOctet(props.forgeEnv)}.128.0/24`,  // High range to avoid existing subnets
         availabilityZone: secondAz,
         mapPublicIpOnLaunch: true,
       });

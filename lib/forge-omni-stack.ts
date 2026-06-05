@@ -31,6 +31,7 @@ import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import { Construct } from 'constructs';
+import { vpcSecondOctet } from './config/network-config';
 
 export interface ForgeOmniStackProps extends cdk.StackProps {
   forgeEnv: string;
@@ -174,7 +175,7 @@ export class ForgeOmniStack extends cdk.Stack {
 
       const albSubnet2 = new ec2.PublicSubnet(this, 'AlbSubnet2', {
         vpcId: props.vpc.vpcId,
-        cidrBlock: '10.0.129.0/24',
+        cidrBlock: `10.${vpcSecondOctet(env)}.129.0/24`,
         availabilityZone: secondAz,
         mapPublicIpOnLaunch: true,
       });

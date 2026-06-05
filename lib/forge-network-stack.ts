@@ -10,6 +10,7 @@ import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
+import { vpcCidr } from './config/network-config';
 
 export interface ForgeNetworkStackProps extends cdk.StackProps {
   forgeEnv: string;
@@ -35,7 +36,7 @@ export class ForgeNetworkStack extends cdk.Stack {
     // ── VPC ─────────────────────────────────────────────────────────────────
     // NAT is handled by a NAT instance below, so we disable CDK's managed NAT.
     this.vpc = new ec2.Vpc(this, 'ForgeVpc', {
-      ipAddresses: ec2.IpAddresses.cidr('10.0.0.0/16'),
+      ipAddresses: ec2.IpAddresses.cidr(vpcCidr(props.forgeEnv)),
       maxAzs,
       natGateways: 0, // We use a NAT instance instead
       subnetConfiguration: [
