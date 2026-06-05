@@ -93,6 +93,11 @@ export class ForgeAppStack extends cdk.Stack {
     const albName = legacyEnv ? 'forge-test-alb' : `forge-${props.forgeEnv}-alb`;
     const appLogGroup = legacyEnv ? '/forge/ecs/forge-app-test' : `/forge/ecs/forge-app-${props.forgeEnv}`;
     const appServiceName = legacyEnv ? 'forge-app-test' : `forge-app-${props.forgeEnv}`;
+    // Statsd metric dimensions: 'dev' keeps the legacy ClusterName/ServiceName
+    // labels so the live env's Forge/ECS metric series stay continuous; other
+    // envs get distinct labels so blue/green metrics don't cross-attribute.
+    const metricClusterName = legacyEnv ? 'forge-app-dev' : `forge-app-${props.forgeEnv}`;
+    const metricServiceName = legacyEnv ? 'forge-app-test' : `forge-app-${props.forgeEnv}`;
 
     // -- Route 53 Hosted Zone (lookup existing) --------------------------------
     // The user has already moved qrucible.ai nameservers to Route 53.
@@ -597,7 +602,7 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         // (.taskdef_groundtruth/live_1444_monitor.json). The prior FORGE_APP_URL
         // stub did nothing -- the agent had no config and emitted no metrics.
         CW_CONFIG_CONTENT:
-          '{"agent": {"metrics_collection_interval": 60, "omit_hostname": true, "debug": false}, "metrics": {"namespace": "Forge/ECS", "append_dimensions": {"ClusterName": "forge-app-dev", "ServiceName": "forge-app-test"}, "metrics_collected": {"statsd": {"service_address": ":8125", "metrics_collection_interval": 60, "metrics_aggregation_interval": 60}}}}',
+          `{"agent": {"metrics_collection_interval": 60, "omit_hostname": true, "debug": false}, "metrics": {"namespace": "Forge/ECS", "append_dimensions": {"ClusterName": "${metricClusterName}", "ServiceName": "${metricServiceName}"}, "metrics_collected": {"statsd": {"service_address": ":8125", "metrics_collection_interval": 60, "metrics_aggregation_interval": 60}}}}`,
       },
       logging: ecs.LogDrivers.awsLogs({
         logGroup,
