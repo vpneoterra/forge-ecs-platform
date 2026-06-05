@@ -543,11 +543,18 @@ export class ForgeComputeStack extends cdk.Stack {
       ],
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [props.ecsSecurityGroup],
-      // Cloud Map for service discovery
+      // Cloud Map for service discovery.
+      // forge-devops publishes an A record: consumers reach the SysML kernel
+      // by name on the fixed nginx port 80 (http://forge-devops.forge.local),
+      // and Node's fetch() only does an A/AAAA lookup -- it never consults SRV.
+      // An SRV-only record yields ENODATA on resolve4 and breaks the SEL
+      // projection bootstrap. Other services keep SRV (no fixed consumer port).
       cloudMapOptions: {
         name: task.name,
         cloudMapNamespace: dnsNamespace,
-        dnsRecordType: servicediscovery.DnsRecordType.SRV,
+        dnsRecordType: task.name === 'forge-devops'
+          ? servicediscovery.DnsRecordType.A
+          : servicediscovery.DnsRecordType.SRV,
         dnsTtl: cdk.Duration.seconds(10),
       },
     });
