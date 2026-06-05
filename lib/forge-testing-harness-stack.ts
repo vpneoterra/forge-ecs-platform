@@ -98,13 +98,18 @@ export class ForgeTestingHarnessStack extends cdk.Stack {
 
     const env = props.forgeEnv;
 
+    // 'dev' keeps the legacy flat physical names that the live blue stack already owns.
+    // All other envs (dev2, prod, ...) append `-${forgeEnv}` so they never collide.
+    const legacyEnv = props.forgeEnv === 'dev';
+    const scoped = (base: string) => (legacyEnv ? base : `${base}-${props.forgeEnv}`);
+
     // Apply harness-specific cost-center tag to every resource in this stack so
     // the USD 50 Budget can scope cleanly to this harness alone.
     cdk.Tags.of(this).add(HARNESS_COST_CENTER_TAG.key, HARNESS_COST_CENTER_TAG.value);
 
     // ── ECR repository for the runner image ────────────────────────────────
     this.runnerRepo = new ecr.Repository(this, 'HarnessRunnerRepo', {
-      repositoryName: HARNESS_RUNNER.ecrRepo,
+      repositoryName: scoped(HARNESS_RUNNER.ecrRepo),
       imageScanOnPush: true,
       lifecycleRules: [
         {
@@ -125,7 +130,7 @@ export class ForgeTestingHarnessStack extends cdk.Stack {
 
     // ── CloudWatch log group ──────────────────────────────────────────────
     const logGroup = new logs.LogGroup(this, 'HarnessLogs', {
-      logGroupName: '/forge/ecs/testing-harness',
+      logGroupName: scoped('/forge/ecs/testing-harness'),
       retention: logs.RetentionDays.ONE_WEEK,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
@@ -154,7 +159,7 @@ export class ForgeTestingHarnessStack extends cdk.Stack {
 
     // ── Fargate task definition ───────────────────────────────────────────
     const taskDef = new ecs.FargateTaskDefinition(this, 'HarnessTaskDef', {
-      family: 'forge-testing-harness',
+      family: scoped('forge-testing-harness'),
       cpu: HARNESS_RUNNER.cpu,
       memoryLimitMiB: HARNESS_RUNNER.memory,
       executionRole,
@@ -207,7 +212,7 @@ export class ForgeTestingHarnessStack extends cdk.Stack {
 
     // ── SNS topic for budget / alarm notifications ────────────────────────
     this.alertTopic = new sns.Topic(this, 'HarnessAlerts', {
-      topicName: 'forge-harness-alerts',
+      topicName: scoped('forge-harness-alerts'),
       displayName: 'FORGE Tier-2 Testing Harness Alerts',
     });
     this.alertTopic.addSubscription(
