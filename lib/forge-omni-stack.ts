@@ -246,7 +246,7 @@ export class ForgeOmniStack extends cdk.Stack {
     this.serviceName = `omni-${env}`;
 
     // Register with ALB target group
-    httpsListener.addTargets('OmniTarget', {
+    const omniTargetGroup = httpsListener.addTargets('OmniTarget', {
       targets: [service],
       port: 5000,
       protocol: elbv2.ApplicationProtocol.HTTP,
@@ -259,6 +259,24 @@ export class ForgeOmniStack extends cdk.Stack {
         healthyThresholdCount: 2,
       },
       deregistrationDelay: cdk.Duration.seconds(30),
+    });
+
+    // -- Service auto scaling --------------------------------------------------
+    // omni does high-load 3D asset generation; scale OUT on CPU and ALB
+    // request rate, back IN when idle. desiredCount:1 is the floor.
+    const scaling = service.autoScaleTaskCount({ minCapacity: 1, maxCapacity: 6 });
+
+    scaling.scaleOnCpuUtilization('OmniCpuScaling', {
+      targetUtilizationPercent: 65,
+      scaleInCooldown: cdk.Duration.seconds(120),
+      scaleOutCooldown: cdk.Duration.seconds(60),
+    });
+
+    scaling.scaleOnRequestCount('OmniReqScaling', {
+      requestsPerTarget: 20,
+      targetGroup: omniTargetGroup,
+      scaleInCooldown: cdk.Duration.seconds(120),
+      scaleOutCooldown: cdk.Duration.seconds(60),
     });
 
     // -- Outputs ---------------------------------------------------------------
