@@ -1225,7 +1225,9 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       //   2. abc-extract-to-efs.yml   → unpack staged chunks to /data on EFS
       //   3. abc-build-index workflow → emit Parquet snapshot under abc/v00/index/
       // Bucket name follows the deterministic pattern from ForgeDataStack.
-      const abcDataBucketName = `forge-platform-data-${this.account}-${this.region}`;
+      const abcDataBucketName = legacyEnv
+        ? `forge-platform-data-${this.account}-${this.region}`
+        : `forge-platform-data-${this.account}-${this.region}-${props.forgeEnv}`;
       taskRole.addToPolicy(new iam.PolicyStatement({
         sid: 'AbcDatasetS3ReadWrite',
         actions: [

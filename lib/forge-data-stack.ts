@@ -44,11 +44,16 @@ export class ForgeDataStack extends cdk.Stack {
 
     const isProd = props.forgeEnv === 'prod';
 
+    // 'dev' keeps the legacy flat physical names that the live blue stack already owns.
+    // All other envs (dev2, prod, ...) append `-${forgeEnv}` so they never collide.
+    const legacyEnv = props.forgeEnv === 'dev';
+    const scoped = (base: string) => (legacyEnv ? base : `${base}-${props.forgeEnv}`);
+
     // ── S3: forge-platform-data ───────────────────────────────────────────────
     // Intelligent-Tiering transitions cold data automatically -- no lifecycle rule complexity.
     // First 128 KB of each object stays in frequent access tier always.
     this.dataBucket = new s3.Bucket(this, 'DataBucket', {
-      bucketName: `forge-platform-data-${this.account}-${this.region}`,
+      bucketName: scoped(`forge-platform-data-${this.account}-${this.region}`),
       versioned: true,
       encryption: s3.BucketEncryption.S3_MANAGED,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
@@ -132,7 +137,7 @@ export class ForgeDataStack extends cdk.Stack {
     // Pay-per-request = free tier covers 1-2 person team usage easily.
     // No Redis needed -- use DynamoDB for job state and simple caching.
     this.jobsTable = new dynamodb.Table(this, 'JobsTable', {
-      tableName: 'forge-jobs',
+      tableName: scoped('forge-jobs'),
       partitionKey: { name: 'job_id', type: dynamodb.AttributeType.STRING },
       sortKey: { name: 'created_at', type: dynamodb.AttributeType.NUMBER },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
@@ -164,7 +169,7 @@ export class ForgeDataStack extends cdk.Stack {
 
     for (const task of SOLVER_MANIFEST) {
       const repo = new ecr.Repository(this, `EcrRepo${task.name.replace(/-/g, '')}`, {
-        repositoryName: task.name,
+        repositoryName: scoped(task.name),
         encryption: ecr.RepositoryEncryption.AES_256,
         imageScanOnPush: true,
         imageTagMutability: ecr.TagMutability.MUTABLE,
