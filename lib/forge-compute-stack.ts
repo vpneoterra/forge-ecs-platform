@@ -72,10 +72,20 @@ export class ForgeComputeStack extends cdk.Stack {
     // Import the existing forge.local namespace instead of creating a new one.
     // Creating it would replace the live namespace and break
     // forge-devops.forge.local service discovery for the running kernel.
+    //
+    // Each env owns its OWN forge.local namespace. Importing the wrong one makes
+    // ForgeCompute create its forge-devops Cloud Map service in another env's
+    // namespace, colliding with that env's existing service. dev keeps the live
+    // shared id byte-for-byte; other envs import their own (created by ForgeApp).
+    const NS_BY_ENV: Record<string, string> = {
+      dev: 'ns-dcqpbkmnzbqgpiub',
+      dev2: 'ns-lehqqlwn5mxifpow',
+    };
+    const nsId = NS_BY_ENV[props.forgeEnv] ?? 'ns-dcqpbkmnzbqgpiub';
     const dnsNamespace = servicediscovery.PrivateDnsNamespace.fromPrivateDnsNamespaceAttributes(this, 'ForgeDns', {
       namespaceName: 'forge.local',
-      namespaceId: 'ns-dcqpbkmnzbqgpiub',
-      namespaceArn: `arn:aws:servicediscovery:${this.region}:${this.account}:namespace/ns-dcqpbkmnzbqgpiub`,
+      namespaceId: nsId,
+      namespaceArn: `arn:aws:servicediscovery:${this.region}:${this.account}:namespace/${nsId}`,
     });
 
     // ── CloudWatch Log Groups ─────────────────────────────────────────────────
