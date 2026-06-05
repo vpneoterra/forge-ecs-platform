@@ -218,7 +218,7 @@ export class ForgeComputeStack extends cdk.Stack {
 
     const capacityProviderA = new ecs.AsgCapacityProvider(this, 'CapacityProviderA', {
       autoScalingGroup: asgA,
-      capacityProviderName: PROVIDER_A.name,
+      capacityProviderName: scoped(PROVIDER_A.name),
       enableManagedScaling: true,
       targetCapacityPercent: PROVIDER_A.targetCapacityPercent,
       enableManagedTerminationProtection: true,
@@ -277,7 +277,7 @@ export class ForgeComputeStack extends cdk.Stack {
 
     const capacityProviderB = new ecs.AsgCapacityProvider(this, 'CapacityProviderB', {
       autoScalingGroup: asgB,
-      capacityProviderName: PROVIDER_B.name,
+      capacityProviderName: scoped(PROVIDER_B.name),
       enableManagedScaling: true,
       targetCapacityPercent: PROVIDER_B.targetCapacityPercent, // 100% -- max bin-packing
       enableManagedTerminationProtection: false,
@@ -340,7 +340,7 @@ export class ForgeComputeStack extends cdk.Stack {
 
     const capacityProviderC = new ecs.AsgCapacityProvider(this, 'CapacityProviderC', {
       autoScalingGroup: asgC,
-      capacityProviderName: PROVIDER_C.name,
+      capacityProviderName: scoped(PROVIDER_C.name),
       enableManagedScaling: true,
       targetCapacityPercent: PROVIDER_C.targetCapacityPercent,
       enableManagedTerminationProtection: false,
