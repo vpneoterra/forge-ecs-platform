@@ -150,8 +150,8 @@ export class ForgeGeometryStack extends cdk.Stack {
     taskRole.addToPolicy(new iam.PolicyStatement({
       actions: ['s3:GetObject', 's3:PutObject', 's3:ListBucket'],
       resources: [
-        `arn:aws:s3:::forge-platform-data-${this.account}-${this.region}`,
-        `arn:aws:s3:::forge-platform-data-${this.account}-${this.region}/*`,
+        `arn:aws:s3:::${scoped(`forge-platform-data-${this.account}-${this.region}`)}`,
+        `arn:aws:s3:::${scoped(`forge-platform-data-${this.account}-${this.region}`)}/*`,
       ],
     }));
     // ECS exec for debugging
