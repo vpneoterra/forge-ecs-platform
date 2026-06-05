@@ -41,6 +41,16 @@
  *   appDomain     Domain for forge-app (default: forgetest.qrucible.ai)
  *   omniDomain    Domain for OMNI (default: omni.qrucible.ai)
  *   alertEmail    Email for CloudWatch alerts (default: ops@forge.local)
+ *   peerEnv       Name of the OTHER env to VPC-peer with (e.g. "dev" when deploying
+ *                 "dev2"). Gated; absent => no peering resources. Peer CIDR is
+ *                 derived via vpcCidr(peerEnv). Wires routes (both sides) + the
+ *                 DKS EFS 2049 ingress from the peer CIDR.
+ *   createPeering "true" => this deploy is the requester and creates the single
+ *                 ec2.CfnVPCPeeringConnection (requires peerVpcId). The accepter
+ *                 re-deploy omits this and passes peerConnectionId instead.
+ *   peerVpcId     The accepter env's VPC id (vpc-...); required with createPeering.
+ *   peerConnectionId  Existing peering connection id (pcx-...) for the accepter
+ *                 side so it adds routes without creating a duplicate connection.
  *
  * Usage:
  *   npx cdk deploy --all -c env=dev -c deployApp=true -c appDomain=forgetest.qrucible.ai -c skipRds=true
@@ -105,6 +115,16 @@ const enableHarnessAutoPause =
   (app.node.tryGetContext('enableHarnessAutoPause') as string | undefined) !== 'false';
 const omniDomain =
   (app.node.tryGetContext('omniDomain') as string | undefined) ?? 'omni.qrucible.ai';
+// VPC peering (gated, symmetric). peerEnv is the OTHER env's name (its CIDR is
+// derived via vpcCidr). createPeering=true makes THIS deploy the requester that
+// creates the CfnVPCPeeringConnection (needs peerVpcId = accepter VPC id); the
+// accepter re-deploy instead passes peerConnectionId (pcx-...). Absent peerEnv
+// => no peering resources anywhere.
+const peerEnv = app.node.tryGetContext('peerEnv') as string | undefined;
+const peerVpcId = app.node.tryGetContext('peerVpcId') as string | undefined;
+const createPeering =
+  (app.node.tryGetContext('createPeering') as string | undefined) === 'true';
+const peerConnectionId = app.node.tryGetContext('peerConnectionId') as string | undefined;
 
 const awsEnv: cdk.Environment = {
   account: process.env.CDK_DEFAULT_ACCOUNT ?? process.env.AWS_ACCOUNT_ID,
@@ -125,6 +145,10 @@ const networkStack = new ForgeNetworkStack(app, `ForgeNetwork-${env}`, {
   env: awsEnv,
   description: 'FORGE VPC, NAT Instance, Security Groups',
   forgeEnv: env,
+  peerEnv,
+  peerVpcId,
+  createPeering,
+  peerConnectionId,
   tags: sharedTags,
 });
 
@@ -159,6 +183,7 @@ if (deployApp) {
     omniDomainName: omniDomain,
     hostedZoneDomain: appDomain.split('.').slice(-2).join('.'), // e.g., 'qrucible.ai'
     deployDks,
+    peerEnv,
     migrateDks,
     dksSrcEfsId,
     dksSrcAccessPointId,

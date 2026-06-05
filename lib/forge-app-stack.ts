@@ -45,7 +45,7 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Construct } from 'constructs';
 import { importSecretByName, ecsSecretByName } from './secret-lookup';
 import { CAP_PICOGK } from './config/geometry-manifest';
-import { vpcSecondOctet } from './config/network-config';
+import { vpcSecondOctet, vpcCidr } from './config/network-config';
 
 export interface ForgeAppStackProps extends cdk.StackProps {
   forgeEnv: string;
@@ -58,6 +58,14 @@ export interface ForgeAppStackProps extends cdk.StackProps {
   omniDomainName: string;   // e.g., 'omni.qrucible.ai'
   hostedZoneDomain: string; // e.g., 'qrucible.ai'
   deployDks?: boolean;
+  /**
+   * Name of the OTHER environment to VPC-peer with. When set (and deployDks is
+   * true), the DKS EFS mount-target SG is opened on 2049 to the peer VPC CIDR
+   * so peer-env tasks can NFS-mount it across the peering link. Absent => no
+   * peer ingress (byte-for-byte unchanged). Must match the network stack's
+   * peerEnv; the actual peering connection/routes live in ForgeNetworkStack.
+   */
+  peerEnv?: string;
   /**
    * One-time DataSync EFS->EFS migration of the DKS dataset from the live
    * source EFS into the dev2 destination EFS. Gated (default off) and nested
@@ -909,6 +917,19 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
 
       // Allow ECS tasks to access EFS
       dksEfs.connections.allowDefaultPortFrom(props.ecsSecurityGroup);
+
+      // Peer-VPC NFS access (gated): when peering is wired (peerEnv set), open
+      // the DKS EFS mount-target SG on 2049 to the peer VPC CIDR so peer-env
+      // tasks can NFS-mount this filesystem across the peering link. The
+      // connection + routes live in ForgeNetworkStack (same peerEnv). Absent
+      // peerEnv => no extra ingress (byte-for-byte unchanged).
+      if (props.peerEnv) {
+        dksEfs.connections.allowFrom(
+          ec2.Peer.ipv4(vpcCidr(props.peerEnv)),
+          ec2.Port.tcp(2049),
+          `NFS from peer VPC (${props.peerEnv})`,
+        );
+      }
 
       // Access point for DKS data
       const dksAccessPoint = dksEfs.addAccessPoint('DksDataAP', {

@@ -14,6 +14,30 @@ import { vpcCidr } from './config/network-config';
 
 export interface ForgeNetworkStackProps extends cdk.StackProps {
   forgeEnv: string;
+  /**
+   * Name of the OTHER environment to VPC-peer with (e.g. when deploying 'dev2'
+   * you pass peerEnv='dev'). When unset, no peering resources are created and
+   * the stack is byte-for-byte unchanged. The peer CIDR is derived from this
+   * via vpcCidr(peerEnv).
+   */
+  peerEnv?: string;
+  /**
+   * The peer environment's VPC id (from context). Required on the requester
+   * side (createPeering=true) to target the CfnVPCPeeringConnection.
+   */
+  peerVpcId?: string;
+  /**
+   * When true, THIS stack is the requester and creates the single
+   * CfnVPCPeeringConnection (and outputs PeeringConnectionId). The accepter
+   * side leaves this false and passes peerConnectionId instead.
+   */
+  createPeering?: boolean;
+  /**
+   * Existing peering connection id (pcx-...). Set on the accepter side so it
+   * adds routes against the connection the requester already created, rather
+   * than creating a duplicate.
+   */
+  peerConnectionId?: string;
   tags?: Record<string, string>;
 }
 
@@ -136,6 +160,58 @@ export class ForgeNetworkStack extends cdk.Stack {
       });
     }
 
+    // ── VPC Peering (gated, symmetric) ───────────────────────────────────────
+    // When peerEnv is set, wire this VPC to the peer environment's VPC so tasks
+    // can reach the peer's EFS mount targets across the peering link. Only the
+    // requester (createPeering=true) creates the CfnVPCPeeringConnection; the
+    // accepter references the existing connection id via peerConnectionId. Both
+    // sides add routes to the peer CIDR on every private subnet route table.
+    // Absent peerEnv => zero new resources (dev/prod byte-for-byte unchanged).
+    if (props.peerEnv) {
+      const peerCidr = vpcCidr(props.peerEnv);
+
+      let peeringConnectionId: string;
+      if (props.createPeering) {
+        if (!props.peerVpcId) {
+          throw new Error(
+            'createPeering=true requires peerVpcId (the accepter VPC id) via -c peerVpcId=vpc-...',
+          );
+        }
+        const peering = new ec2.CfnVPCPeeringConnection(this, 'ForgeVpcPeering', {
+          vpcId: this.vpc.vpcId,
+          peerVpcId: props.peerVpcId,
+          tags: [{ key: 'Name', value: `forge-peer-${props.forgeEnv}-${props.peerEnv}` }],
+        });
+        peeringConnectionId = peering.ref;
+
+        new cdk.CfnOutput(this, 'PeeringConnectionId', {
+          value: peering.ref,
+          description:
+            'VPC peering connection id -- pass to the peer env re-deploy as -c peerConnectionId=',
+          exportName: `ForgePeeringConnectionId-${props.forgeEnv}`,
+        });
+      } else {
+        if (!props.peerConnectionId) {
+          throw new Error(
+            'peerEnv set without createPeering requires peerConnectionId (pcx-...) from the ' +
+              'requester deploy, via -c peerConnectionId=pcx-...',
+          );
+        }
+        peeringConnectionId = props.peerConnectionId;
+      }
+
+      // Route every private subnet to the peer CIDR via the peering connection.
+      for (let i = 0; i < this.privateSubnets.length; i++) {
+        const subnet = this.privateSubnets[i] as ec2.Subnet;
+        new ec2.CfnRoute(this, `PeerRoute${i}`, {
+          routeTableId: subnet.routeTable.routeTableId,
+          destinationCidrBlock: peerCidr,
+          vpcPeeringConnectionId: peeringConnectionId,
+        });
+      }
+      // The peer-CIDR EFS SG ingress is added after the EFS SG is created below.
+    }
+
     // ── VPC Endpoints ────────────────────────────────────────────────────────
     // S3 Gateway endpoint (free -- no data transfer charges through NAT)
     this.vpc.addGatewayEndpoint('S3Endpoint', {
@@ -227,6 +303,16 @@ export class ForgeNetworkStack extends cdk.Stack {
       ec2.Port.tcp(2049),
       'NFS from ECS',
     );
+    // Peer-VPC NFS access (gated): when peering is wired, let the peer VPC's
+    // tasks reach this stack's generic EFS mount targets. The DKS EFS SG is
+    // separate (forge-app-stack, under deployDks) and is opened there.
+    if (props.peerEnv) {
+      this.efsSecurityGroup.addIngressRule(
+        ec2.Peer.ipv4(vpcCidr(props.peerEnv)),
+        ec2.Port.tcp(2049),
+        `NFS from peer VPC (${props.peerEnv})`,
+      );
+    }
 
     // ── Outputs ──────────────────────────────────────────────────────────────
     this.natInstanceId = new cdk.CfnOutput(this, 'NatInstanceId', {
