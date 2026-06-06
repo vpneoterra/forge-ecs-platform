@@ -1,0 +1,146 @@
+name: Build & Push Standalone OMNI Image (omni-dev2)
+
+# Builds docker/omni/Dockerfile from forgenew@main (or specified ref)
+# and pushes to the isolated ECR repo omni-dev2.
+# NEVER pushes to omni, forge-omni, or forge-omni-dev2.
+# Mirrors build-omni2.yml idiom: buildx, ECR login, describe||create,
+# tags :latest + :YYYYMMDD-HHMMSS + :sha8.
+#
+# After a successful push, copy the printed IMAGE_DIGEST and proceed with
+# the ECS rollout in build-omni-standalone.yml's "ECS Rollout" job
+# OR follow the manual ECS rollout steps in omni-execution-prompt.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      forgenew_ref:
+        description: 'forgenew git ref to build (branch, tag, or full SHA)'
+        required: false
+        default: 'main'
+      dry_run:
+        description: 'Dry run — build but do not push'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO: omni-dev2          # GREEN standalone repo — never omni or forge-omni
+
+jobs:
+  build:
+    name: Build Standalone OMNI (linux/amd64)
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image_digest: ${{ steps.push.outputs.digest }}
+      ecr_uri:      ${{ steps.meta.outputs.ecr_uri }}
+      sha8:         ${{ steps.meta.outputs.sha8 }}
+      build_date:   ${{ steps.meta.outputs.build_date }}
+
+    steps:
+      - name: Checkout forgenew @ ref
+        uses: actions/checkout@v4
+        with:
+          repository: vpneoterra/forgenew
+          ref: ${{ github.event.inputs.forgenew_ref || 'main' }}
+          token: ${{ secrets.GH_PAT }}
+          path: image-source
+
+      - name: Verify OMNI Dockerfile exists
+        run: |
+          if [ ! -f image-source/docker/omni/Dockerfile ]; then
+            echo "::error::image-source/docker/omni/Dockerfile not found on ref '${{ github.event.inputs.forgenew_ref || 'main' }}'."
+            exit 1
+          fi
+          echo "Dockerfile found. Pinned upstream SHAs:"
+          grep -E 'git checkout' image-source/docker/omni/Dockerfile | head -10 || true
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Ensure omni-dev2 ECR repo exists (already created, verify only)
+        run: |
+          aws ecr describe-repositories \
+            --repository-names ${{ env.ECR_REPO }} \
+            --region ${{ env.AWS_REGION }} \
+          || aws ecr create-repository \
+               --repository-name ${{ env.ECR_REPO }} \
+               --region ${{ env.AWS_REGION }} \
+               --image-scanning-configuration scanOnPush=true \
+               --image-tag-mutability MUTABLE \
+               --tags Key=Project,Value=OmniStandalone Key=ManagedBy,Value=CDK
+          echo "ECR repo ${{ env.ECR_REPO }} confirmed."
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URI="${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}"
+          echo "ecr_uri=${ECR_URI}" >> $GITHUB_OUTPUT
+          echo "build_date=$(date -u +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+          SHA8=$(git -C image-source rev-parse --short=8 HEAD)
+          # Emit under both names so all references resolve (sha8 used by job outputs, git_sha by tags)
+          echo "sha8=${SHA8}" >> $GITHUB_OUTPUT
+          echo "git_sha=${SHA8}" >> $GITHUB_OUTPUT
+
+      - name: Build and push Standalone OMNI image
+        id: push
+        uses: docker/build-push-action@v5
+        with:
+          context:    ./image-source/docker/omni
+          file:       ./image-source/docker/omni/Dockerfile
+          platforms:  linux/amd64
+          push:       ${{ github.event.inputs.dry_run != 'true' }}
+          tags: |
+            ${{ steps.meta.outputs.ecr_uri }}:latest
+            ${{ steps.meta.outputs.ecr_uri }}:${{ steps.meta.outputs.build_date }}
+            ${{ steps.meta.outputs.ecr_uri }}:${{ steps.meta.outputs.git_sha }}
+          cache-from: type=registry,ref=${{ steps.meta.outputs.ecr_uri }}:cache
+          cache-to:   type=registry,ref=${{ steps.meta.outputs.ecr_uri }}:cache,mode=max
+          build-args: |
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+            GIT_SHA=${{ steps.meta.outputs.git_sha }}
+
+      - name: Print pushed image digest
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          echo "================================================="
+          echo "PUSHED IMAGE DIGEST (use this for ECS rollout):"
+          echo "${{ steps.push.outputs.digest }}"
+          echo "Full URI by digest:"
+          echo "${{ steps.meta.outputs.ecr_uri }}@${{ steps.push.outputs.digest }}"
+          echo "================================================="
+
+      - name: Build summary
+        if: always()
+        run: |
+          {
+            echo "## Standalone OMNI Build"
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| forgenew ref | ${{ github.event.inputs.forgenew_ref || 'main' }} |"
+            echo "| git SHA8 | ${{ steps.meta.outputs.git_sha }} |"
+            echo "| ECR repo | ${{ env.ECR_REPO }} |"
+            echo "| Tags | latest, ${{ steps.meta.outputs.build_date }}, ${{ steps.meta.outputs.git_sha }} |"
+            echo "| Digest | ${{ steps.push.outputs.digest }} |"
+            echo "| Dry run | ${{ github.event.inputs.dry_run }} |"
+            echo "| Result | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
