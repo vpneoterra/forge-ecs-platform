@@ -764,9 +764,12 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
     // -- Route 53 Alias Records ------------------------------------------------
     // A records with Alias to ALB -- Route 53 automatically resolves to the
     // ALB's current IPs. No CNAME needed, no manual DNS updates ever.
-    // Gated on claimProdDomain so exactly one env owns the prod alias: during a
-    // blue/green cutover the outgoing env deploys with claimProdDomain=false,
-    // dropping this record so CloudFormation DELETEs it and frees the name.
+    // Both the forge and omni prod aliases point at THIS shared app ALB: forge
+    // hits the default target group, omni is routed by the OmniTarget
+    // host-header listener rule below. Gated on claimProdDomain so exactly one
+    // env owns the prod names: during a blue/green cutover the outgoing env
+    // deploys with claimProdDomain=false, dropping both records so
+    // CloudFormation DELETEs them and frees the names for the incoming env.
     if (props.claimProdDomain ?? true) {
       new route53.ARecord(this, 'ForgeAlbAlias', {
         zone: hostedZone,
@@ -776,12 +779,20 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         ),
         comment: 'FORGE app ALB -- managed by CDK',
       });
-    }
 
-    // omni public DNS alias intentionally NOT created here. The standalone
-    // ForgeOmni stack is the sole owner of the omniDomainName Route53 alias.
-    // The embedded omni stays reachable internally via Cloud Map (omni.<ns>)
-    // and externally via the OmniTarget host-header rule on the shared ALB.
+      // omni.qrucible.ai resolves to the SAME app ALB; the OmniTarget
+      // host-header rule (priority 10) forwards it to the embedded omni
+      // service. Distinct logical id from ForgeOmniStack's standalone
+      // 'OmniAlbAlias' so the two never collide.
+      new route53.ARecord(this, 'OmniAppAlbAlias', {
+        zone: hostedZone,
+        recordName: props.omniDomainName,
+        target: route53.RecordTarget.fromAlias(
+          new route53Targets.LoadBalancerTarget(this.alb),
+        ),
+        comment: 'OMNI via FORGE app ALB host-header -- managed by CDK',
+      });
+    }
 
     // -- Fargate Service -------------------------------------------------------
     const service = new ecs.FargateService(this, 'ForgeAppService', {
