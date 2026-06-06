@@ -105,6 +105,14 @@ const enableHarnessAutoPause =
   (app.node.tryGetContext('enableHarnessAutoPause') as string | undefined) !== 'false';
 const omniDomain =
   (app.node.tryGetContext('omniDomain') as string | undefined) ?? 'omni.qrucible.ai';
+// Ownership flag for the production Route 53 alias records (forge.qrucible.ai +
+// omni.qrucible.ai). Exactly one env may OWN these records at a time, because
+// CloudFormation cannot CREATE a record set that another stack already declares.
+// Defaults true so normal/GREEN deploys claim the prod hostnames. Deploy the
+// outgoing (BLUE) env with -c claimProdDomain=false to drop its declarations so
+// CloudFormation DELETEs them from Route 53, freeing the names for the new owner.
+const claimProdDomain =
+  (app.node.tryGetContext('claimProdDomain') as string | undefined) !== 'false';
 
 const awsEnv: cdk.Environment = {
   account: process.env.CDK_DEFAULT_ACCOUNT ?? process.env.AWS_ACCOUNT_ID,
@@ -158,6 +166,7 @@ if (deployApp) {
     domainName: appDomain,
     omniDomainName: omniDomain,
     hostedZoneDomain: appDomain.split('.').slice(-2).join('.'), // e.g., 'qrucible.ai'
+    claimProdDomain,
     deployDks,
     migrateDks,
     dksSrcEfsId,
@@ -226,6 +235,7 @@ if (deployOmni) {
     publicSubnets: networkStack.publicSubnets,
     domainName: omniDomain,
     hostedZoneDomain: omniDomain.split('.').slice(-2).join('.'),
+    claimProdDomain,
     tags: sharedTags,
   });
   omniStack.addDependency(networkStack);
