@@ -86,6 +86,14 @@ export interface ForgeAppStackProps extends cdk.StackProps {
    * HTTPS listener without a separate certificate.
    */
   lucidDomainName?: string;
+  /**
+   * Whether this stack OWNS the production forge.qrucible.ai Route 53 alias.
+   * Only one env may own it at a time (CloudFormation cannot CREATE a record
+   * set another stack already declares). Set false on the outgoing env during a
+   * blue/green cutover so the record is dropped here and CloudFormation DELETEs
+   * it, freeing the name for the incoming env. Defaults true.
+   */
+  claimProdDomain?: boolean;
   tags?: Record<string, string>;
 }
 
@@ -756,14 +764,19 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
     // -- Route 53 Alias Records ------------------------------------------------
     // A records with Alias to ALB -- Route 53 automatically resolves to the
     // ALB's current IPs. No CNAME needed, no manual DNS updates ever.
-    new route53.ARecord(this, 'ForgeAlbAlias', {
-      zone: hostedZone,
-      recordName: props.domainName,
-      target: route53.RecordTarget.fromAlias(
-        new route53Targets.LoadBalancerTarget(this.alb),
-      ),
-      comment: 'FORGE app ALB -- managed by CDK',
-    });
+    // Gated on claimProdDomain so exactly one env owns the prod alias: during a
+    // blue/green cutover the outgoing env deploys with claimProdDomain=false,
+    // dropping this record so CloudFormation DELETEs it and frees the name.
+    if (props.claimProdDomain ?? true) {
+      new route53.ARecord(this, 'ForgeAlbAlias', {
+        zone: hostedZone,
+        recordName: props.domainName,
+        target: route53.RecordTarget.fromAlias(
+          new route53Targets.LoadBalancerTarget(this.alb),
+        ),
+        comment: 'FORGE app ALB -- managed by CDK',
+      });
+    }
 
     // omni public DNS alias intentionally NOT created here. The standalone
     // ForgeOmni stack is the sole owner of the omniDomainName Route53 alias.

@@ -42,6 +42,14 @@ export interface ForgeOmniStackProps extends cdk.StackProps {
   publicSubnets: ec2.ISubnet[];
   domainName: string;       // e.g., 'omni.qrucible.ai'
   hostedZoneDomain: string; // e.g., 'qrucible.ai'
+  /**
+   * Whether this stack OWNS the production omni.qrucible.ai Route 53 alias.
+   * Only one env may own it at a time (CloudFormation cannot CREATE a record
+   * set another stack already declares). Set false on the outgoing env during a
+   * blue/green cutover so the record is dropped here and CloudFormation DELETEs
+   * it, freeing the name for the incoming env. Defaults true.
+   */
+  claimProdDomain?: boolean;
   tags?: Record<string, string>;
 }
 
@@ -218,14 +226,19 @@ export class ForgeOmniStack extends cdk.Stack {
     });
 
     // -- Route 53 Alias Record ------------------------------------------------
-    new route53.ARecord(this, 'OmniAlbAlias', {
-      zone: hostedZone,
-      recordName: props.domainName,
-      target: route53.RecordTarget.fromAlias(
-        new route53Targets.LoadBalancerTarget(this.alb),
-      ),
-      comment: 'OMNI app ALB -- managed by CDK',
-    });
+    // Gated on claimProdDomain so exactly one env owns the prod alias: during a
+    // blue/green cutover the outgoing env deploys with claimProdDomain=false,
+    // dropping this record so CloudFormation DELETEs it and frees the name.
+    if (props.claimProdDomain ?? true) {
+      new route53.ARecord(this, 'OmniAlbAlias', {
+        zone: hostedZone,
+        recordName: props.domainName,
+        target: route53.RecordTarget.fromAlias(
+          new route53Targets.LoadBalancerTarget(this.alb),
+        ),
+        comment: 'OMNI app ALB -- managed by CDK',
+      });
+    }
 
     // -- Fargate Service -------------------------------------------------------
     const service = new ecs.FargateService(this, 'OmniService', {
