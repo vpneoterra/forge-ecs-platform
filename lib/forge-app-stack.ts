@@ -276,6 +276,13 @@ export class ForgeAppStack extends cdk.Stack {
     ecrRepo.grantPull(executionRole);
     dksEcrRepo.grantPull(executionRole);
 
+    // Bucket the forge-app + forge-dks containers write to at runtime. Single
+    // source of truth for both the container env vars (AWS_S3_BUCKET_CEM_ASSETS,
+    // DKS_RUNLOG_S3_BUCKET) and the task-role grant below. NOT env-scoped: this
+    // is a shared, pre-existing CEM-assets bucket (same literal already used by
+    // the live forge-app-test:1444 task def), so both BLUE and GREEN write to it.
+    const cemAssetsBucket = 'forge-cem-assets';
+
     // -- Task Role (runtime) --------------------------------------------------
     const taskRole = new iam.Role(this, 'TaskRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
@@ -286,6 +293,36 @@ export class ForgeAppStack extends cdk.Stack {
         'ssmmessages:OpenControlChannel', 'ssmmessages:OpenDataChannel',
       ],
       resources: ['*'],
+    }));
+
+    // -- S3: forge-cem-assets object writes (RC-C) ----------------------------
+    // The forge-app container writes AIN/monitor snapshots (forge-dks sidecar:
+    // DKS_RUNLOG_S3_BUCKET=forge-cem-assets, DKS_RUNLOG_S3_PREFIX=monitor-logs/)
+    // and CEM asset objects (AWS_S3_BUCKET_CEM_ASSETS=forge-cem-assets) to this
+    // bucket, but the role previously granted S3 objects only on
+    // forge-platform-data-<...>/abc/* (and only inside the deployDks block), so
+    // every runtime PutObject to forge-cem-assets failed AccessDenied (367x on
+    // forge-cem-assets/monitor-logs/... in GREEN). This grant exists in the live
+    // BLUE role out-of-band; codifying it here makes it stick on redeploy for
+    // every env. Least privilege: object actions the app genuinely performs,
+    // scoped to this dedicated bucket's objects only (NOT s3:* and NOT all
+    // buckets). The bucket is single-purpose (CEM assets + monitor-logs), so the
+    // object scope is the bucket contents rather than a per-key prefix.
+    taskRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'CemAssetsS3ObjectReadWrite',
+      actions: [
+        's3:PutObject',
+        's3:PutObjectAcl',
+        's3:GetObject',
+        's3:AbortMultipartUpload',
+        's3:ListMultipartUploadParts',
+      ],
+      resources: [`arn:aws:s3:::${cemAssetsBucket}/*`],
+    }));
+    taskRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'CemAssetsS3List',
+      actions: ['s3:ListBucket', 's3:GetBucketLocation'],
+      resources: [`arn:aws:s3:::${cemAssetsBucket}`],
     }));
 
     // -- Fargate Task Definition ----------------------------------------------
@@ -438,7 +475,7 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         ASSET_CDN_BASE: 'https://d9va7rcq7bqjn.cloudfront.net',
         ASSET_RECONCILER_ENABLED: 'true',
         ASSET_RECONCILER_TICK_MS: '60000',
-        AWS_S3_BUCKET_CEM_ASSETS: 'forge-cem-assets',
+        AWS_S3_BUCKET_CEM_ASSETS: cemAssetsBucket,
         AWS_S3_REGION: 'us-east-1',
         // -- Conductor --
         CONDUCTOR_DEADLETTER_ENABLED: 'true',
@@ -590,7 +627,7 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         DKS_LOG_LEVEL: 'INFO',
         DKS_RUNLOG_ENABLED: '1',
         AWS_REGION: 'us-east-1',
-        DKS_RUNLOG_S3_BUCKET: 'forge-cem-assets',
+        DKS_RUNLOG_S3_BUCKET: cemAssetsBucket,
         DKS_CONFIDENCE_THRESHOLD: '0.6',
       },
       secrets: {
@@ -815,8 +852,15 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         // FORGE Node enrichment bridge (server/omni-enrichment-bridge.js) mounted
         // at /api/omni-enriched in server.js. Was defaulting to localhost:3000
         // which (a) doesn't exist in the OMNI task and (b) had a wrong path prefix.
+        // Derived from the SAME constructs that name + register the forge-app
+        // service in this stack: the env-scoped service name (appServiceName,
+        // 'forge-app-test' on legacy dev / 'forge-app-<env>' otherwise) and the
+        // Cloud Map namespace this stack creates (namespace.namespaceName,
+        // 'forge.local'). The prior hardcoded 'forge-app-test' was the BLUE/dev
+        // name and does not resolve from the GREEN (dev2) network, where the
+        // app registers as forge-app-dev2.forge.local.
         ENRICHMENT_BRIDGE_URL:
-          'http://forge-app-test.forge.local:3000/api/omni-enriched',
+          `http://${appServiceName}.${namespace.namespaceName}:3000/api/omni-enriched`,
       },
       secrets: {
         ANTHROPIC_API_KEY: secrets['ANTHROPIC_API_KEY'],
