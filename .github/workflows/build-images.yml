@@ -80,21 +80,23 @@ jobs:
             dockerfile: Dockerfile
             platforms: linux/amd64
 
-          # Shared (NOT env-scoped) images: their ECR repos have no -dev2
-          # counterpart (green and blue share these). env_scoped: false means
-          # they are skipped on a dev2-targeted run.
+          # lucid and dks-query ARE env-scoped: dedicated lucid-dev2 and
+          # dks-query-dev2 ECR repos now exist, so green builds its own copies
+          # on a dev2 run (blue/dev still pushes to the bare repos). dks-ingest
+          # stays shared (no dks-ingest consumer in green app services; the
+          # forgenew build-image.yml owns dks-ingest-dev2 if/when needed).
           - name: lucid
             repo: LUCID
             dockerfile: Dockerfile
             platforms: linux/amd64
-            env_scoped: false
 
           - name: dks-query
             repo: forge-dks
             dockerfile: Dockerfile.query
             platforms: linux/amd64
-            env_scoped: false
 
+          # Shared (NOT env-scoped): no -dev2 counterpart consumed by green.
+          # env_scoped: false means it is skipped on a dev2-targeted run.
           - name: dks-ingest
             repo: forge-dks
             dockerfile: Dockerfile.ingest
