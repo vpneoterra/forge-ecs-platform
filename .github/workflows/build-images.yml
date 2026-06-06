@@ -7,8 +7,20 @@ on:
         description: 'Specific image to build (leave empty for all)'
         required: false
         default: ''
+      target_env:
+        # Which environment's ECR repos to push to.
+        # 'dev'  (default) = blue/live behavior, UNCHANGED (pushes to <name>).
+        # 'dev2' = green    = pushes to the env-scoped <name>-dev2 repos so
+        #          green tracks its own builds without touching blue images.
+        description: 'Target env: dev (blue, default) or dev2 (green)'
+        required: false
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - dev2
   schedule:
-    # Weekly Monday 6am UTC — refresh base images
+    # Weekly Monday 6am UTC — refresh base images (blue/dev only)
     - cron: '0 6 * * 1'
 
 env:
@@ -68,31 +80,46 @@ jobs:
             dockerfile: Dockerfile
             platforms: linux/amd64
 
+          # Shared (NOT env-scoped) images: their ECR repos have no -dev2
+          # counterpart (green and blue share these). env_scoped: false means
+          # they are skipped on a dev2-targeted run.
           - name: lucid
             repo: LUCID
             dockerfile: Dockerfile
             platforms: linux/amd64
+            env_scoped: false
 
           - name: dks-query
             repo: forge-dks
             dockerfile: Dockerfile.query
             platforms: linux/amd64
+            env_scoped: false
 
           - name: dks-ingest
             repo: forge-dks
             dockerfile: Dockerfile.ingest
             platforms: linux/amd64
+            env_scoped: false
 
     steps:
       - name: Check if this image should build
         id: filter
         run: |
           TARGET="${{ github.event.inputs.target_image }}"
-          if [ -z "$TARGET" ] || [ "$TARGET" = "${{ matrix.image.name }}" ]; then
-            echo "should_build=true" >> $GITHUB_OUTPUT
-          else
-            echo "should_build=false" >> $GITHUB_OUTPUT
+          TARGET_ENV="${{ github.event.inputs.target_env }}"
+          ENV_SCOPED="${{ matrix.image.env_scoped }}"   # '' (true) or 'false'
+          SHOULD=true
+          # Image-name filter
+          if [ -n "$TARGET" ] && [ "$TARGET" != "${{ matrix.image.name }}" ]; then
+            SHOULD=false
           fi
+          # On a dev2 (green) run, skip images that are NOT env-scoped
+          # (they have no <name>-dev2 ECR repo; green shares blue's repo).
+          if [ "$TARGET_ENV" = "dev2" ] && [ "$ENV_SCOPED" = "false" ]; then
+            echo "Skipping ${{ matrix.image.name }} on dev2 run (shared repo, no -dev2 variant)."
+            SHOULD=false
+          fi
+          echo "should_build=$SHOULD" >> $GITHUB_OUTPUT
 
       # Source-repo checkout (skipped for images whose context is in this repo).
       - uses: actions/checkout@v4
@@ -134,8 +161,17 @@ jobs:
         id: meta
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          ECR_URI=$ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ matrix.image.name }}
+          # Env-scope the ECR repo name. dev (default) keeps the bare repo name
+          # byte-for-byte (blue unchanged). dev2 appends -dev2 (green's repos).
+          # Scheduled runs have no inputs, so default to '' (blue) safely.
+          TARGET_ENV="${{ github.event.inputs.target_env }}"
+          ENV_SUFFIX=""
+          if [ "$TARGET_ENV" = "dev2" ]; then ENV_SUFFIX="-dev2"; fi
+          REPO_NAME="${{ matrix.image.name }}${ENV_SUFFIX}"
+          ECR_URI=$ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${REPO_NAME}
+          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
           echo "ecr_uri=$ECR_URI" >> $GITHUB_OUTPUT
+          echo "Target env: ${TARGET_ENV:-dev}  ->  ECR repo: ${REPO_NAME}"
           echo "build_date=$(date -u +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
           echo "git_sha=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
 
@@ -173,11 +209,11 @@ jobs:
         if: steps.filter.outputs.should_build == 'true'
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          echo "Checking ECR scan results for ${{ matrix.image.name }}..."
+          echo "Checking ECR scan results for ${{ steps.meta.outputs.repo_name }}..."
           # Brief wait for scan to complete (non-blocking — just informational)
           sleep 30
           aws ecr describe-image-scan-findings \
-            --repository-name ${{ matrix.image.name }} \
+            --repository-name ${{ steps.meta.outputs.repo_name }} \
             --image-id imageTag=latest \
             --region ${{ env.AWS_REGION }} \
             --query 'imageScanFindings.findingSeverityCounts' \
