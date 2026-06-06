@@ -14,8 +14,18 @@ on:
         description: 'Source repo ref (branch/tag/SHA). Empty = default branch.'
         required: false
         default: ''
+      target_env:
+        # 'dev' (default) = blue, UNCHANGED (pushes to <ecr_name>).
+        # 'dev2' = green = pushes to <ecr_name>-dev2 so green tracks its builds.
+        description: 'Target env: dev (blue, default) or dev2 (green)'
+        required: false
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - dev2
   schedule:
-    # Weekly Wednesday 6am UTC — refresh geometry base images
+    # Weekly Wednesday 6am UTC — refresh geometry base images (blue/dev only)
     - cron: '0 6 * * 3'
 
 env:
@@ -108,8 +118,16 @@ jobs:
         id: meta
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          ECR_URI=$ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ matrix.image.ecr_name }}
+          # Env-scope the ECR repo: dev (default) keeps the bare name (blue
+          # unchanged); dev2 appends -dev2 (green's geometry repos).
+          TARGET_ENV="${{ github.event.inputs.target_env }}"
+          ENV_SUFFIX=""
+          if [ "$TARGET_ENV" = "dev2" ]; then ENV_SUFFIX="-dev2"; fi
+          REPO_NAME="${{ matrix.image.ecr_name }}${ENV_SUFFIX}"
+          ECR_URI=$ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${REPO_NAME}
+          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
           echo "ecr_uri=$ECR_URI" >> $GITHUB_OUTPUT
+          echo "Target env: ${TARGET_ENV:-dev}  ->  ECR repo: ${REPO_NAME}"
           echo "build_date=$(date -u +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
           echo "git_sha=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
 
@@ -135,11 +153,11 @@ jobs:
         if: steps.filter.outputs.should_build == 'true'
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          echo "Checking ECR scan results for ${{ matrix.image.ecr_name }}..."
+          echo "Checking ECR scan results for ${{ steps.meta.outputs.repo_name }}..."
           # Brief wait for scan to complete (non-blocking — just informational)
           sleep 30
           aws ecr describe-image-scan-findings \
-            --repository-name ${{ matrix.image.ecr_name }} \
+            --repository-name ${{ steps.meta.outputs.repo_name }} \
             --image-id imageTag=latest \
             --region ${{ env.AWS_REGION }} \
             --query 'imageScanFindings.findingSeverityCounts' \
