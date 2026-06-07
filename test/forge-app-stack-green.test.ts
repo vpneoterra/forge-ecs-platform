@@ -161,3 +161,54 @@ describe('ForgeAppStack — RC-C forge-cem-assets task-role grant', () => {
     }
   });
 });
+
+describe('ForgeAppStack — FIX d560d7d6 OMNI bridge programs/* GLB write', () => {
+  const template = synth('dev2');
+
+  test('task role pins the exact minimum multipart-upload grant on programs/*', () => {
+    template.hasResourceProperties('AWS::IAM::Policy', {
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Sid: 'CemAssetsProgramsGlbWrite',
+            Effect: 'Allow',
+            Action: [
+              's3:PutObject',
+              's3:PutObjectAcl',
+              's3:AbortMultipartUpload',
+            ],
+            Resource: 'arn:aws:s3:::forge-cem-assets/programs/*',
+          }),
+        ]),
+      },
+    });
+  });
+
+  test('programs/* grant carries no read/delete/list actions (write-only, least privilege)', () => {
+    const policies = template.findResources('AWS::IAM::Policy');
+    let found = false;
+    for (const pol of Object.values(policies) as any[]) {
+      for (const stmt of pol.Properties.PolicyDocument.Statement as any[]) {
+        if (stmt.Sid === 'CemAssetsProgramsGlbWrite') {
+          found = true;
+          const actions = Array.isArray(stmt.Action) ? stmt.Action : [stmt.Action];
+          expect(actions).not.toContain('s3:*');
+          expect(actions).not.toContain('s3:GetObject');
+          expect(actions).not.toContain('s3:DeleteObject');
+          expect(actions).not.toContain('s3:ListBucket');
+        }
+      }
+    }
+    expect(found).toBe(true);
+  });
+});
+
+describe('ForgeAppStack — FIX d560d7d6 ASSET_CDN_BASE present for dev2', () => {
+  const template = synth('dev2');
+  const appEnv = envForContainer(template, 'forge-app');
+
+  test('ASSET_CDN_BASE is set so persisted GLBs have a CDN-retrievable URL', () => {
+    expect(appEnv.ASSET_CDN_BASE).toBeDefined();
+    expect(appEnv.ASSET_CDN_BASE).toMatch(/^https:\/\//);
+  });
+});

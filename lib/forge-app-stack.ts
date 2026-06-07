@@ -333,6 +333,31 @@ export class ForgeAppStack extends cdk.Stack {
       resources: [`arn:aws:s3:::${cemAssetsBucket}`],
     }));
 
+    // -- S3: OMNI bridge per-part GLB writes under programs/* (FIX d560d7d6) ---
+    // The OMNI enrichment bridge persists each generated GLB part to
+    // s3://forge-cem-assets/programs/<programId>/<job>/<file> via the AWS SDK's
+    // multipart PutObject path. On the dev2 (GREEN) cutover this failed EVERY
+    // upload with AccessDenied ("not authorized to perform: s3:PutObject on
+    // resource arn:aws:s3:::forge-cem-assets/programs/...") because the dev2
+    // task role did not carry the forge-cem-assets write grant the live BLUE
+    // role held out-of-band. The broad CemAssetsS3ObjectReadWrite statement
+    // above (forge-cem-assets/*) also serves the DKS sidecar's monitor-logs/
+    // prefix, so it is intentionally kept; this statement pins the EXACT
+    // minimum the GLB bridge needs on the programs/* prefix as an explicit,
+    // asserted contract (least privilege: only the three multipart-upload
+    // object actions the SDK performs, scoped to programs/* — NOT the whole
+    // bucket, NOT s3:*, NOT all buckets). Mirrors the AbcDatasetS3ReadWrite
+    // explicit-PolicyStatement convention used elsewhere in this stack.
+    taskRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'CemAssetsProgramsGlbWrite',
+      actions: [
+        's3:PutObject',
+        's3:PutObjectAcl',
+        's3:AbortMultipartUpload',
+      ],
+      resources: [`arn:aws:s3:::${cemAssetsBucket}/programs/*`],
+    }));
+
     // -- Fargate Task Definition ----------------------------------------------
     // Sized to match the live forge-app-test:1444 task def (cpu 1024 / mem
     // 3072). The prior 512/1024 was undersized for the full forge-app + DKS
@@ -480,6 +505,14 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         AXIOM_TOKEN_BUDGET_DAY: '200000',
         AXIOM_USE_MOCK: 'false',
         // -- Assets / CDN / S3 --
+        // CDN that fronts forge-cem-assets so a persisted GLB has a
+        // public, CDN-retrievable URL (without it asset-storage.js warns the
+        // stored object has no fronted public URL). No CloudFront distribution
+        // is defined in this CDK repo, so this follows the same hardcoded
+        // env-URL convention as LUCID_URL / QRUCIBLE_API_URL — the literal is
+        // copied verbatim from the live forge-app-test:1444 task def. Applies
+        // to every env (dev + dev2). NOTE: confirm this distribution actually
+        // fronts forge-cem-assets for dev2 before deploy (see PR body).
         ASSET_CDN_BASE: 'https://d9va7rcq7bqjn.cloudfront.net',
         ASSET_RECONCILER_ENABLED: 'true',
         ASSET_RECONCILER_TICK_MS: '60000',
