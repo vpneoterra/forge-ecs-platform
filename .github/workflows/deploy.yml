@@ -12,6 +12,7 @@ on:
         type: choice
         options:
           - dev
+          - dev2
           - prod
       skipRds:
         description: 'Skip RDS (use external Supabase)'
@@ -41,21 +42,41 @@ on:
         options:
           - 'false'
           - 'true'
+      # NOTE: The three flags below are tri-state. Leave on 'auto' to use the
+      # environment's known-correct stack set (see the Resolve deploy flags
+      # step); pick 'true'/'false' only to override for a one-off deploy.
+      #
+      # dev2 (GREEN) is a FULL environment: ForgeGeometry-dev2, ForgeLucid-dev2
+      # and the solver stacks (ForgeData/Compute/Orchestration-dev2) are all
+      # live. Deploying dev2 with these false would DESTROY those stacks, so
+      # 'auto' resolves them to true for dev2. dev/prod keep false on 'auto'.
       deployGeometry:
         description: 'Deploy Geometry Platform (B-Rep, GPU SDF, Neural SDF)'
         required: false
-        type: boolean
-        default: false
+        type: choice
+        default: 'auto'
+        options:
+          - 'auto'
+          - 'true'
+          - 'false'
       deployLucid:
         description: 'Deploy LUCID multi-mode AI workspace'
         required: false
-        type: boolean
-        default: false
+        type: choice
+        default: 'auto'
+        options:
+          - 'auto'
+          - 'true'
+          - 'false'
       deploySolvers:
         description: 'Deploy solver/compute stacks (ForgeData + ForgeCompute + ForgeOrchestration; includes SysML kernel)'
         required: false
-        type: boolean
-        default: false
+        type: choice
+        default: 'auto'
+        options:
+          - 'auto'
+          - 'true'
+          - 'false'
       lucidActiveMode:
         description: 'LUCID active mode'
         required: false
@@ -181,6 +202,37 @@ jobs:
       - name: Verify AWS identity
         run: aws sts get-caller-identity
 
+      # Resolve the per-stack deploy flags from the selected environment.
+      # 'auto' means "use this environment's known-correct stack set":
+      #   - dev2 (GREEN) is a full env  -> Geometry/Lucid/Solvers = true
+      #   - dev / prod                  -> Geometry/Lucid/Solvers = false
+      # An explicit 'true'/'false' input always overrides the auto value.
+      - name: Resolve deploy flags
+        id: flags
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+          IN_GEOMETRY: ${{ github.event.inputs.deployGeometry || 'auto' }}
+          IN_LUCID: ${{ github.event.inputs.deployLucid || 'auto' }}
+          IN_SOLVERS: ${{ github.event.inputs.deploySolvers || 'auto' }}
+        run: |
+          set -euo pipefail
+          # Default (auto) values per environment.
+          case "$ENVIRONMENT" in
+            dev2)
+              auto_geometry=true; auto_lucid=true; auto_solvers=true ;;
+            *)
+              auto_geometry=false; auto_lucid=false; auto_solvers=false ;;
+          esac
+          resolve() { if [ "$1" = "auto" ]; then echo "$2"; else echo "$1"; fi; }
+          GEOMETRY=$(resolve "$IN_GEOMETRY" "$auto_geometry")
+          LUCID=$(resolve "$IN_LUCID" "$auto_lucid")
+          SOLVERS=$(resolve "$IN_SOLVERS" "$auto_solvers")
+          echo "deployGeometry=$GEOMETRY" >> "$GITHUB_OUTPUT"
+          echo "deployLucid=$LUCID" >> "$GITHUB_OUTPUT"
+          echo "deploySolvers=$SOLVERS" >> "$GITHUB_OUTPUT"
+          echo "Resolved deploy flags for env=$ENVIRONMENT:"
+          echo "  deployGeometry=$GEOMETRY  deployLucid=$LUCID  deploySolvers=$SOLVERS"
+
       - name: Install dependencies
         run: npm ci
 
@@ -197,9 +249,9 @@ jobs:
             -c deployApp=true \
             -c deployDks=${{ github.event.inputs.deployDks || 'true' }} \
             -c deployGemma=${{ github.event.inputs.deployGemma || 'false' }} \
-            -c deployGeometry=${{ inputs.deployGeometry || 'false' }} \
-            -c deployLucid=${{ inputs.deployLucid || 'false' }} \
-            -c deploySolvers=${{ inputs.deploySolvers || 'false' }} \
+            -c deployGeometry=${{ steps.flags.outputs.deployGeometry }} \
+            -c deployLucid=${{ steps.flags.outputs.deployLucid }} \
+            -c deploySolvers=${{ steps.flags.outputs.deploySolvers }} \
             -c lucidActiveMode=${{ github.event.inputs.lucidActiveMode || 'code' }} \
             -c lucidImageTag=${{ github.event.inputs.lucidImageTag || 'latest' }} \
             -c lucidImageDigest=${{ github.event.inputs.lucidImageDigest || '' }} \
@@ -216,9 +268,9 @@ jobs:
             -c deployApp=true \
             -c deployDks=${{ github.event.inputs.deployDks || 'true' }} \
             -c deployGemma=${{ github.event.inputs.deployGemma || 'false' }} \
-            -c deployGeometry=${{ inputs.deployGeometry || 'false' }} \
-            -c deployLucid=${{ inputs.deployLucid || 'false' }} \
-            -c deploySolvers=${{ inputs.deploySolvers || 'false' }} \
+            -c deployGeometry=${{ steps.flags.outputs.deployGeometry }} \
+            -c deployLucid=${{ steps.flags.outputs.deployLucid }} \
+            -c deploySolvers=${{ steps.flags.outputs.deploySolvers }} \
             -c lucidActiveMode=${{ github.event.inputs.lucidActiveMode || 'code' }} \
             -c lucidImageTag=${{ github.event.inputs.lucidImageTag || 'latest' }} \
             -c lucidImageDigest=${{ github.event.inputs.lucidImageDigest || '' }} \
@@ -239,12 +291,25 @@ jobs:
           cat cdk-outputs.json | python3 -m json.tool
 
       - name: Smoke test
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
         run: |
-          # Wait for ECS services to stabilize
-          CLUSTER="forge-app-dev"
+          set -euo pipefail
+          # Cluster + service names are env-scoped in the app stack
+          # (clusterName: forge-app-<env>; appServiceName: forge-app-<env>,
+          # except the legacy 'dev' env which keeps forge-app-test; omni is
+          # always forge-omni).
+          CLUSTER="forge-app-${ENVIRONMENT}"
+          if [ "$ENVIRONMENT" = "dev" ]; then
+            APP_SERVICE="forge-app-test"
+          else
+            APP_SERVICE="forge-app-${ENVIRONMENT}"
+          fi
+          OMNI_SERVICE="forge-omni"
           echo "Waiting for ECS services to become stable in cluster: $CLUSTER"
+          echo "  services: $APP_SERVICE $OMNI_SERVICE"
           aws ecs wait services-stable \
             --cluster "$CLUSTER" \
-            --services forge-app-service omni-service \
+            --services "$APP_SERVICE" "$OMNI_SERVICE" \
             --region ${{ env.AWS_REGION }} || echo "Warning: services not stable yet (may still be starting)"
           echo "Smoke test complete"
