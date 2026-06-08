@@ -324,11 +324,25 @@ export class ForgeGeometryStack extends cdk.Stack {
     // Preserve CFN ordering: the task-def must come after the ECR repo construct.
     td.node.addDependency(repo);
 
+    // PicoGK refuses to start its geometry path when S3 is enabled unless
+    // FORGE_S3_BUCKET is set (throws InvalidOperationException, returning HTTP 500
+    // on every /generate, /boolean and /run request while /health still passes).
+    // The bucket is the same forge-platform-data bucket created in ForgeDataStack
+    // and already granted to this task role above (s3:GetObject/PutObject/ListBucket).
+    // It is derived from account+region here — rather than hardcoded in the static
+    // manifest Record — because those tokens only resolve inside the stack, matching
+    // the IAM resource ARNs and ForgeDataStack bucketName exactly.
+    const picogkS3Env: Record<string, string> =
+      cap.id === CAP_PICOGK.id
+        ? { FORGE_S3_BUCKET: `forge-platform-data-${this.account}-${this.region}` }
+        : {};
+
     const container = td.addContainer(`${cap.taskName}-container`, {
       image: this.geometryImage(cap, scopedName),
       essential: true,
       environment: {
         ...cap.containerEnvVars,
+        ...picogkS3Env,
         AWS_REGION: this.region,
         FORGE_ENV: props.forgeEnv,
       },
