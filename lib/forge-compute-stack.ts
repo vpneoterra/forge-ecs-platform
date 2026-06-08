@@ -15,6 +15,7 @@ import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
+import { resolveEcrImage } from './image-ref';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as efs from 'aws-cdk-lib/aws-efs';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
@@ -470,10 +471,17 @@ export class ForgeComputeStack extends cdk.Stack {
       }
     }
 
-    // ECR image reference
+    // ECR image reference.
+    // Prefer an immutable pin from CDK context so each image push yields a new
+    // task-def revision that ECS auto-rolls (see lib/image-ref.ts). The context
+    // prefix is the task name camelCased, e.g.:
+    //   -c forgeDevopsImageDigest=sha256:...   (preferred)
+    //   -c forgeDevopsImageTag=<git-sha>
+    // Falls back to ':latest' when no override is supplied.
     const repo = props.ecrRepos.get(task.name);
+    const ctxPrefix = task.name.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
     const imageUri = repo
-      ? ecs.ContainerImage.fromEcrRepository(repo, 'latest')
+      ? resolveEcrImage(this, repo, ctxPrefix)
       : ecs.ContainerImage.fromRegistry(`${this.account}.dkr.ecr.${this.region}.amazonaws.com/${task.name}:latest`);
 
     const logGroup = logGroups.get(task.name);

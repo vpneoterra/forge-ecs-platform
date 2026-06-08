@@ -23,6 +23,7 @@ import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
+import { resolveEcrImage } from './image-ref';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as iam from 'aws-cdk-lib/aws-iam';
@@ -142,8 +143,12 @@ export class ForgeOmniStack extends cdk.Stack {
       },
     });
 
+    // Immutable image pin via CDK context (see lib/image-ref.ts):
+    //   -c omniImageDigest=sha256:...   (preferred)
+    //   -c omniImageTag=<git-sha>
+    // Falls back to ':latest' when no override is supplied.
     const container = taskDef.addContainer('omni-api', {
-      image: ecs.ContainerImage.fromEcrRepository(ecrRepo, 'latest'),
+      image: resolveEcrImage(this, ecrRepo, 'omni'),
       essential: true,
       environment: {
         DISPLAY: ':99',

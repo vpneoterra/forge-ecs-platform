@@ -319,12 +319,13 @@ export class ForgeGeometryStack extends cdk.Stack {
     // intentionally EMPTY until CI pushes images; this does not block CREATE
     // because every geometry service deploys dormant (desiredCount=0,
     // activateOnDeploy=false), so no task is started against the empty repo.
-    const imageUri = `${this.account}.dkr.ecr.${this.region}.amazonaws.com/${scopedName}:latest`;
+    // Image ref: floating-':latest' string by default; immutable digest/tag when
+    // an override is supplied (see geometryImage()).
     // Preserve CFN ordering: the task-def must come after the ECR repo construct.
     td.node.addDependency(repo);
 
     const container = td.addContainer(`${cap.taskName}-container`, {
-      image: ecs.ContainerImage.fromRegistry(imageUri),
+      image: this.geometryImage(cap, scopedName),
       essential: true,
       environment: {
         ...cap.containerEnvVars,
@@ -474,13 +475,14 @@ export class ForgeGeometryStack extends cdk.Stack {
     // synth-time '@sha256:<digest>' pin that caused the FluxTK outage. Uses the
     // SAME scoped repo name (non-dev repos are intentionally empty until CI
     // pushes; GPU tasks run only via operator RunTask, so CREATE is not blocked).
-    const imageUri = `${this.account}.dkr.ecr.${this.region}.amazonaws.com/${scopedName}:latest`;
     td.node.addDependency(repo);
 
     // GPU resource requirement — CDK doesn't have a native L2 for this,
-    // so we add it via escape hatch after container creation
+    // so we add it via escape hatch after container creation.
+    // Image ref: floating-':latest' string by default; immutable digest/tag when
+    // an override is supplied (see geometryImage()).
     const container = td.addContainer(`${cap.taskName}-container`, {
-      image: ecs.ContainerImage.fromRegistry(imageUri),
+      image: this.geometryImage(cap, scopedName),
       cpu: cap.cpu!,
       memoryLimitMiB: cap.memory!,
       essential: true,
@@ -522,5 +524,36 @@ export class ForgeGeometryStack extends cdk.Stack {
     //   aws ecs run-task --cluster forge-dev --task-definition forge-sdf-gpu \
     //     --capacity-provider-strategy capacityProvider=ForgeProviderC,weight=1 \
     //     --network-configuration ...
+  }
+
+  /**
+   * Resolve the container image for a geometry capability.
+   *
+   * DEFAULT (no override): keep the deliberate floating-':latest' STRING form
+   * via fromRegistry. This stores a literal tag in the task-def so ECS resolves
+   * the digest at task start — cold starts always pull current ':latest' and are
+   * never broken by a ':latest' overwrite (this is what avoided a repeat of the
+   * FluxTK synth-time-digest-pin outage).
+   *
+   * OVERRIDE (recommended for deploys): pass an immutable pin via CDK context so
+   * each push yields a new task-def revision and ECS auto-rolls the service:
+   *   -c <taskName camelCased>ImageDigest=sha256:...   (preferred)
+   *   -c <taskName camelCased>ImageTag=<git-sha>
+   * e.g. forge-picogk -> forgePicogkImageDigest / forgePicogkImageTag.
+   */
+  private geometryImage(cap: GeometryCapability, scopedName: string): ecs.ContainerImage {
+    const prefix = cap.taskName!.replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
+    const digest = this.node.tryGetContext(`${prefix}ImageDigest`) as string | undefined;
+    const tag = this.node.tryGetContext(`${prefix}ImageTag`) as string | undefined;
+    const base = `${this.account}.dkr.ecr.${this.region}.amazonaws.com/${scopedName}`;
+    if (digest) {
+      const d = digest.startsWith('sha256:') ? digest : `sha256:${digest}`;
+      return ecs.ContainerImage.fromRegistry(`${base}@${d}`);
+    }
+    if (tag) {
+      return ecs.ContainerImage.fromRegistry(`${base}:${tag}`);
+    }
+    // Backwards-compatible safe default: literal floating ':latest' string.
+    return ecs.ContainerImage.fromRegistry(`${base}:latest`);
   }
 }
