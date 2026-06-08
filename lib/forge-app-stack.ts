@@ -31,6 +31,7 @@ import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
+import { resolveEcrImage } from './image-ref';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as iam from 'aws-cdk-lib/aws-iam';
@@ -374,8 +375,9 @@ export class ForgeAppStack extends cdk.Stack {
       },
     });
 
+    // Immutable image pin via CDK context (-c forgeAppImageDigest / forgeAppImageTag).
     const container = taskDef.addContainer('forge-app', {
-      image: ecs.ContainerImage.fromEcrRepository(ecrRepo, 'latest'),
+      image: resolveEcrImage(this, ecrRepo, 'forgeApp'),
       essential: true,
       environment: {
         NODE_ENV: 'production',
@@ -660,8 +662,9 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
     // .taskdef_groundtruth/live_1444_dks_full.json. The two secrets reuse the
     // already-resolved ecs.Secret objects (dks-database-url, anthropic-api-key)
     // to avoid duplicate AwsCustomResource lookups.
+    // Immutable image pin via CDK context (-c forgeDksImageDigest / forgeDksImageTag).
     taskDef.addContainer('forge-dks', {
-      image: ecs.ContainerImage.fromEcrRepository(dksEcrRepo, 'latest'),
+      image: resolveEcrImage(this, dksEcrRepo, 'forgeDks'),
       essential: false,
       environment: {
         DKS_RUNLOG_S3_PREFIX: 'monitor-logs/',
@@ -899,8 +902,9 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
 
     omniEcrRepo.grantPull(executionRole);
 
+    // Immutable image pin via CDK context (-c forgeOmniImageDigest / forgeOmniImageTag).
     const omniContainer = omniTaskDef.addContainer('omni-api', {
-      image: ecs.ContainerImage.fromEcrRepository(omniEcrRepo, 'latest'),
+      image: resolveEcrImage(this, omniEcrRepo, 'forgeOmni'),
       essential: true,
       environment: {
         DISPLAY: ':99',
@@ -1162,8 +1166,9 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         },
       });
 
+      // Immutable image pin via CDK context (-c dksQueryImageDigest / dksQueryImageTag).
       const dksQueryContainer = dksQueryTaskDef.addContainer('dks-query', {
-        image: ecs.ContainerImage.fromEcrRepository(dksQueryEcrRepo, 'latest'),
+        image: resolveEcrImage(this, dksQueryEcrRepo, 'dksQuery'),
         essential: true,
         environment: {
           LLM_BACKEND: 'claude',
@@ -1275,8 +1280,9 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       );
       vertexSaSecret.grantRead(executionRole);
 
+      // Immutable image pin via CDK context (-c dksIngestImageDigest / dksIngestImageTag).
       const dksIngestContainer = dksIngestTaskDef.addContainer('dks-ingest', {
-        image: ecs.ContainerImage.fromEcrRepository(dksIngestEcrRepo, 'latest'),
+        image: resolveEcrImage(this, dksIngestEcrRepo, 'dksIngest'),
         essential: true,
         environment: {
           DKS_EMBEDDING_MODEL: 'all-MiniLM-L6-v2',
