@@ -858,8 +858,16 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       protocol: elbv2.ApplicationProtocol.HTTP,
       healthCheck: {
         path: '/health',
-        interval: cdk.Duration.seconds(30),
-        timeout: cdk.Duration.seconds(10),
+        // [GREEN-DEPLOY-503 2026-06-07] Tightened from interval=30s/timeout=10s.
+        // Root cause of the deploy-time 503 windows: at desiredCount=1, a new
+        // task needed 2 consecutive passes 30s apart (~60s) to register, while
+        // the old target drained in ~30s (deregistrationDelay) — leaving the
+        // target group with ZERO healthy targets for ~30s on every rolling
+        // deploy, so the ALB returned 503. With interval=15s a new task goes
+        // healthy in ~30s (2 x 15s), inside the drain window, closing the gap.
+        // timeout must stay < interval; 5s is ample for the trivial /health.
+        interval: cdk.Duration.seconds(15),
+        timeout: cdk.Duration.seconds(5),
         healthyHttpCodes: '200',
         unhealthyThresholdCount: 3,
         healthyThresholdCount: 2,
