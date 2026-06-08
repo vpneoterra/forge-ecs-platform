@@ -400,7 +400,7 @@ jobs:
 
           # Design Studio API
           echo -n "  /api/design-studio/project-config/test ... "
-          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "$DOMAIN/api/design-studio/project-config/test" || echo "000")
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$DOMAIN/api/design-studio/project-config/test" || echo "000")
           if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 500 ]; then
             echo "✅ ($STATUS)"
           else
@@ -410,7 +410,7 @@ jobs:
 
           # Traces API
           echo -n "  /api/traces ... "
-          if curl -sf "$DOMAIN/api/traces" | jq -e '.total' > /dev/null 2>&1; then
+          if curl -sf "$DOMAIN/api/traces" | jq -e '.traces' > /dev/null 2>&1; then
             echo "✅"
           else
             echo "❌"
