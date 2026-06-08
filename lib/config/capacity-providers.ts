@@ -32,22 +32,41 @@ export interface CapacityProviderConfig {
 
 /**
  * Provider A: Graviton Spot, always-on.
- * Hosts: forge-lightweight + forge-devops + forge-monitoring (all fit on c6g.xlarge: 4 vCPU, 8 GB)
- * Total always-on CPU: 7 vCPU, ~12.8 GB. Fits on c6g.xlarge with ~10% headroom.
- * Spot price: ~$0.07/hr -> $51/month
+ * Hosts the three always-on services: forge-devops (4 vCPU / 7 GB),
+ * forge-lightweight (2 vCPU / 3.75 GB) and forge-monitoring (1 vCPU / 1.75 GB).
+ * Total always-on footprint: 7 vCPU (7168 CPU units) / ~12.8 GB.
+ *
+ * A single c6g.xlarge is 4 vCPU / 8 GB (4096 CPU units), so the always-on set
+ * does NOT fit on one host: forge-devops alone (4096 CPU) saturates an entire
+ * c6g.xlarge. The set requires TWO c6g.xlarge instances (verified live: devops
+ * pinned to one host at 0 remaining CPU; lightweight+monitoring on the second).
+ *
+ * minCapacity is therefore 2, not 1. The prior `minCapacity: 1` was a latent
+ * misconfiguration: it let the ASG scale in (or a deploy recycle down) to a
+ * single host that physically cannot place forge-devops (4096 CPU > 1024 free
+ * on a host already running lightweight+monitoring), so the SysML kernel was
+ * evicted and `forge-devops.forge.local` lost all Cloud Map instances
+ * (ENOTFOUND) — the deploy-time enabler of the 2026-06-08 GREEN outage. Keeping
+ * >=2 always-on Graviton hosts means an instance recycle never drops cluster
+ * capacity below the always-on footprint, and ECS can immediately place the
+ * forge-devops replacement on the surviving host.
+ *
+ * Spot price: ~$0.07/hr per instance -> ~$102/month for the 2 always-on hosts
+ * (the fleet already runs 2 instances in steady state; this only corrects the
+ * declared floor to match the real always-on footprint).
  */
 export const PROVIDER_A: CapacityProviderConfig = {
   name: 'ForgeProviderA',
   instanceTypes: ['c6g.xlarge', 'c6g.large', 'm6g.xlarge', 'm7g.xlarge'],
   spot: true,
-  minCapacity: 1,
+  minCapacity: 2,
   maxCapacity: 2,
   targetCapacityPercent: 80,
   architecture: 'arm64',
   amiType: 'bottlerocket-arm64',
-  description: 'Graviton Spot for always-on services (geometry, devops, monitoring)',
+  description: 'Graviton Spot for always-on services (devops, monitoring, lightweight)',
   estimatedSpotPricePerHour: 0.07,
-  estimatedMonthlyMin: 51,
+  estimatedMonthlyMin: 102,
   estimatedMonthlyMax: 102,
 };
 
