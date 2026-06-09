@@ -605,7 +605,17 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         // -- Image / diag --
         IMAGE_TAG: '8a9a4078705e0a692a58aa12b560c8c6a0eef4a1',
         INTERNAL_DIAG_TOKEN: '1234',
-        KEYSTONE_HF_ENDPOINT: 'https://mfto106x86m937qp.us-east-1.aws.endpoints.huggingface.cloud',
+        // KEYSTONE_HF_ENDPOINT was previously hard-coded here as an env literal,
+        // but it is now sourced from the `forge/test/keystone-hf-endpoint` secret
+        // (see baseSecretNames -> `keystone-hf-endpoint` and the omni-api +
+        // forge-app `secrets` blocks below). ECS rejects task definitions that
+        // declare the same key as both `environment` and `secrets` on a single
+        // container, so keeping the literal here causes:
+        //   `The secret name must be unique and not shared with any new or
+        //    existing environment variables set on the container, such as
+        //    'KEYSTONE_HF_ENDPOINT'.`
+        // The runtime value is identical (same URL string lives inside the
+        // secret), so removing the literal is a no-op for the application.
         // -- Maestro --
         MAESTRO_BACKEND: 'pgboss',
         MAESTRO_HARNESS_ENABLED: 'true',
