@@ -204,6 +204,26 @@ export class ForgeAppStack extends cdk.Stack {
       'devstral-staging-endpoint',
       'forgejo-pat',
       'gh-token',
+      // KEYSTONE (HuggingFace provider) -- consumed by the OMNI .NET binary
+      // (`docker/omni/src/Services/Keystone/ClaudeApiService.cs`). The class's
+      // `IsConfigured` gate requires BOTH a non-empty `_apiKey` and a non-empty
+      // `_hfBaseUrl` when `KEYSTONE_PROVIDER=huggingface` (the default). Missing
+      // either short-circuits every call site:
+      //   - KeystoneOrchestrator.cs:42-50  (subassembly enrichment skipped)
+      //   - ClaudeApiService.GenerateSdfCandidates:202 (returns []; SdfRouter
+      //     logs `KEYSTONE failed … substage=claude_empty`)
+      //   - ClaudeApiService.GenerateCadQueryScript / EnrichFitAnalysis
+      // The autoloader at line ~243 turns each entry below into a `secrets`
+      // map key by replacing '-' with '_' and upper-casing, i.e.
+      //   keystone-hf-token    -> secrets['KEYSTONE_HF_TOKEN']
+      //   keystone-hf-endpoint -> secrets['KEYSTONE_HF_ENDPOINT']
+      // Both are then wired into the `omni-api` container's `secrets` block
+      // below. Without these the previously-good HF endpoint receives 0 calls
+      // (see KEYSTONE_ZERO_CALLS_REPORT.md). Underlying secrets live at
+      //   forge/test/keystone-hf-token        (hf_BNBG…JuVqETL)
+      //   forge/test/keystone-hf-endpoint     (https://mfto106x86m937qp.us-east-1.aws.endpoints.huggingface.cloud)
+      'keystone-hf-token',
+      'keystone-hf-endpoint',
     ];
     // Autonomous Pipeline v2: Upstash Redis for BullMQ. Only include when
     // the pipeline is enabled, so disabling the flag is a clean CDK-only
@@ -930,9 +950,25 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         // app registers as forge-app-dev2.forge.local.
         ENRICHMENT_BRIDGE_URL:
           `http://${appServiceName}.${namespace.namespaceName}:3000/api/omni-enriched`,
+        // KEYSTONE provider selection. `ClaudeApiService` defaults to
+        // 'huggingface' when this env var is unset, but we set it explicitly so
+        // the live task-definition reflects the intended provider and so a
+        // future rollback to 'anthropic' is a one-line CDK edit + redeploy
+        // (rather than a code change). KEYSTONE must use the HuggingFace path,
+        // not Claude. ANTHROPIC_API_KEY is retained below only as a documented
+        // rollback path; with KEYSTONE_PROVIDER=huggingface it is never read.
+        KEYSTONE_PROVIDER: 'huggingface',
       },
       secrets: {
         ANTHROPIC_API_KEY: secrets['ANTHROPIC_API_KEY'],
+        // KEYSTONE HuggingFace provider configuration. Both are required for
+        // ClaudeApiService.IsConfigured == true (see comment in secretNames
+        // above). The hardcoded fallback endpoint URL inside the .NET binary
+        // is intentionally the SAME host as the secret value -- the secret
+        // exists so it can be rotated (or pointed at a different endpoint)
+        // without rebuilding the container image.
+        KEYSTONE_HF_TOKEN: secrets['KEYSTONE_HF_TOKEN'],
+        KEYSTONE_HF_ENDPOINT: secrets['KEYSTONE_HF_ENDPOINT'],
       },
       logging: ecs.LogDrivers.awsLogs({
         logGroup: omniLogGroup,

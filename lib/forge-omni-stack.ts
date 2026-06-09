@@ -88,8 +88,25 @@ export class ForgeOmniStack extends cdk.Stack {
       this, 'SecretOmniApiKey', `forge/${env}/omni-api-key`,
     );
 
+    // KEYSTONE (HuggingFace provider) secrets -- shared across environments and
+    // therefore live under `forge/test/*` (not the env-scoped path used above).
+    // The OMNI .NET binary (`docker/omni/src/Services/Keystone/ClaudeApiService.cs`)
+    // requires BOTH a non-empty `_apiKey` (HF token) and a non-empty `_hfBaseUrl`
+    // (HF endpoint URL) for `IsConfigured` to flip true when `KEYSTONE_PROVIDER=huggingface`.
+    // Without these the previously-good HF endpoint receives 0 calls (see
+    // KEYSTONE_ZERO_CALLS_REPORT.md). KEYSTONE must use the HuggingFace path,
+    // not Claude.
+    const keystoneHfTokenSecret = secretsmanager.Secret.fromSecretNameV2(
+      this, 'SecretKeystoneHfToken', 'forge/test/keystone-hf-token',
+    );
+    const keystoneHfEndpointSecret = secretsmanager.Secret.fromSecretNameV2(
+      this, 'SecretKeystoneHfEndpoint', 'forge/test/keystone-hf-endpoint',
+    );
+
     const secrets: Record<string, ecs.Secret> = {
       API_KEY: ecs.Secret.fromSecretsManager(omniApiKeySecret),
+      KEYSTONE_HF_TOKEN: ecs.Secret.fromSecretsManager(keystoneHfTokenSecret),
+      KEYSTONE_HF_ENDPOINT: ecs.Secret.fromSecretsManager(keystoneHfEndpointSecret),
     };
 
     // -- CloudWatch Log Group ------------------------------------------------
@@ -110,7 +127,14 @@ export class ForgeOmniStack extends cdk.Stack {
     });
     executionRole.addToPolicy(new iam.PolicyStatement({
       actions: ['secretsmanager:GetSecretValue', 'kms:Decrypt'],
-      resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:forge/${env}/*`],
+      resources: [
+        `arn:aws:secretsmanager:${this.region}:${this.account}:secret:forge/${env}/*`,
+        // KEYSTONE HF secrets are shared across envs and live in forge/test/*.
+        // Scope is intentionally narrow (only the two specific secret names
+        // with their wildcard suffixes) to avoid widening to all of forge/test/*.
+        `arn:aws:secretsmanager:${this.region}:${this.account}:secret:forge/test/keystone-hf-token-*`,
+        `arn:aws:secretsmanager:${this.region}:${this.account}:secret:forge/test/keystone-hf-endpoint-*`,
+      ],
     }));
     executionRole.addToPolicy(new iam.PolicyStatement({
       actions: ['ssm:GetParameters', 'ssm:GetParameter'],
@@ -162,6 +186,11 @@ export class ForgeOmniStack extends cdk.Stack {
         FluxTK__BaseUrl: 'http://forge-fluxtk.forge-geometry.local:8040',
         ENRICHMENT_BRIDGE_URL:
           'http://forge-app-test.forge.local:3000/api/omni-enriched',
+        // KEYSTONE provider selection -- HuggingFace path (NOT Claude/Anthropic).
+        // Default in `ClaudeApiService.cs` is also 'huggingface'; set explicitly
+        // so the live task definition reflects intent and a future rollback to
+        // 'anthropic' is a one-line CDK edit. Keep in sync with forge-app-stack.ts.
+        KEYSTONE_PROVIDER: 'huggingface',
       },
       secrets,
       logging: ecs.LogDrivers.awsLogs({
