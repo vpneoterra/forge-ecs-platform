@@ -161,8 +161,18 @@ export class ForgeAppStack extends cdk.Stack {
     );
 
     // forge-dks sidecar (DKS runtime co-located with forge-app on :1444)
+    //
+    // Per-env repo naming: dev/prod have unsuffixed ECR repos (`forge-dks`),
+    // dev2 has a `-dev2`-suffixed mirror (`forge-dks-dev2`) that is the only
+    // one actually populated by CI in this account. The previous hard-coded
+    // `forge-dks` literal caused dev2 deploys to reference a non-existent
+    // repo (`forge-dks:latest` not found), triggering the ECS deployment
+    // circuit breaker and rolling the entire ForgeApp-dev2 stack back --
+    // which collaterally reverts the forge-omni service to its pre-update
+    // task definition and undoes the KEYSTONE HF secret wiring (PR #110/#111).
+    const dksRepoName = props.forgeEnv === 'dev2' ? 'forge-dks-dev2' : 'forge-dks';
     const dksEcrRepo = ecr.Repository.fromRepositoryName(
-      this, 'ForgeDksRepo', 'forge-dks',
+      this, 'ForgeDksRepo', dksRepoName,
     );
 
     // -- Feature flags --------------------------------------------------------
