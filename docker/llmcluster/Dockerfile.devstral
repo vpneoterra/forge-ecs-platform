@@ -1,10 +1,14 @@
 # llmcluster-devstral: vLLM OpenAI-compatible server for Devstral-Small-2-24B
 # Internal alias: devstral-kmv
-# Model: mistralai/Devstral-Small-2-24B-Instruct-2512 (AWQ 4-bit)
+# Model: mistralai/Devstral-Small-2-24B-Instruct-2512 (compressed-tensors AWQ 4-bit)
 # GPU: A10G 24GB (g5.2xlarge)
-FROM vllm/vllm-openai:v0.6.4
+#
+# Devstral-Small-2-2512 uses the `mistral3` architecture (Mistral-Small-3.x).
+# vLLM v0.6.4 does NOT recognize model_type=mistral3 -> use vllm-openai:latest,
+# which has the Mistral3 implementation + mistral_common >= 1.8.6.
+FROM vllm/vllm-openai:latest
 
-# EFS is mounted by the ECS agent via task volumes/mountPoints — no in-image NFS utils needed
+# EFS is mounted by the ECS agent via task volumes/mountPoints
 USER root
 
 # Create models directory (will be EFS mount)
@@ -13,30 +17,24 @@ RUN mkdir -p /models
 # vLLM serves on port 8000
 EXPOSE 8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
-  CMD curl -f http://localhost:8000/health || exit 1
+# Health check under the ALB path prefix (server runs with --root-path /devstral)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=5 \
+  CMD curl -f http://localhost:8000/devstral/health || exit 1
 
-# Entrypoint: use HF_TOKEN from env (injected via ECS secrets)
-# Model is loaded from EFS /models or downloaded fresh via HF_TOKEN
-CMD ["sh", "-c", "python -m vllm.entrypoints.openai.api_server \
-  --model /models/devstral-kmv \
-  --dtype auto \
-  --quantization awq \
-  --max-model-len 32768 \
-  --port 8000 \
-  --enable-auto-tool-choice \
-  --tool-call-parser mistral \
-  --served-model-name mistralai/Devstral-Small-2-24B-Instruct-2512 \
-  --host 0.0.0.0 \
-  || (echo 'EFS model not found, downloading from HF...' && \
-    python -m vllm.entrypoints.openai.api_server \
-    --model mistralai/Devstral-Small-2-24B-Instruct-2512 \
-    --dtype auto \
-    --quantization awq \
-    --max-model-len 32768 \
-    --port 8000 \
-    --enable-auto-tool-choice \
-    --tool-call-parser mistral \
-    --served-model-name mistralai/Devstral-Small-2-24B-Instruct-2512 \
-    --host 0.0.0.0)"]
+# Default command serves the compressed-tensors checkpoint from EFS.
+# NOTE: ECS task definition overrides entryPoint=["sh","-c"] + command, so this
+# CMD is a sane local default only. The base image ENTRYPOINT is
+# `python3 -m vllm.entrypoints.openai.api_server`, so when run directly we pass
+# bare args (no re-invocation of python).
+CMD ["--model", "/models/devstral-kmv", \
+     "--quantization", "compressed-tensors", \
+     "--dtype", "half", \
+     "--max-model-len", "32768", \
+     "--gpu-memory-utilization", "0.92", \
+     "--kv-cache-dtype", "fp8", \
+     "--root-path", "/devstral", \
+     "--port", "8000", \
+     "--host", "0.0.0.0", \
+     "--enable-auto-tool-choice", \
+     "--tool-call-parser", "mistral", \
+     "--served-model-name", "mistralai/Devstral-Small-2-24B-Instruct-2512"]
