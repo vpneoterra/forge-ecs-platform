@@ -4,9 +4,8 @@
 # GPU: A10G 24GB (g5.2xlarge)
 FROM vllm/vllm-openai:v0.6.4
 
-# Install EFS mount utilities
+# EFS is mounted by the ECS agent via task volumes/mountPoints — no in-image NFS utils needed
 USER root
-RUN apt-get update && apt-get install -y amazon-efs-utils nfs-common && rm -rf /var/lib/apt/lists/*
 
 # Create models directory (will be EFS mount)
 RUN mkdir -p /models
