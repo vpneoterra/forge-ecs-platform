@@ -1,0 +1,35 @@
+# llmcluster-agentllm: vLLM OpenAI-compatible server for gpt-oss-safeguard-20b
+# Internal alias: agentllm-vfi
+# Model: openai/gpt-oss-safeguard-20b (MXFP4 MoE, ~13GB)
+# GPU: L40S 48GB (g6e.2xlarge), sm_89 Ada -> MXFP4 via Marlin fallback kernel
+#
+# Requires a vLLM build with GptOssForCausalLM + MXFP4 support (>= 0.10.1).
+# We use vllm/vllm-openai:latest which is well past that.
+FROM vllm/vllm-openai:latest
+
+USER root
+
+# Create models directory (EFS mount point)
+RUN mkdir -p /models
+
+# L40S (Ada / sm_89) is NOT Hopper/Blackwell, so the optimized MXFP4 MoE kernels
+# (FlashInfer / Triton matmul_ogs) are unavailable. Force the Marlin fallback,
+# which supports MXFP4 weight-only compute on Ada.
+ENV VLLM_MXFP4_USE_MARLIN=1
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
+  CMD curl -f http://localhost:8000/agentllm/health || exit 1
+
+# Model loaded from EFS /models/agentllm-vfi. NO --quantization flag: vLLM
+# auto-detects MXFP4 from the checkpoint's config. --root-path puts the
+# OpenAI routes under /agentllm so the ALB path-prefix routing works.
+CMD ["sh", "-c", "python3 -m vllm.entrypoints.openai.api_server \
+  --model /models/agentllm-vfi \
+  --served-model-name gpt-oss-safeguard-20b-vfi \
+  --max-model-len 32768 \
+  --gpu-memory-utilization 0.92 \
+  --root-path /agentllm \
+  --host 0.0.0.0 \
+  --port 8000"]
