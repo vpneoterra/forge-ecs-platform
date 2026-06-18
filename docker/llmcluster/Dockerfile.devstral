@@ -1,0 +1,43 @@
+# llmcluster-devstral: vLLM OpenAI-compatible server for Devstral-Small-2-24B
+# Internal alias: devstral-kmv
+# Model: mistralai/Devstral-Small-2-24B-Instruct-2512 (AWQ 4-bit)
+# GPU: A10G 24GB (g5.2xlarge)
+FROM vllm/vllm-openai:v0.6.4
+
+# Install EFS mount utilities
+USER root
+RUN apt-get update && apt-get install -y amazon-efs-utils nfs-common && rm -rf /var/lib/apt/lists/*
+
+# Create models directory (will be EFS mount)
+RUN mkdir -p /models
+
+# vLLM serves on port 8000
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
+  CMD curl -f http://localhost:8000/health || exit 1
+
+# Entrypoint: use HF_TOKEN from env (injected via ECS secrets)
+# Model is loaded from EFS /models or downloaded fresh via HF_TOKEN
+CMD ["sh", "-c", "python -m vllm.entrypoints.openai.api_server \
+  --model /models/devstral-kmv \
+  --dtype auto \
+  --quantization awq \
+  --max-model-len 32768 \
+  --port 8000 \
+  --enable-auto-tool-choice \
+  --tool-call-parser mistral \
+  --served-model-name mistralai/Devstral-Small-2-24B-Instruct-2512 \
+  --host 0.0.0.0 \
+  || (echo 'EFS model not found, downloading from HF...' && \
+    python -m vllm.entrypoints.openai.api_server \
+    --model mistralai/Devstral-Small-2-24B-Instruct-2512 \
+    --dtype auto \
+    --quantization awq \
+    --max-model-len 32768 \
+    --port 8000 \
+    --enable-auto-tool-choice \
+    --tool-call-parser mistral \
+    --served-model-name mistralai/Devstral-Small-2-24B-Instruct-2512 \
+    --host 0.0.0.0)"]
