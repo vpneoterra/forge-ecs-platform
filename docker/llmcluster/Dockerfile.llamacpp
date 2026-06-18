@@ -1,0 +1,38 @@
+# llmcluster-llamacpp: llama.cpp CUDA base image (shared by Gemma + Qwen)
+# Build this first, then tag for each model or use CMD override
+ARG CUDA_VERSION=12.4.1
+ARG UBUNTU_VERSION=22.04
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+    git cmake build-essential curl python3 python3-pip \
+    libcurl4-openssl-dev libssl-dev \
+    amazon-efs-utils nfs-common \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build llama.cpp with CUDA support
+WORKDIR /build
+RUN git clone --depth=1 https://github.com/ggerganov/llama.cpp.git
+WORKDIR /build/llama.cpp
+RUN cmake -B build \
+      -DGGML_CUDA=ON \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DLLAMA_CURL=ON \
+    && cmake --build build --config Release -j$(nproc) --target llama-server
+
+RUN cp build/bin/llama-server /usr/local/bin/llama-server && chmod +x /usr/local/bin/llama-server
+
+# huggingface_hub for the runtime weight-download fallback (used when EFS is empty)
+RUN pip3 install --no-cache-dir "huggingface_hub[cli,hf_transfer]"
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
+
+RUN mkdir -p /models
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
+  CMD curl -f http://localhost:8000/health || exit 1
+
+# Default CMD - override per model in task def or derived image
+CMD ["llama-server", "--help"]

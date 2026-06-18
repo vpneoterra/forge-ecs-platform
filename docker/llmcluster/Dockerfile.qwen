@@ -1,0 +1,27 @@
+# llmcluster-qwen: llama.cpp server for Qwen3-Coder-Next GGUF
+# Internal alias: qwen3-coder-next-gguf-xaw
+# Model: unsloth/Qwen3-Coder-Next-GGUF, file UD-Q4_K_XL (~46GB)
+# GPU: L40S 48GB (g6e.2xlarge)
+FROM 266087050444.dkr.ecr.us-east-1.amazonaws.com/llmcluster-llamacpp:latest
+
+ENV MODEL_ALIAS=qwen-xaw
+ENV MODEL_REPO=unsloth/Qwen3-Coder-Next-GGUF
+ENV MODEL_FILE=Qwen3-Coder-Next-UD-Q4_K_XL.gguf
+
+EXPOSE 8000
+
+CMD ["sh", "-c", "\
+  MODEL_PATH=/models/${MODEL_ALIAS}/${MODEL_FILE}; \
+  if [ ! -f \"$MODEL_PATH\" ]; then \
+    echo 'Model not on EFS, downloading...'; \
+    mkdir -p /models/${MODEL_ALIAS}; \
+    python3 -c \"from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='${MODEL_REPO}', filename='${MODEL_FILE}', local_dir='/models/${MODEL_ALIAS}', token='${HF_TOKEN}')\"; \
+  fi; \
+  exec llama-server \
+    --model $MODEL_PATH \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --ctx-size 32768 \
+    --n-gpu-layers 999 \
+    --alias unsloth/Qwen3-Coder-Next-GGUF \
+    --temp 1.0 --top-p 0.95 --top-k 40 --min-p 0.01"]
