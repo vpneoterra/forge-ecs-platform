@@ -70,6 +70,16 @@ export class ForgeOmniStack extends cdk.Stack {
 
     const env = props.forgeEnv;
 
+    // -- OMNI burst-fleet capacity CAP ("keep 120 policy") ---------------------
+    // Single source of truth for the burst fleet's maximum task count. This is a
+    // CEILING, not a target: the warm-floor controller Lambda drives the actual
+    // task count to EXACTLY the live queued+running work (clamped to this cap),
+    // so the fleet never balloons toward 120 on its own -- it only reaches high
+    // counts if there is genuinely that much concurrent render work. Used for
+    // BOTH the scalable-target maxCapacity AND the controller Lambda's
+    // OMNI_MAX_TASKS env so the two can never drift out of agreement.
+    const OMNI_MAX_TASKS = 120;
+
     // -- Route 53 Hosted Zone (lookup existing) --------------------------------
     const hostedZone = route53.HostedZone.fromLookup(this, 'HostedZone', {
       domainName: props.hostedZoneDomain,
@@ -383,9 +393,16 @@ export class ForgeOmniStack extends cdk.Stack {
 
     // -- Service auto scaling (burst tier, scale-to-zero) ----------------------
     // This fleet is the BURST tier on top of the always-warm `forge-omni` floor.
-    // It scales 0 -> 3 on render backlog so we never pay for idle compute, and
-    // returns to 0 when the queue drains. The warm floor (1 task) is provided by
-    // forge-omni, so OMNI is always reachable even at min 0 here.
+    // It scales 0 -> OMNI_MAX_TASKS (120) on render backlog so we never pay for
+    // idle compute, and returns to 0 when the queue drains. The warm floor (1
+    // task) is provided by forge-omni, so OMNI is reachable even at min 0 here.
+    //
+    // CAP=120 is a CEILING, not a target. The warm-floor controller Lambda is the
+    // PRIMARY scale-out driver and sets the floor to EXACTLY queued+running work
+    // each minute, so the fleet only ever holds as many tasks as there is live
+    // work (clamped at 120) -- it does NOT free-run up to the cap. A naive
+    // CPU/target policy would balloon OMNI to dozens of idle containers; this
+    // design keeps the count pinned to real demand and trims it down fast.
     //
     // TWO cooperating controls (they do NOT fight -- one sets the FLOOR, the
     // other does the elastic step scaling within [floor, max]):
@@ -411,7 +428,7 @@ export class ForgeOmniStack extends cdk.Stack {
     // for the duration of each render (OMNI_TASK_PROTECTION=on) -- the scheduler
     // will not terminate a task that is actively rendering, even when the desired
     // count drops. So idle tasks retire fast while in-flight work is preserved.
-    const scaling = service.autoScaleTaskCount({ minCapacity: 0, maxCapacity: 3 });
+    const scaling = service.autoScaleTaskCount({ minCapacity: 0, maxCapacity: OMNI_MAX_TASKS });
 
     scaling.scaleOnMetric('OmniBacklogPerTaskScaling', {
       metric: new cloudwatch.Metric({
@@ -419,12 +436,29 @@ export class ForgeOmniStack extends cdk.Stack {
         metricName: 'BacklogPerTask',
         statistic: 'Average',
         period: cdk.Duration.minutes(1),
+        // DIMENSIONLESS on purpose. BacklogPerTask is the OMNI-specific scaling
+        // signal published by the unified OMNI control Lambda below (the
+        // continuation of the `omni-backlog-metric` model), NOT by the worker.
+        // The worker's RenderMetricsPublisher emits a DIFFERENT, ServiceName-
+        // dimensioned set (QueueDepth/RunningJobs/...) for observability only and
+        // never publishes BacklogPerTask, so there is no dimension collision.
+        // This policy must read the controller's dimensionless BacklogPerTask
+        // stream -- adding a ServiceName dimension here would point it at a
+        // metric nobody publishes and blind the policy.
       }),
-      // Step scaling: backlog 0 -> scale IN by 1 (retire idle tasks quickly;
-      // protected in-flight renders are NOT killed). backlog >= 1 -> add a task;
-      // deeper backlog -> add more, up to maxCapacity. The explicit negative step
-      // at the bottom is what makes container count come down quickly once work
-      // is delivered/drained, rather than lingering.
+      // ELASTIC TRIM steps -- the FLOOR controller Lambda is the primary
+      // scale-out; this native policy's main job is fast scale-IN plus a small
+      // top-up between 1-minute Lambda ticks:
+      //   backlog 0    -> scale IN by 1 (retire an idle task immediately;
+      //                   protected in-flight renders are NOT killed -- this is
+      //                   what brings the count down quickly once work is
+      //                   delivered/drained, rather than lingering).
+      //   backlog >= 1 -> add 1 (small top-up between Lambda ticks).
+      //   backlog >= 3 -> add 2 (slightly deeper top-up).
+      // These stay SMALL on purpose: the floor already provisions the fleet to
+      // the live work count, so large native steps would double-count demand and
+      // overshoot toward the 120 cap (the exact ballooning we are avoiding).
+      // Scale-out magnitude lives in the floor, not here.
       scalingSteps: [
         { upper: 0, change: -1 },
         { lower: 1, change: +1 },
@@ -442,21 +476,40 @@ export class ForgeOmniStack extends cdk.Stack {
     // request-based policies; backlog is the primary burst signal.
     void omniTargetGroup;
 
-    // -- Warm-floor controller Lambda (scale-out FROM ZERO) --------------------
-    // See the autoscaling comment above for why this exists: at desiredCount=0
-    // no task publishes BacklogPerTask, so the native policy can never leave
-    // zero on its own. This Lambda ticks every minute, reads the queue depth
-    // directly from the shared Postgres render queue (the same omni.render_jobs
-    // table + the same queued/running definition the worker uses), computes a
-    // desired FLOOR, and pushes it via RegisterScalableTarget.
+    // -- Unified OMNI control Lambda (BacklogPerTask + scale-out FROM ZERO) -----
+    // This is the SINGLE OMNI scaling brain: the CDK-managed continuation of the
+    // out-of-band `omni-backlog-metric` Lambda's purpose-built OMNI control model
+    // (NOT a generic autoscaler), with the off-zero floor job folded in so there
+    // is exactly one brain. Every minute it does BOTH jobs from ONE authoritative
+    // read of the shared Postgres render queue (omni.render_jobs -- the same table
+    // + queued/running definition the worker and PR A use):
     //
-    // Floor math (SLOTS=1, so one task serves one render at a time):
-    //   need  = QueueDepth + RunningJobs            // total live work units
-    //   floor = clamp(need - WARM_SLOTS, 0, MAX)    // warm forge-omni absorbs 1
-    // WARM_SLOTS=1 reflects the always-on forge-omni floor that handles the
-    // first unit of work; MAX is the scalable-target maxCapacity (3) so the
-    // floor can never exceed the fleet cap. When need <= WARM_SLOTS the floor is
-    // 0 and the native policy is free to scale the burst fleet back to zero.
+    //   (A) PUBLISH OMNI/Render -> BacklogPerTask (DIMENSIONLESS, the exact stream
+    //       the native step policy above consumes):
+    //         BacklogPerTask = (queued + running) / max(runningTaskCount, 1)
+    //       runningTaskCount is the ECS service runningCount (DescribeServices) --
+    //       the same denominator the legacy omni-backlog-metric Lambda used -- so
+    //       the step policy keeps reacting to backlog-per-task exactly as before.
+    //       The worker does NOT publish BacklogPerTask (it emits a separate,
+    //       ServiceName-dimensioned observability set), so this is the sole
+    //       publisher and there is no collision.
+    //
+    //   (B) SET the scalable-target FLOOR (minCapacity) so the fleet can leave
+    //       zero -- at desiredCount=0 no task runs and the step policy is blind:
+    //         need  = queued + running                  // total live work units
+    //         floor = clamp(need - WARM_SLOTS, 0, MAX)  // warm forge-omni absorbs 1
+    //       WARM_SLOTS=1 reflects the always-on forge-omni floor; MAX is the
+    //       scalable-target maxCapacity (OMNI_MAX_TASKS, 120) so the floor can
+    //       never exceed the cap. When need <= WARM_SLOTS the floor is 0 and the
+    //       native step policy is free to scale the burst fleet back to zero.
+    //
+    // The two controls do NOT fight: this Lambda sets the FLOOR and publishes the
+    // SIGNAL; the native step policy does elastic scale-out/in within [floor, MAX]
+    // on that signal. Because the floor tracks the FULL live work count each tick,
+    // the fleet ramps to demand in one minute and never creeps idly toward the
+    // cap. FAIL-LOUD: any data-source error raises and the Lambda publishes/sets
+    // NOTHING (a broken probe must never emit a misleading 0 that triggers
+    // scale-in during a real backlog).
     const controllerFn = new lambda.Function(this, 'OmniScaleFloorController', {
       functionName: `omni-scale-floor-controller-${env}`,
       runtime: lambda.Runtime.PYTHON_3_12,
@@ -473,14 +526,23 @@ export class ForgeOmniStack extends cdk.Stack {
         OMNI_SERVICE_NAMESPACE: 'ecs',
         OMNI_SCALABLE_RESOURCE_ID: `service/${this.ecsCluster.clusterName}/omni-${env}`,
         OMNI_SCALABLE_DIMENSION: 'ecs:service:DesiredCount',
-        OMNI_MAX_TASKS: '3',
+        // Cap the floor at the same ceiling as the scalable target so the floor
+        // can never exceed the fleet cap ("keep 120 policy"). Sourced from the
+        // single OMNI_MAX_TASKS constant above so the two stay in lock-step.
+        OMNI_MAX_TASKS: String(OMNI_MAX_TASKS),
         OMNI_WARM_SLOTS: '1',
         OMNI_JOBS_DB_SECRET_ARN: jobsDbSecret.secretArn,
         OMNI_RENDER_TABLE: 'omni.render_jobs',
+        // (A) BacklogPerTask publication -- folds the omni-backlog-metric job in.
+        OMNI_METRIC_NAMESPACE: 'OMNI/Render',
+        OMNI_METRIC_NAME: 'BacklogPerTask',
+        OMNI_ECS_CLUSTER: this.ecsCluster.clusterName,
+        OMNI_ECS_SERVICE: `omni-${env}`,
       },
     });
 
-    // IAM: read the queue-DB connection secret, read+set the scalable target.
+    // IAM: read the queue-DB connection secret; read+set the scalable target;
+    // publish the BacklogPerTask metric; read the ECS service runningCount.
     jobsDbSecret.grantRead(controllerFn);
     controllerFn.addToRolePolicy(new iam.PolicyStatement({
       // application-autoscaling has no resource-level scoping for these actions;
@@ -492,11 +554,25 @@ export class ForgeOmniStack extends cdk.Stack {
       ],
       resources: ['*'],
     }));
+    controllerFn.addToRolePolicy(new iam.PolicyStatement({
+      // PutMetricData has no resource-level scoping; constrain to our OMNI/Render
+      // namespace via condition so this role can only write our own namespace.
+      actions: ['cloudwatch:PutMetricData'],
+      resources: ['*'],
+      conditions: { StringEquals: { 'cloudwatch:namespace': 'OMNI/Render' } },
+    }));
+    controllerFn.addToRolePolicy(new iam.PolicyStatement({
+      // Read the burst service's runningCount for the BacklogPerTask denominator.
+      // DescribeServices is not resource-scopable; scope by cluster ARN condition.
+      actions: ['ecs:DescribeServices'],
+      resources: ['*'],
+      conditions: { ArnEquals: { 'ecs:cluster': this.ecsCluster.clusterArn } },
+    }));
 
     // 1-minute EventBridge tick.
     const controllerSchedule = new events.Rule(this, 'OmniScaleFloorSchedule', {
       ruleName: `omni-scale-floor-${env}`,
-      description: 'Tick the OMNI burst warm-floor controller every minute',
+      description: 'Tick the unified OMNI control Lambda (BacklogPerTask + floor) every minute',
       schedule: events.Schedule.rate(cdk.Duration.minutes(1)),
     });
     controllerSchedule.addTarget(new eventsTargets.LambdaFunction(controllerFn, {

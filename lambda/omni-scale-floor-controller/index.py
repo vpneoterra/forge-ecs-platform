@@ -1,15 +1,23 @@
-# ─── omni-scale-floor-controller ──────────────────────────────────────────────
-# OMNI burst-tier WARM-FLOOR controller.
+# ─── omni-scale-floor-controller (UNIFIED OMNI control brain) ─────────────────
+# The SINGLE OMNI scaling brain. CDK-managed continuation of the out-of-band
+# `omni-backlog-metric` Lambda's purpose-built OMNI control model, with the
+# off-zero floor job folded in so there is exactly ONE brain. Runs every minute
+# and does BOTH jobs from ONE authoritative read of omni.render_jobs:
 #
-# WHY: the omni-${env} burst fleet is a scale-to-zero Fargate service. Its native
-# Application Auto Scaling step policy scales on the OMNI/Render -> BacklogPerTask
-# CloudWatch metric, but that metric is only published by RUNNING tasks. At
-# desiredCount=0 no task is running, so BacklogPerTask is absent and the native
-# policy can never scale the fleet OFF zero. This controller closes that
-# cold-start gap by reading the AUTHORITATIVE queue depth directly from the shared
-# Postgres render queue (omni.render_jobs) and RAISING the scalable-target floor
-# (minCapacity) so the fleet can start. When the queue drains it drops the floor
-# back to 0 and the native step policy scales the fleet back in.
+#   (A) PUBLISH OMNI/Render -> BacklogPerTask (DIMENSIONLESS):
+#         BacklogPerTask = (queued + running) / max(runningTaskCount, 1)
+#       runningTaskCount is the omni-${env} ECS service runningCount
+#       (DescribeServices) -- the SAME denominator the legacy omni-backlog-metric
+#       Lambda used. This is the OMNI-specific signal the native step policy
+#       consumes. The render worker does NOT publish BacklogPerTask (it emits a
+#       SEPARATE, ServiceName-dimensioned observability set), so this Lambda is
+#       the SOLE publisher -- no collision; the step policy reads this stream.
+#
+#   (B) SET the scalable-target FLOOR (minCapacity) so the fleet can leave ZERO.
+#       At desiredCount=0 no task runs and the native step policy is blind to new
+#       work, so the policy alone can never lift the fleet off zero. This Lambda
+#       closes that cold-start gap by RAISING minCapacity from the queue depth.
+#       When the queue drains it drops the floor to 0 and the policy scales in.
 #
 # WHY A FLOOR (not desiredCount): AWS docs are explicit that with an active
 # scaling policy on a service, Application Auto Scaling can REVERT a desiredCount
@@ -18,23 +26,30 @@
 # fighting it: ASG always honours minCapacity, and the native policy is free to
 # scale within [floor, max].
 #
-# FLOOR MATH (OMNI_RENDER_SLOTS=1 -> one task serves one render at a time):
+# FLOOR MATH (WARM_SLOTS=1 -> one task serves one render at a time):
 #     need  = queued + running            # total live work units in the queue
 #     floor = clamp(need - WARM_SLOTS, 0, MAX)
 # WARM_SLOTS=1 accounts for the always-on `forge-omni` warm floor that absorbs the
-# first unit of work; MAX is the burst fleet's maxCapacity. When need <= WARM_SLOTS
-# the floor is 0 and the burst fleet is allowed to return to zero.
+# first unit of work; MAX is the burst fleet's maxCapacity (OMNI_MAX_TASKS=120, a
+# CEILING -- the floor tracks live work so the fleet never creeps idly to the
+# cap). When need <= WARM_SLOTS the floor is 0 and the burst fleet returns to 0.
 #
 # QUEUE DEPTH SOURCE: the EXACT same definition the worker uses
-# (PostgresRenderJobStore.GetQueueStats):
+# (PostgresRenderJobStore.GetQueueStats) -- ONE source of truth shared by the
+# worker, this brain, and PR A's claimable queue, replacing the legacy Lambda's
+# separate bom_omni_render_jobs/fresh-window read:
 #     SELECT COUNT(*) FILTER (WHERE status='queued')  AS queued,
 #            COUNT(*) FILTER (WHERE status='running') AS running
 #       FROM omni.render_jobs;
+# Stale orphans cannot inflate the signal: the reclaim sweep fails expired leases
+# OUT of 'running', so only genuinely live work is counted (the same intent as the
+# legacy Lambda's fresh-window orphan exclusion, enforced by queue state instead).
 #
-# FAIL-LOUD: any error (secret fetch, DB connect, query, register) is logged at
-# ERROR and re-raised so the invocation is marked FAILED and is visible in
-# CloudWatch/alarms. We do NOT swallow errors to "pass" -- a controller that
-# silently no-ops would leave the fleet stuck at zero under load.
+# FAIL-LOUD: any error (secret fetch, DB connect, query, ECS describe, metric
+# put, register) is logged at ERROR and re-raised so the invocation is marked
+# FAILED and visible in CloudWatch/alarms. We do NOT swallow errors to "pass" --
+# a broken probe must never emit a misleading 0 that triggers scale-in during a
+# real backlog, nor silently leave the fleet stuck at zero under load.
 # ──────────────────────────────────────────────────────────────────────────────
 from __future__ import annotations
 
@@ -52,10 +67,46 @@ logger.setLevel(logging.INFO)
 
 _secrets = boto3.client("secretsmanager")
 _aas = boto3.client("application-autoscaling")
+_ecs = boto3.client("ecs")
+_cw = boto3.client("cloudwatch")
 
 
 def _clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
+
+
+def _running_task_count() -> int:
+    # ECS service runningCount -- the BacklogPerTask denominator, identical to the
+    # legacy omni-backlog-metric Lambda. Fail loud if the service is missing so a
+    # broken probe never emits a misleading metric.
+    cluster = os.environ["OMNI_ECS_CLUSTER"]
+    service = os.environ["OMNI_ECS_SERVICE"]
+    resp = _ecs.describe_services(cluster=cluster, services=[service])
+    svcs = resp.get("services", [])
+    if not svcs:
+        raise RuntimeError(f"ECS service {cluster}/{service} not found")
+    return int(svcs[0].get("runningCount", 0))
+
+
+def _publish_backlog_per_task(queued: int, running: int, running_tasks: int) -> float:
+    # (A) Publish the OMNI-specific scaling signal the native step policy consumes.
+    # BacklogPerTask = live work units / running tasks. DIMENSIONLESS on purpose:
+    # the step policy reads the dimensionless stream, and the worker publishes a
+    # SEPARATE ServiceName-dimensioned observability set (never BacklogPerTask),
+    # so this is the sole publisher of this metric -- no collision.
+    namespace = os.environ.get("OMNI_METRIC_NAMESPACE", "OMNI/Render")
+    metric_name = os.environ.get("OMNI_METRIC_NAME", "BacklogPerTask")
+    backlog = queued + running
+    per_task = backlog / max(running_tasks, 1)
+    _cw.put_metric_data(
+        Namespace=namespace,
+        MetricData=[{
+            "MetricName": metric_name,
+            "Value": float(per_task),
+            "Unit": "Count",
+        }],
+    )
+    return per_task
 
 
 def _get_conn_string() -> str:
@@ -176,30 +227,41 @@ def _set_floor(floor: int, max_tasks: int) -> None:
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
-    max_tasks = int(os.environ.get("OMNI_MAX_TASKS", "3"))
+    max_tasks = int(os.environ.get("OMNI_MAX_TASKS", "120"))
     warm_slots = int(os.environ.get("OMNI_WARM_SLOTS", "1"))
 
     queued, running = _read_queue_depth()
     need = queued + running
     desired_floor = _clamp(need - warm_slots, 0, max_tasks)
 
+    # (A) Publish BacklogPerTask EVERY tick so the native step policy always has a
+    # fresh signal -- done before the floor decision and unconditionally (even on
+    # a floor no-op), since the step policy reacts to this metric continuously.
+    running_tasks = _running_task_count()
+    per_task = _publish_backlog_per_task(queued, running, running_tasks)
+
     current = _current_floor()
     if current == desired_floor:
         logger.info(
-            "no-op: queued=%d running=%d need=%d warm=%d floor=%d (unchanged)",
-            queued, running, need, warm_slots, desired_floor,
+            "no-op: queued=%d running=%d running_tasks=%d backlog_per_task=%.3f "
+            "need=%d warm=%d floor=%d (unchanged)",
+            queued, running, running_tasks, per_task, need, warm_slots, desired_floor,
         )
         return {
-            "queued": queued, "running": running, "need": need,
+            "queued": queued, "running": running, "running_tasks": running_tasks,
+            "backlog_per_task": per_task, "need": need,
             "floor": desired_floor, "changed": False,
         }
 
     _set_floor(desired_floor, max_tasks)
     logger.info(
-        "set floor: queued=%d running=%d need=%d warm=%d floor %s -> %d (max=%d)",
-        queued, running, need, warm_slots, current, desired_floor, max_tasks,
+        "set floor: queued=%d running=%d running_tasks=%d backlog_per_task=%.3f "
+        "need=%d warm=%d floor %s -> %d (max=%d)",
+        queued, running, running_tasks, per_task, need, warm_slots,
+        current, desired_floor, max_tasks,
     )
     return {
-        "queued": queued, "running": running, "need": need,
+        "queued": queued, "running": running, "running_tasks": running_tasks,
+        "backlog_per_task": per_task, "need": need,
         "floor": desired_floor, "previous_floor": current, "changed": True,
     }
