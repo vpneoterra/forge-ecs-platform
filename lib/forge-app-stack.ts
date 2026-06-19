@@ -7,8 +7,13 @@
  *   - forge.qrucible.ai  → forge-app (Node.js, port 3000)
  *   - omni.qrucible.ai   → forge-omni (PicoGK .NET, port 5000)
  *
- * Internal connectivity: forge-app reaches OMNI via Cloud Map private DNS
- * at omni.forge.local:5000 (no public internet hop).
+ * Internal connectivity: forge-app reaches OMNI at https://omni.qrucible.ai
+ * (host-header routed to the forge-omni target on this same shared ALB). The
+ * Cloud Map name omni.forge.local is NOT used for app->OMNI calls: the live
+ * forge-omni service is registered only with the ALB target group, so the
+ * Cloud Map `omni` record carries zero instances and omni.forge.local does
+ * not resolve. OMNI_API_URL therefore points at the published ALB hostname,
+ * the only OMNI endpoint that is actually reachable.
  *
  * Route 53 integration:
  *   - ACM certificate with SAN covering both domains (auto DNS validation)
@@ -469,7 +474,15 @@ export class ForgeAppStack extends cdk.Stack {
         HETZNER_COMPUTE_URL: 'http://89.167.79.141:8001',
         LUCID_URL: 'https://api-lucid.qrucible.ai',
         FREECAD_MCP_URL: 'http://89.167.79.141:8016',
-        OMNI_API_URL: 'http://omni.forge.local:5000',
+        // forge-app reaches OMNI via the published ALB hostname (host-header
+        // routed to the forge-omni target on this same shared ALB). The prior
+        // value http://omni.forge.local:5000 was an unresolvable Cloud Map name
+        // — the live forge-omni service has no serviceRegistries, so the `omni`
+        // Cloud Map record has zero instances and getaddrinfo ENOTFOUND was
+        // returned on every /api/bomgen/health probe, failing the deploy smoke
+        // test. parseOmniBase() (server/omni-cem-bridge.js) prefers OMNI_API_URL,
+        // so this is the single authoritative OMNI endpoint for the bridge.
+        OMNI_API_URL: 'https://omni.qrucible.ai',
         OMNI_HOST: 'omni.qrucible.ai',
         OMNI_PORT: '5000',
         DKS_ENABLED: 'true',
@@ -1529,8 +1542,9 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
     });
 
     new cdk.CfnOutput(this, 'OmniServiceDiscovery', {
-      value: 'omni.forge.local:5000',
-      description: 'OMNI internal endpoint via Cloud Map',
+      value: 'https://omni.qrucible.ai',
+      description: 'OMNI endpoint used by forge-app (published ALB hostname; '
+        + 'host-header routed to the forge-omni target on the shared ALB)',
     });
 
     new cdk.CfnOutput(this, 'OmniPublicDomain', {
