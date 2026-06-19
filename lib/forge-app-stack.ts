@@ -959,6 +959,16 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
     const omniContainer = omniTaskDef.addContainer('omni-api', {
       image: resolveEcrImage(this, omniEcrRepo, 'forgeOmni'),
       essential: true,
+      // [RC#2 4270137b 2026-06-19] Container-level hard memory limit (GREEN/-dev2
+      // deployed taskdef — this embedded omni-api is the one running as
+      // forge-omni-dev2:151, which the analysis found with memory=null). Without
+      // it, an unbounded SdfShapeRouter placeholder mesh OOM-killed the whole
+      // TASK before any terminal render callback (exit 137,
+      // omni_task_died_before_terminal). The explicit limit scopes the OOM to the
+      // container (clean restart) and gives the SdfRouter vertex-ceiling a real
+      // byte budget. Set just under the task limit (16384) for sidecar headroom;
+      // omni-api is the only essential container.
+      memoryLimitMiB: 15360,
       environment: {
         DISPLAY: ':99',
         DOTNET_ENVIRONMENT: 'Production',

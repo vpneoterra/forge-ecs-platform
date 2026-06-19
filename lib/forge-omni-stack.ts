@@ -174,6 +174,18 @@ export class ForgeOmniStack extends cdk.Stack {
     const container = taskDef.addContainer('omni-api', {
       image: resolveEcrImage(this, ecrRepo, 'omni'),
       essential: true,
+      // [RC#2 4270137b 2026-06-19] Container-level hard memory limit. Root cause
+      // amplifier of the OMNI exit-137 crash-loop: the omni-api container had NO
+      // memory / memoryReservation (only the task-level 16384 MB), so when the
+      // SdfShapeRouter built an unbounded multi-GB placeholder mesh the cgroup
+      // OOM-killer scoped to the whole TASK and it died before delivering any
+      // terminal render callback (omni_task_died_before_terminal). An explicit
+      // container limit (a) scopes the OOM to the container so the platform
+      // restarts cleanly, and (b) gives the SdfRouter vertex-ceiling (the code
+      // half of RC#2) a real byte budget to size against. Set just under the
+      // task limit (16384) to leave headroom for the agent/log sidecar overhead;
+      // omni-api is the only essential container in this task.
+      memoryLimitMiB: 15360,
       environment: {
         DISPLAY: ':99',
         DOTNET_ENVIRONMENT: 'Production',
