@@ -959,6 +959,15 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
     const omniContainer = omniTaskDef.addContainer('omni-api', {
       image: resolveEcrImage(this, omniEcrRepo, 'forgeOmni'),
       essential: true,
+      // STOP/DRAIN: forge-omni is the always-warm OMNI floor. Even though it does
+      // not join the claimable render queue, an in-process render still runs for
+      // MINUTES. The ECS default stopTimeout is 30s, which SIGKILLs the container
+      // mid-render on every rolling deploy -- throwing away minutes of work and
+      // returning a 5xx to the in-flight request. 120s lets the active render
+      // finish before the agent escalates to SIGKILL; pairs with the OmniTarget
+      // deregistrationDelay (130s) below so the ALB stops sending new requests
+      // while the in-flight render drains.
+      stopTimeout: cdk.Duration.seconds(120),
       environment: {
         DISPLAY: ':99',
         DOTNET_ENVIRONMENT: 'Production',
@@ -1057,7 +1066,11 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         unhealthyThresholdCount: 3,
         healthyThresholdCount: 2,
       },
-      deregistrationDelay: cdk.Duration.seconds(30),
+      // STOP/DRAIN: hold the OMNI target in `draining` long enough for an
+      // in-flight render (minutes) to finish before the ALB force-closes
+      // connections. Must be >= the container stopTimeout (120s); 130s leaves a
+      // small margin so the container-level drain completes first.
+      deregistrationDelay: cdk.Duration.seconds(130),
     });
 
     // -- DKS (Design Knowledge System) -- conditional on deployDks -------------
