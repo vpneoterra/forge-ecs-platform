@@ -28,6 +28,7 @@ import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
@@ -278,7 +279,13 @@ export class ForgeOmniStack extends cdk.Stack {
     const service = new ecs.FargateService(this, 'OmniService', {
       cluster: this.ecsCluster,
       taskDefinition: taskDef,
-      desiredCount: 1,
+      // BURST TIER: omni-${env} is the elastic overflow fleet, NOT the warm
+      // baseline. The always-warm OMNI floor is `forge-omni` (forge-app-stack.ts,
+      // desiredCount:1 on Fargate, host-header routed at omni.qrucible.ai), which
+      // stays up 24/7 and is unaffected by the daily green/geometry cluster
+      // parking. This service therefore starts at ZERO and only scales out on
+      // real render backlog, so it costs nothing when idle.
+      desiredCount: 0,
       serviceName: `omni-${env}`,
       enableExecuteCommand: true,
       circuitBreaker: { rollback: true },
@@ -308,23 +315,41 @@ export class ForgeOmniStack extends cdk.Stack {
       deregistrationDelay: cdk.Duration.seconds(30),
     });
 
-    // -- Service auto scaling --------------------------------------------------
-    // omni does high-load 3D asset generation; scale OUT on CPU and ALB
-    // request rate, back IN when idle. desiredCount:1 is the floor.
-    const scaling = service.autoScaleTaskCount({ minCapacity: 1, maxCapacity: 6 });
+    // -- Service auto scaling (burst tier, scale-to-zero) ----------------------
+    // This fleet is the BURST tier on top of the always-warm `forge-omni` floor.
+    // It scales 0 -> 3 strictly on render backlog so we never pay for idle
+    // compute, and returns to 0 when the queue drains. The warm floor (1 task)
+    // is provided by forge-omni, so OMNI is always reachable even at min 0 here.
+    //
+    // Backlog signal: workers publish OMNI/Render -> BacklogPerTask (queued jobs
+    // per running task) from the shared claimable render queue (forgenew PR
+    // #1649). Target 1.0 means "keep roughly one queued job per task"; a long
+    // scale-in cooldown avoids thrashing mid-render, while the deregistration
+    // delay + container stopTimeout let an in-flight render drain on scale-in.
+    const scaling = service.autoScaleTaskCount({ minCapacity: 0, maxCapacity: 3 });
 
-    scaling.scaleOnCpuUtilization('OmniCpuScaling', {
-      targetUtilizationPercent: 65,
-      scaleInCooldown: cdk.Duration.seconds(120),
-      scaleOutCooldown: cdk.Duration.seconds(60),
+    scaling.scaleOnMetric('OmniBacklogPerTaskScaling', {
+      metric: new cloudwatch.Metric({
+        namespace: 'OMNI/Render',
+        metricName: 'BacklogPerTask',
+        statistic: 'Average',
+        period: cdk.Duration.minutes(1),
+      }),
+      // Step scaling from zero: any backlog brings up a task; deeper backlog
+      // adds more, up to maxCapacity. Below 1 queued-job-per-task, hold/scale in.
+      scalingSteps: [
+        { upper: 1, change: 0 },
+        { lower: 1, change: +1 },
+        { lower: 3, change: +2 },
+      ],
+      adjustmentType: cdk.aws_applicationautoscaling.AdjustmentType.CHANGE_IN_CAPACITY,
+      cooldown: cdk.Duration.seconds(60),
+      evaluationPeriods: 1,
     });
 
-    scaling.scaleOnRequestCount('OmniReqScaling', {
-      requestsPerTarget: 20,
-      targetGroup: omniTargetGroup,
-      scaleInCooldown: cdk.Duration.seconds(120),
-      scaleOutCooldown: cdk.Duration.seconds(60),
-    });
+    // Reference the target group so the symbol is retained for future
+    // request-based policies; backlog is the primary burst signal.
+    void omniTargetGroup;
 
     // -- Outputs ---------------------------------------------------------------
     this.albDnsName = new cdk.CfnOutput(this, 'AlbDnsName', {
