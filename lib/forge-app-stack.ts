@@ -394,6 +394,39 @@ export class ForgeAppStack extends cdk.Stack {
       resources: [`arn:aws:s3:::${cemAssetsBucket}/programs/*`],
     }));
 
+    // -- S3: OMNI render artifacts (GLB/STL) under renders/* ------------------
+    // The OMNI render fleet (BomRenderWorker, running as the embedded omni-api
+    // container under THIS task role) persists each rendered GLB/STL to
+    // s3://forge-omni-artifacts-<account>-<region>/renders/<...>. The role
+    // granted object writes only on forge-cem-assets/* and forge-platform-data-
+    // <...>/abc/*; the artifacts bucket was in NO policy statement, so every
+    // per-part PutObject returned AccessDenied -> OMNI produced zero GLBs ->
+    // declared GeometryEmpty -> never returned a source_model_url -> the W6
+    // geometry-lock predicate (with_source_model_url > 0) could never pass and
+    // the whole program failed. Least privilege: only the object actions the
+    // multipart-upload render path performs, scoped to the renders/* prefix (NOT
+    // the whole bucket object space, NOT s3:*, NOT all buckets). Bucket name is
+    // built from this.account/this.region to mirror the AbcDatasetS3ReadWrite
+    // ARN-construction convention above (resolves to
+    // forge-omni-artifacts-266087050444-us-east-1 in dev2).
+    const omniArtifactsBucket = `forge-omni-artifacts-${this.account}-${this.region}`;
+    taskRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'OmniArtifactsRendersWrite',
+      actions: [
+        's3:PutObject',
+        's3:PutObjectAcl',
+        's3:AbortMultipartUpload',
+        's3:ListMultipartUploadParts',
+        's3:GetObject',
+      ],
+      resources: [`arn:aws:s3:::${omniArtifactsBucket}/renders/*`],
+    }));
+    taskRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'OmniArtifactsList',
+      actions: ['s3:ListBucket', 's3:GetBucketLocation'],
+      resources: [`arn:aws:s3:::${omniArtifactsBucket}`],
+    }));
+
     // -- Fargate Task Definition ----------------------------------------------
     // Sized to match the live forge-app-test:1444 task def (cpu 1024 / mem
     // 3072). The prior 512/1024 was undersized for the full forge-app + DKS

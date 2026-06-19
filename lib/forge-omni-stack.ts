@@ -154,6 +154,34 @@ export class ForgeOmniStack extends cdk.Stack {
       resources: ['*'],
     }));
 
+    // -- S3: OMNI render artifacts (GLB/STL) under renders/* ------------------
+    // The OMNI render fleet (BomRenderWorker) persists each rendered GLB/STL to
+    // s3://forge-omni-artifacts-<account>-<region>/renders/<...>. Without this
+    // grant every per-part PutObject returns AccessDenied -> OMNI produces zero
+    // GLBs -> declares GeometryEmpty -> never returns a source_model_url -> the
+    // W6 geometry-lock predicate (with_source_model_url > 0) can never pass.
+    // This self-contained OMNI deployment runs the same render workload under
+    // its own task role, so the grant is mirrored here. Least privilege: only
+    // the multipart-upload object actions the render path performs, scoped to
+    // the renders/* prefix (NOT the whole bucket, NOT s3:*, NOT all buckets).
+    const omniArtifactsBucket = `forge-omni-artifacts-${this.account}-${this.region}`;
+    taskRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'OmniArtifactsRendersWrite',
+      actions: [
+        's3:PutObject',
+        's3:PutObjectAcl',
+        's3:AbortMultipartUpload',
+        's3:ListMultipartUploadParts',
+        's3:GetObject',
+      ],
+      resources: [`arn:aws:s3:::${omniArtifactsBucket}/renders/*`],
+    }));
+    taskRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'OmniArtifactsList',
+      actions: ['s3:ListBucket', 's3:GetBucketLocation'],
+      resources: [`arn:aws:s3:::${omniArtifactsBucket}`],
+    }));
+
     // -- Fargate Task Definition ----------------------------------------------
     const taskDef = new ecs.FargateTaskDefinition(this, 'OmniTaskDef', {
       family: 'omni',
