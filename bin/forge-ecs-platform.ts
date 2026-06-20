@@ -223,7 +223,31 @@ if (deployApp) {
 }
 
 // -- OMNI PicoGK Fountain Pen Generator (Fargate) ----------------------------
+// [RC-1] Single OMNI service / single target group invariant.
+//
+// ROOT CAUSE this closes: ForgeAppStack embeds the canonical OMNI service
+// (forge-omni) behind the shared app ALB, owns the omni.qrucible.ai alias, and
+// is the autoscaled + metric-dimensioned fleet that actually renders. The
+// standalone ForgeOmniStack stands up a SEPARATE service (omni-<env>) on its own
+// ALB/target group/autoscaling and — when claimProdDomain is set — also claims
+// omni.qrucible.ai. Co-deploying both with the prod hostname is the split that
+// pointed omni.qrucible.ai at an empty (0-task) fleet while the workers ran as
+// forge-omni (HTTP 502 at the edge; autoscaling acting on the wrong service).
+// The migrate-omni-to-appstack workflow records the platform intent to retire
+// the standalone stack and consolidate onto forge-omni.
+//
+// Enforce the invariant at synth time, fail loud: the standalone stack may NOT
+// claim the prod OMNI hostname while ForgeAppStack (the canonical owner of that
+// hostname) is also being synthesized. Standalone ForgeOmniStack remains usable
+// on its own (deployApp=false) or pointed at a NON-prod omniDomain.
 if (deployOmni) {
+  if (deployApp && claimProdDomain) {
+    throw new Error(
+      `RC-1 OMNI split guard: ForgeOmniStack (standalone omni-${env}) cannot claim the prod OMNI hostname "${omniDomain}" while ForgeAppStack already owns it (forge-omni behind the shared ALB). ` +
+      `Pick one OMNI owner: deploy ForgeApp only (it serves omni.qrucible.ai), or deploy the standalone stack with -c deployApp=false, or point it at a non-prod -c omniDomain. ` +
+      `Co-claiming the hostname routes traffic to a separate, empty service and is the exact split this fix removes.`,
+    );
+  }
   const omniStack = new ForgeOmniStack(app, `ForgeOmni-${env}`, {
     env: awsEnv,
     description: 'OMNI PicoGK Fountain Pen Generator -- Fargate, ALB, Route 53, ACM',

@@ -1,15 +1,21 @@
-name: Build & Push Standalone OMNI Image (omni-dev2)
+name: Build & Push OMNI Image (forge-omni) + Deploy
 
-# Builds docker/omni/Dockerfile from forgenew@main (or specified ref)
-# and pushes to the isolated ECR repo omni-dev2.
-# NEVER pushes to omni, forge-omni, or forge-omni-dev2.
-# Mirrors build-omni2.yml idiom: buildx, ECR login, describe||create.
-# RC2-A: tags IMMUTABLE only (:YYYYMMDD-HHMMSS + :sha8), NEVER :latest; the
-# deploy pins the pushed @sha256 digest.
+# Builds docker/omni/Dockerfile from forgenew@main (or specified ref) and pushes
+# to the CANONICAL OMNI ECR repo `forge-omni` — the repo ForgeAppStack's
+# forge-omni service actually pulls (lib/forge-app-stack.ts OmniRepo). Then the
+# `deploy` job rolls that service by registering a NEW task-def revision pinned
+# to the pushed @sha256 digest via the existing CDK digest-pin path
+# (-c forgeOmniImageDigest), so ECS auto-rolls to the freshly built image.
 #
-# After a successful push, copy the printed IMAGE_DIGEST and proceed with
-# the ECS rollout in build-omni-standalone.yml's "ECS Rollout" job
-# OR follow the manual ECS rollout steps in omni-execution-prompt.md.
+# [RC-3] ROOT CAUSE this closes: the build previously pushed to the ORPHAN repo
+# `omni-dev2` and only PRINTED the digest — there was no register-task-definition
+# / update-service step, so the live service never ran the newly built code, and
+# the orphan omni-dev2 task def stayed pinned to a digest that ECR lifecycle GC'd
+# (CannotPullContainerError, 0 running tasks). Building the canonical repo and
+# wiring the digest-pinned CDK deploy closes the build→deploy gap. Digest is
+# hard-required for the deploy; if it is empty the deploy FAILS (no :latest).
+#
+# RC2-A: tags IMMUTABLE only (:YYYYMMDD-HHMMSS + :sha8), NEVER :latest.
 
 on:
   workflow_dispatch:
@@ -19,15 +25,19 @@ on:
         required: false
         default: 'main'
       dry_run:
-        description: 'Dry run — build but do not push'
+        description: 'Dry run — build but do not push (deploy is skipped)'
         required: false
         default: 'false'
         type: choice
         options: ['false', 'true']
+      env_name:
+        description: 'Target env for the ECS rollout (cluster forge-app-<env>, service forge-omni)'
+        required: false
+        default: 'dev2'
 
 env:
   AWS_REGION: us-east-1
-  ECR_REPO: omni-dev2          # GREEN standalone repo — never omni or forge-omni
+  ECR_REPO: forge-omni          # CANONICAL repo the forge-omni service pulls (RC-1/RC-3)
 
 jobs:
   build:
@@ -77,21 +87,37 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Ensure omni-dev2 ECR repo exists (IMMUTABLE tags -- RC2-A)
+      - name: Ensure forge-omni ECR repo exists and enforce IMMUTABLE tags (RC2-A / RC-3)
         run: |
-          # RC2-A: tags must be IMMUTABLE so a push can never silently overwrite
-          # the digest a live deployment pinned. If the repo must be created here,
-          # create it IMMUTABLE; never MUTABLE.
-          aws ecr describe-repositories \
-            --repository-names ${{ env.ECR_REPO }} \
-            --region ${{ env.AWS_REGION }} \
-          || aws ecr create-repository \
-               --repository-name ${{ env.ECR_REPO }} \
-               --region ${{ env.AWS_REGION }} \
-               --image-scanning-configuration scanOnPush=true \
-               --image-tag-mutability IMMUTABLE \
-               --tags Key=Project,Value=OmniStandalone Key=ManagedBy,Value=CDK
-          echo "ECR repo ${{ env.ECR_REPO }} confirmed."
+          set -euo pipefail
+          # RC2-A/RC-3: tags MUST be IMMUTABLE so a push can never silently
+          # overwrite the digest a live deployment pinned. If the repo must be
+          # created here, create it IMMUTABLE; if it already exists MUTABLE, flip
+          # it to IMMUTABLE so the canonical forge-omni repo cannot regress to the
+          # mutable-tag failure mode (program 253f20a6).
+          if aws ecr describe-repositories \
+               --repository-names "${ECR_REPO}" \
+               --region "${AWS_REGION}" >/dev/null 2>&1; then
+            MUT=$(aws ecr describe-repositories \
+              --repository-names "${ECR_REPO}" --region "${AWS_REGION}" \
+              --query 'repositories[0].imageTagMutability' --output text)
+            echo "ECR repo ${ECR_REPO} exists with imageTagMutability=${MUT}"
+            if [ "${MUT}" != "IMMUTABLE" ]; then
+              echo "Enforcing IMMUTABLE tag mutability on ${ECR_REPO} (was ${MUT})."
+              aws ecr put-image-tag-mutability \
+                --repository-name "${ECR_REPO}" \
+                --image-tag-mutability IMMUTABLE \
+                --region "${AWS_REGION}" >/dev/null
+            fi
+          else
+            aws ecr create-repository \
+              --repository-name "${ECR_REPO}" \
+              --region "${AWS_REGION}" \
+              --image-scanning-configuration scanOnPush=true \
+              --image-tag-mutability IMMUTABLE \
+              --tags Key=Project,Value=Omni Key=ManagedBy,Value=CDK
+          fi
+          echo "ECR repo ${ECR_REPO} confirmed IMMUTABLE."
 
       - name: Set image metadata
         id: meta
@@ -166,11 +192,11 @@ jobs:
         if: github.event.inputs.dry_run != 'true'
         run: |
           echo "================================================="
-          echo "PUSHED IMAGE DIGEST (use this for ECS rollout):"
+          echo "PUSHED IMAGE DIGEST (used by the deploy job below):"
           echo "${{ steps.push.outputs.digest }}"
           echo "Full URI by digest:"
           echo "${{ steps.meta.outputs.ecr_uri }}@${{ steps.push.outputs.digest }}"
-          echo "Deploy with: cdk deploy ... -c omniImageDigest=${{ steps.push.outputs.digest }}"
+          echo "Deploy pins it via: cdk deploy ForgeApp-<env> -c forgeOmniImageDigest=${{ steps.push.outputs.digest }}"
           echo "================================================="
 
       - name: Build summary
@@ -188,3 +214,82 @@ jobs:
             echo "| Dry run | ${{ github.event.inputs.dry_run }} |"
             echo "| Result | ${{ job.status }} |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # [RC-3] ECS rollout: register a NEW task-def revision pinned to the pushed
+  # @sha256 digest and roll the CANONICAL forge-omni service. Uses the existing
+  # CDK digest-pin path (resolveEcrImage reads -c forgeOmniImageDigest), so CDK
+  # synthesizes a new OmniTaskDef revision and ECS auto-rolls the service to it.
+  deploy:
+    name: Roll forge-omni to the pushed digest
+    needs: build
+    if: github.event.inputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      IMAGE_DIGEST: ${{ needs.build.outputs.image_digest }}
+      ENV_NAME: ${{ github.event.inputs.env_name || 'dev2' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require a resolvable digest (RC-3 — no :latest fallback)
+        run: |
+          set -euo pipefail
+          # Hard-fail if the build produced no digest. A deploy MUST pin an exact
+          # immutable image; there is no :latest fallback (RC2-A/RC2-C/RC-3).
+          if [ -z "${IMAGE_DIGEST}" ]; then
+            echo "::error::build job produced no image_digest — refusing to deploy (RC-3: a rollout must pin an exact @sha256 digest, never :latest)."
+            exit 1
+          fi
+          if ! echo "${IMAGE_DIGEST}" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::image_digest '${IMAGE_DIGEST}' is not a full sha256:<64-hex> digest. Refusing to deploy (no coercion)."
+            exit 1
+          fi
+          echo "Deploying forge-omni pinned to ${IMAGE_DIGEST}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install CDK dependencies
+        run: npm ci
+
+      - name: CDK deploy ForgeApp (pin forge-omni to pushed digest)
+        run: |
+          set -euo pipefail
+          # resolveEcrImage(this, omniEcrRepo, 'forgeOmni') reads forgeOmniImageDigest
+          # and emits a digest-pinned EcrImage, so this synthesizes a new OmniTaskDef
+          # revision and ECS rolls the forge-omni service to the freshly built image.
+          npx cdk deploy "ForgeApp-${ENV_NAME}" \
+            --require-approval never \
+            --outputs-file cdk-outputs.json \
+            -c env="${ENV_NAME}" \
+            -c deployApp=true \
+            -c appDomain=forge.qrucible.ai \
+            -c skipRds=true \
+            -c forgeOmniImageDigest="${IMAGE_DIGEST}"
+
+      - name: Wait for forge-omni rollout to stabilize
+        run: |
+          set -euo pipefail
+          CLUSTER="forge-app-${ENV_NAME}"
+          echo "Waiting for ${CLUSTER}/forge-omni to reach steady state on the new task def..."
+          aws ecs wait services-stable \
+            --cluster "${CLUSTER}" \
+            --services forge-omni \
+            --region "${AWS_REGION}"
+          aws ecs describe-services \
+            --cluster "${CLUSTER}" \
+            --services forge-omni \
+            --query 'services[0].{status:status,desired:desiredCount,running:runningCount,taskDef:taskDefinition}' \
+            --output table
