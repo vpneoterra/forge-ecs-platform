@@ -248,6 +248,23 @@ export class ForgeAppStack extends cdk.Stack {
       //   forge/test/keystone-hf-endpoint     (https://mfto106x86m937qp.us-east-1.aws.endpoints.huggingface.cloud)
       'keystone-hf-token',
       'keystone-hf-endpoint',
+      // OMNI render-queue + durable render-index Postgres connection strings.
+      // Program.cs HARD-REQUIRES JOBS_DB_CONNECTION_STRING in a Production
+      // environment: with DOTNET_ENVIRONMENT=Production and the var unset it
+      // THROWS at startup ("The OMNI render workers require the shared Postgres
+      // queue ... Verify the ECS taskdef secret injection for
+      // JOBS_DB_CONNECTION_STRING."), so the omni-api container would crash-loop
+      // and OmniService would never reach steady state. RENDER_JOBS_DB_CONNECTION_
+      // STRING ([RC-13] durable render index) falls back to JOBS_DB_CONNECTION_
+      // STRING when unset, but the live reconciled taskdef injects both, so we
+      // wire both to keep the render-index on its dedicated connection. The
+      // autoloader below maps each entry to secrets[<NAME>.replace('-','_').
+      // toUpperCase()], i.e.:
+      //   jobs-db-connection-string         -> secrets['JOBS_DB_CONNECTION_STRING']
+      //   render-jobs-db-connection-string  -> secrets['RENDER_JOBS_DB_CONNECTION_STRING']
+      // Underlying secrets live at forge/test/{jobs,render-jobs}-db-connection-string.
+      'jobs-db-connection-string',
+      'render-jobs-db-connection-string',
     ];
     // Autonomous Pipeline v2: Upstash Redis for BullMQ. Only include when
     // the pipeline is enabled, so disabling the flag is a clean CDK-only
@@ -434,6 +451,26 @@ export class ForgeAppStack extends cdk.Stack {
       sid: 'OmniArtifactsList',
       actions: ['s3:ListBucket', 's3:GetBucketLocation'],
       resources: [`arn:aws:s3:::${omniArtifactsBucket}`],
+    }));
+
+    // -- CloudWatch: OMNI/Render backlog metrics ------------------------------
+    // [RC-2] The in-process RenderMetricsPublisher (enabled via OMNI_METRICS=on
+    // on the omni-api container) calls PutMetricData to emit the authoritative
+    // OMNI/Render BacklogPerTask / QueueDepth series that the OmniService
+    // autoscaling policies consume. The task role had NO cloudwatch grant, so
+    // every PutMetricData returned AccessDenied; the publisher swallows the
+    // exception (RenderMetricsPublisher.cs:195 "metric publication failed") and
+    // emits nothing, leaving the scalable target on INSUFFICIENT_DATA forever.
+    // PutMetricData does not support resource-level ARNs (Resource must be '*'),
+    // so least privilege is enforced with a cloudwatch:namespace condition
+    // pinning the grant to OMNI/Render only.
+    taskRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'OmniRenderMetricsPublish',
+      actions: ['cloudwatch:PutMetricData'],
+      resources: ['*'],
+      conditions: {
+        StringEquals: { 'cloudwatch:namespace': 'OMNI/Render' },
+      },
     }));
 
     // -- Fargate Task Definition ----------------------------------------------
@@ -1048,9 +1085,42 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         // not Claude. ANTHROPIC_API_KEY is retained below only as a documented
         // rollback path; with KEYSTONE_PROVIDER=huggingface it is never read.
         KEYSTONE_PROVIDER: 'huggingface',
+        // S3 artifact persistence + mesh staging root. Program.cs selects the
+        // S3ArtifactStore (durable, task-independent download) ONLY when
+        // OMNI_ARTIFACT_BUCKET is set; unset, it falls back to LocalArtifactStore
+        // and every render is trapped on the task that produced it (the stateful
+        // behaviour Option B removed). The bucket the taskRole was just granted
+        // renders/* write on (OmniArtifactsRendersWrite) is the SAME identifier,
+        // so reuse omniArtifactsBucket rather than re-deriving the name.
+        // OMNI_MESH_ARTIFACTS_ROOT is the container-local mesh staging dir the
+        // render path writes intermediate facet output to before upload.
+        OMNI_ARTIFACT_BUCKET: omniArtifactsBucket,
+        OMNI_MESH_ARTIFACTS_ROOT: '/var/facet2/mesh',
+        // [RC-2] Activate the in-process RenderMetricsPublisher. It is GATED OFF
+        // unless OMNI_METRICS=on (RenderMetricsPublisher.cs:92) — unset, the
+        // service is inert and the authoritative OMNI/Render BacklogPerTask /
+        // QueueDepth series the OmniService autoscaling policies above consume is
+        // NEVER published, so the scalable target sits on INSUFFICIENT_DATA and
+        // forge-omni can never scale out on backlog (the dead-signal failure the
+        // decommissioned omni-backlog-metric Lambda also produced). OMNI_SERVICE_
+        // NAME pins the published ServiceName dimension to 'forge-omni' so it
+        // binds to the policies' Dimensions (RenderMetricsPublisher.cs:103-109);
+        // the FargateService.serviceName below is the SAME literal, so reuse it
+        // rather than hardcoding a second copy.
+        OMNI_METRICS: 'on',
+        OMNI_SERVICE_NAME: 'forge-omni',
       },
       secrets: {
         ANTHROPIC_API_KEY: secrets['ANTHROPIC_API_KEY'],
+        // OMNI shared render queue (PostgresJobStore) + durable render index.
+        // REQUIRED in Production: Program.cs throws on startup without
+        // JOBS_DB_CONNECTION_STRING (see baseSecretNames note). RENDER_JOBS_DB_
+        // CONNECTION_STRING backs the [RC-13] render index; both are injected to
+        // mirror the live reconciled taskdef. OmniPoolerGuard.Assert... enforces
+        // these point at the Supabase transaction pooler (port 6543), not the
+        // session pooler, so scaled-out tasks don't exhaust EMAXCONNSESSION.
+        JOBS_DB_CONNECTION_STRING: secrets['JOBS_DB_CONNECTION_STRING'],
+        RENDER_JOBS_DB_CONNECTION_STRING: secrets['RENDER_JOBS_DB_CONNECTION_STRING'],
         // KEYSTONE HuggingFace provider configuration. Both are required for
         // ClaudeApiService.IsConfigured == true (see comment in secretNames
         // above). The hardcoded fallback endpoint URL inside the .NET binary
