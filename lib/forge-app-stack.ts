@@ -1137,9 +1137,13 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       maxCapacity: 6,   // covers the 5-concurrent-job peak observed in Solar Nomad + headroom.
     });
 
-    // backlog_per_task series from the existing omni-backlog-metric Lambda,
-    // dimensioned to THIS service. Target-tracking drives DesiredCount toward
-    // backlog whenever running<backlog, then scales back in as it drains.
+    // [RC-2] Authoritative BacklogPerTask series published by the OMNI render
+    // workers (RenderMetricsPublisher -> OMNI/Render) from omni.render_jobs ground
+    // truth, dimensioned to THIS canonical service (forge-omni). Replaces the dead
+    // FORGE/Platform backlog_per_task series the out-of-band omni-backlog-metric
+    // Lambda computed from the never-written bom_omni_render_jobs mirror. Target-
+    // tracking drives DesiredCount toward the real backlog, then scales in as it
+    // drains. Identity is centralized in config/omni-backlog-metric.ts.
     const omniBacklogPerTask = new cloudwatch.Metric({
       namespace: OMNI_BACKLOG_NAMESPACE,
       metricName: OMNI_BACKLOG_PER_TASK_METRIC_NAME,
@@ -1158,12 +1162,13 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       scaleInCooldown: cdk.Duration.seconds(300),
     });
 
-    // Step-scaling fast path on the raw `backlog` count: any backlog above the
-    // warm baseline must add tasks immediately, independent of the per-task
-    // ratio's averaging window. CHANGE_IN_CAPACITY bands add more tasks the
-    // deeper the backlog so capacity lands inside the FIXED 900 s W6 window.
-    // Exactly one no-change band (backlog 0..2) sits between the scale-in and
-    // scale-out alarms as CDK requires.
+    // [RC-2] Step-scaling fast path on the authoritative QueueDepth count
+    // (OMNI/Render, omni.render_jobs status='queued'): any queued backlog above
+    // the warm baseline must add tasks immediately, independent of the per-task
+    // ratio's averaging window. CHANGE_IN_CAPACITY bands add more tasks the deeper
+    // the backlog so capacity lands inside the FIXED 900 s W6 window. Exactly one
+    // no-change band (depth 0..2) sits between the scale-in and scale-out alarms
+    // as CDK requires.
     const omniBacklog = new cloudwatch.Metric({
       namespace: OMNI_BACKLOG_NAMESPACE,
       metricName: OMNI_BACKLOG_METRIC_NAME,
