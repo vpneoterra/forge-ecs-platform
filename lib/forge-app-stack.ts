@@ -981,12 +981,38 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       capacityProviderStrategies: [
         { capacityProvider: 'FARGATE_SPOT', weight: 1, base: 1 },
       ],
-      // Cloud Map registration for forge-app-test is managed OUT-OF-BAND
-      // (srv-oxqi6vvrhy44u2jr, created 2026-05-28 per
-      // FluxTK_ServiceDiscovery_RCA.md / PR #58). A CDK-managed cloudMapOptions
-      // here collides with that pre-existing service ('already exists') and
-      // deadlocks deploy, so it is intentionally omitted. See drift
-      // reconciliation Option B.
+      // [RC3 ef589069 2026-06-20] Cloud Map service-discovery registration for
+      // forge-app, so OMNI's ENRICHMENT_BRIDGE_URL (built below from the SAME
+      // `appServiceName` + `namespace.namespaceName` constructs) actually
+      // resolves. In program ef589069 the OMNI task's pre-KILN POST to
+      // http://forge-app-dev2.forge.local:3000/api/omni-enriched failed with
+      // "Name or service not known": the forge.local namespace existed and OMNI
+      // was registered in it, but forge-app on the dev2 cluster had NO Cloud Map
+      // record at all — its registration was never managed here, so the name the
+      // URL is derived from did not exist.
+      //
+      // Registering via cloudMapOptions makes CDK create the A-record
+      // `<name>.forge.local` = `${appServiceName}.forge.local`. Because the URL
+      // and this registration are both derived from `appServiceName` +
+      // `namespace` in THIS stack, they cannot drift apart again.
+      //
+      // EXCEPTION: the legacy `dev` env (appServiceName == 'forge-app-test')
+      // already has an OUT-OF-BAND Cloud Map service (srv-oxqi6vvrhy44u2jr,
+      // created 2026-05-28 per FluxTK_ServiceDiscovery_RCA.md / PR #58). A
+      // CDK-managed registration there collides ('already exists') and deadlocks
+      // deploy, so legacy stays out-of-band as before. Non-legacy envs (dev2,
+      // prod) have no such pre-existing service — registering them here is what
+      // closes RC3.
+      ...(legacyEnv
+        ? {}
+        : {
+            cloudMapOptions: {
+              name: appServiceName,
+              cloudMapNamespace: namespace,
+              dnsRecordType: servicediscovery.DnsRecordType.A,
+              dnsTtl: cdk.Duration.seconds(10),
+            },
+          }),
     });
 
     this.serviceName = appServiceName;
@@ -1109,6 +1135,63 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         // rather than hardcoding a second copy.
         OMNI_METRICS: 'on',
         OMNI_SERVICE_NAME: 'forge-omni',
+        // [RC1.3 ef589069 2026-06-20] Compose/assembly memory ceiling.
+        // LapidaryFlags.ComposeMemCeiling() parses this as RAW BYTES (bare
+        // base-10 digits, no suffix/multiplier — see LapidaryFlags.cs
+        // ParsePositiveBytes); unset ⇒ the guard is dormant, which is exactly
+        // why the 12 exit-137 OOM kills in program ef589069 went unguarded. It
+        // bounds the total source GLB/STL bytes admitted into ONE compose before
+        // the python (trimesh) child is spawned — the existing ProgramGlbComposer
+        // guard AND the new shared GlbService.BuildAssemblyGlb guard both read it.
+        //
+        // Derivation (same budget model the in-process VoxelBudget already uses,
+        // VoxelBudget.cs:89-115 — kept consistent so the two paths can't diverge):
+        //   container hard limit ........................ 15360 MiB (memoryLimitMiB above)
+        //   − .NET runtime + GC heaps + native PicoGK/
+        //     OpenVDB resident baseline ................. 3072 MiB
+        //   = working budget for the compose child ...... 12288 MiB
+        //   trimesh holds ≈2× the admitted source bytes in-process (parse +
+        //   scene-graph build), and the guard refuses BEFORE spawn, so the
+        //   ceiling on admitted source bytes must be half the working budget:
+        //   12288 MiB ÷ 2 = 6144 MiB = 6144 × 1024 × 1024 = 6,442,450,944 bytes.
+        // This is the identical 6144 MiB "mesh + export buffer" headroom figure
+        // in VoxelBudget.cs:99 — derived, not a round guess.
+        LAPIDARY_COMPOSE_MEM_CEILING: '6442450944',
+        // [RC2 ef589069 2026-06-20] Per-task render-claim concurrency.
+        // BomRenderWorker.ParseSlots() defaults to 1 when unset (the value the
+        // task actually ran with), so 6 tasks × 1 slot × ~12 min/render could
+        // not drain a 42-part queue — QueueDepth stayed pinned 15-18 for the
+        // whole window. ParseSlots accepts 1-16.
+        //
+        // Derivation — the LARGEST value that stays under BOTH real bounds, where
+        // each bound is taken from the live OMNI code, not assumed:
+        //   (a) PicoGK in-process kernel / CPU bound. The voxel-bake +
+        //       marching-cubes stage is multi-threaded across the task's 8 vCPUs
+        //       (cpu: 8192 above). BomRenderWorker.cs:21-24 requires slots not
+        //       over-subscribe the single in-process kernel; budgeting ~2 vCPUs
+        //       per concurrent render so the shared kernel is not thrashed gives
+        //       8 vCPU ÷ 2 = 4 renders.
+        //   (b) Cumulative voxel-grid memory bound. VoxelMemoryAccountant's
+        //       process-wide ceiling is 10.0e9 B (VoxelMemoryAccountant.cs:34),
+        //       and after the RC1.1 adaptive-voxel fix a part is bounded to the
+        //       per-part voxel budget (≈6e9 B worst case, MaxTotalVoxels). With 4
+        //       concurrent renders each gets 10.0e9 ÷ 4 = 2.5e9 B of grid
+        //       headroom — above a 1024-axis-sample bounded part yet below the
+        //       6e9 per-part cap — so the accountant admits 4 typical renders
+        //       without failing closed. Container RAM also holds: 4 concurrent
+        //       grid+mesh working sets + the 3072 MiB baseline stay under 15360.
+        // min(4 kernel-safe, 4 memory-safe) = 4 — the binding kernel constraint.
+        // Do NOT raise without RC1.1 in place: more slots × unbounded meshes
+        // multiplies the exit-137 risk this fix removes.
+        OMNI_RENDER_SLOTS: '4',
+        // Match the hard in-process execution cap to the claim concurrency.
+        // BomRenderService's _semaphore (BOM_RENDER_CONCURRENCY, default 1 —
+        // BomRenderService.cs:53-58) is the kernel cap that slots queue behind;
+        // left at 1, four claimed renders would execute serially (claimed-then-
+        // leased, not parallel) and RC2 would not actually drain the queue. Set
+        // equal to OMNI_RENDER_SLOTS so the claim concurrency is real execution
+        // concurrency, bounded by the SAME derived 4 above (kernel + memory safe).
+        BOM_RENDER_CONCURRENCY: '4',
       },
       secrets: {
         ANTHROPIC_API_KEY: secrets['ANTHROPIC_API_KEY'],
