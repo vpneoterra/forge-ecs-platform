@@ -170,8 +170,18 @@ export class ForgeAppStack extends cdk.Stack {
       this, 'ForgeAppRepo', 'forge-app-test',
     );
 
+    // Per-env repo naming (same contract as dksRepoName below): dev/prod use the
+    // unsuffixed `forge-omni` repo; dev2 uses the `-dev2`-suffixed mirror
+    // (`forge-omni-dev2`), which is the ONLY repo CI populates for this env. The
+    // live forge-omni-dev2 task defs (:166/:167) and the CI build of the merged
+    // render-code fixes (digest f3d577af, tagged with PR #1669's merge SHA) exist
+    // only in `forge-omni-dev2`. The prior hardcoded `forge-omni` literal made a
+    // dev2 digest-pinned deploy emit `forge-omni@<digest>` for a digest that does
+    // not exist in that repo -> CannotPullContainerError + circuit-breaker
+    // rollback (the same failure mode the dksRepoName comment documents).
+    const omniRepoName = props.forgeEnv === 'dev' ? 'forge-omni' : `forge-omni-${props.forgeEnv}`;
     const omniEcrRepo = ecr.Repository.fromRepositoryName(
-      this, 'OmniRepo', 'forge-omni',
+      this, 'OmniRepo', omniRepoName,
     );
 
     // forge-dks sidecar (DKS runtime co-located with forge-app on :1444)
