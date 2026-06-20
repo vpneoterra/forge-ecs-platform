@@ -3,8 +3,9 @@ name: Build & Push Standalone OMNI Image (omni-dev2)
 # Builds docker/omni/Dockerfile from forgenew@main (or specified ref)
 # and pushes to the isolated ECR repo omni-dev2.
 # NEVER pushes to omni, forge-omni, or forge-omni-dev2.
-# Mirrors build-omni2.yml idiom: buildx, ECR login, describe||create,
-# tags :latest + :YYYYMMDD-HHMMSS + :sha8.
+# Mirrors build-omni2.yml idiom: buildx, ECR login, describe||create.
+# RC2-A: tags IMMUTABLE only (:YYYYMMDD-HHMMSS + :sha8), NEVER :latest; the
+# deploy pins the pushed @sha256 digest.
 #
 # After a successful push, copy the printed IMAGE_DIGEST and proceed with
 # the ECS rollout in build-omni-standalone.yml's "ECS Rollout" job
@@ -76,8 +77,11 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Ensure omni-dev2 ECR repo exists (already created, verify only)
+      - name: Ensure omni-dev2 ECR repo exists (IMMUTABLE tags -- RC2-A)
         run: |
+          # RC2-A: tags must be IMMUTABLE so a push can never silently overwrite
+          # the digest a live deployment pinned. If the repo must be created here,
+          # create it IMMUTABLE; never MUTABLE.
           aws ecr describe-repositories \
             --repository-names ${{ env.ECR_REPO }} \
             --region ${{ env.AWS_REGION }} \
@@ -85,7 +89,7 @@ jobs:
                --repository-name ${{ env.ECR_REPO }} \
                --region ${{ env.AWS_REGION }} \
                --image-scanning-configuration scanOnPush=true \
-               --image-tag-mutability MUTABLE \
+               --image-tag-mutability IMMUTABLE \
                --tags Key=Project,Value=OmniStandalone Key=ManagedBy,Value=CDK
           echo "ECR repo ${{ env.ECR_REPO }} confirmed."
 
@@ -101,7 +105,7 @@ jobs:
           echo "sha8=${SHA8}" >> $GITHUB_OUTPUT
           echo "git_sha=${SHA8}" >> $GITHUB_OUTPUT
 
-      - name: Build and push Standalone OMNI image
+      - name: Build and push Standalone OMNI image (IMMUTABLE tags only -- RC2-A)
         id: push
         uses: docker/build-push-action@v5
         with:
@@ -109,8 +113,12 @@ jobs:
           file:       ./image-source/docker/omni/Dockerfile
           platforms:  linux/amd64
           push:       ${{ github.event.inputs.dry_run != 'true' }}
+          # RC2-A: NO `:latest`. Only immutable, content-addressed tags. The CD
+          # path deploys by the pushed @sha256 digest (printed below); `:latest`
+          # is exactly the mutable reference that bricked the fleet (the pinned
+          # digest was overwritten then GC'd). Pushing `:latest` to an IMMUTABLE
+          # repo would also fail on the second build.
           tags: |
-            ${{ steps.meta.outputs.ecr_uri }}:latest
             ${{ steps.meta.outputs.ecr_uri }}:${{ steps.meta.outputs.build_date }}
             ${{ steps.meta.outputs.ecr_uri }}:${{ steps.meta.outputs.git_sha }}
           cache-from: type=registry,ref=${{ steps.meta.outputs.ecr_uri }}:cache
@@ -118,6 +126,41 @@ jobs:
           build-args: |
             BUILD_DATE=${{ steps.meta.outputs.build_date }}
             GIT_SHA=${{ steps.meta.outputs.git_sha }}
+
+      - name: Verify pushed image is real (not empty/layerless) -- RC2-C
+        if: github.event.inputs.dry_run != 'true'
+        env:
+          ECR_URI: ${{ steps.meta.outputs.ecr_uri }}
+          DIGEST:  ${{ steps.push.outputs.digest }}
+          # Real OMNI images are ~1.7 GB. 47 of 81 historical images were
+          # sub-1 MB empty/manifest-only pushes (RC2-C). Floor well above any
+          # manifest-only artifact but below a real build.
+          MIN_IMAGE_BYTES: '524288000'   # 500 MB
+        run: |
+          set -euo pipefail
+          if [ -z "${DIGEST}" ]; then
+            echo "::error::No image digest was produced by the build/push step. Refusing to proceed (RC2-C: a layerless/empty build must fail before deploy)."
+            exit 1
+          fi
+          echo "Inspecting pushed manifest ${ECR_URI}@${DIGEST} ..."
+          # imageSizeInBytes is the sum of all compressed layer blob sizes for the
+          # image. A layerless/manifest-only push reports a near-zero size.
+          SIZE=$(aws ecr describe-images \
+            --repository-name "${ECR_REPO}" \
+            --image-ids imageDigest="${DIGEST}" \
+            --region "${AWS_REGION}" \
+            --query 'imageDetails[0].imageSizeInBytes' \
+            --output text)
+          echo "Reported imageSizeInBytes=${SIZE} (floor=${MIN_IMAGE_BYTES})"
+          if [ "${SIZE}" = "None" ] || [ -z "${SIZE}" ]; then
+            echo "::error::ECR reports no size for ${DIGEST} -- the pushed artifact has no layers (RC2-C). Failing the build before any deploy."
+            exit 1
+          fi
+          if [ "${SIZE}" -lt "${MIN_IMAGE_BYTES}" ]; then
+            echo "::error::Pushed image is ${SIZE} bytes, below the ${MIN_IMAGE_BYTES}-byte floor for a real OMNI image (RC2-C: empty/manifest-only push). Failing before deploy."
+            exit 1
+          fi
+          echo "Pushed image size verification passed."
 
       - name: Print pushed image digest
         if: github.event.inputs.dry_run != 'true'
@@ -127,6 +170,7 @@ jobs:
           echo "${{ steps.push.outputs.digest }}"
           echo "Full URI by digest:"
           echo "${{ steps.meta.outputs.ecr_uri }}@${{ steps.push.outputs.digest }}"
+          echo "Deploy with: cdk deploy ... -c omniImageDigest=${{ steps.push.outputs.digest }}"
           echo "================================================="
 
       - name: Build summary
@@ -139,7 +183,7 @@ jobs:
             echo "| forgenew ref | ${{ github.event.inputs.forgenew_ref || 'main' }} |"
             echo "| git SHA8 | ${{ steps.meta.outputs.git_sha }} |"
             echo "| ECR repo | ${{ env.ECR_REPO }} |"
-            echo "| Tags | latest, ${{ steps.meta.outputs.build_date }}, ${{ steps.meta.outputs.git_sha }} |"
+            echo "| Tags | ${{ steps.meta.outputs.build_date }}, ${{ steps.meta.outputs.git_sha }} (no :latest -- RC2-A) |"
             echo "| Digest | ${{ steps.push.outputs.digest }} |"
             echo "| Dry run | ${{ github.event.inputs.dry_run }} |"
             echo "| Result | ${{ job.status }} |"

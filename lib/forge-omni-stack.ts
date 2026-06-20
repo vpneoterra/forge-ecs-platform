@@ -31,8 +31,17 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as appscaling from 'aws-cdk-lib/aws-applicationautoscaling';
 import { Construct } from 'constructs';
 import { vpcSecondOctet } from './config/network-config';
+import {
+  OMNI_BACKLOG_NAMESPACE,
+  OMNI_BACKLOG_METRIC_NAME,
+  OMNI_BACKLOG_PER_TASK_METRIC_NAME,
+  OMNI_BACKLOG_PER_TASK_TARGET,
+  OMNI_BACKLOG_SERVICE_DIMENSION,
+} from './config/omni-backlog-metric';
 
 export interface ForgeOmniStackProps extends cdk.StackProps {
   forgeEnv: string;
@@ -78,10 +87,51 @@ export class ForgeOmniStack extends cdk.Stack {
       containerInsights: false,
     });
 
-    // -- ECR Repository (import existing) ------------------------------------
-    const ecrRepo = ecr.Repository.fromRepositoryName(
-      this, 'OmniRepo', 'omni',
-    );
+    // -- ECR Repository (OWNED -- RC2-A/RC2-D/RC2-E) -------------------------
+    // This standalone stack IS the OMNI scale-out fleet (`omni-${env}` service ->
+    // forge-omni-dev2 at env=dev2). RC2 traced the entire program-window outage to
+    // how this fleet's ECR repo was configured out-of-band:
+    //   - imageTagMutability=MUTABLE  -> a `:latest` push silently overwrote the
+    //     digest a live deployment pinned (RC2-A).
+    //   - lifecycle "keep 5 tagged + expire untagged after 3 days" -> the digest a
+    //     RUNNING deployment referenced was GC'd once a newer `:latest` push left
+    //     the old one untagged, yielding CannotPullContainerError (RC2-D/RC2-E).
+    // The structural fix is to make CDK OWN the repo so these guarantees are
+    // codified and version-controlled, not set by hand:
+    //   - imageTagMutability = IMMUTABLE: a tag, once pushed, cannot be overwritten.
+    //   - lifecycle expires ONLY genuinely unreferenced UNTAGGED images, and never
+    //     deletes a tagged build image by count (no maxImageCount sweep that could
+    //     remove a digest an active task-def still pins). Combined with digest-
+    //     pinned deploys (resolveEcrImage requires @sha256/immutable tag) the
+    //     "expired out from under a running deployment" path is closed.
+    //   - removalPolicy RETAIN: never destroy the image store on stack delete.
+    //
+    // DEPLOY NOTE: the repo `forge-omni-${env}` already exists in AWS (created
+    // out-of-band). Adopt it into this stack with `cdk import` (CloudFormation
+    // import) so this OWNED definition takes over its configuration without a
+    // destroy/recreate. After import, every subsequent deploy enforces IMMUTABLE +
+    // the pin-safe lifecycle below.
+    const ecrRepo = new ecr.Repository(this, 'OmniRepo', {
+      repositoryName: `forge-omni-${env}`,
+      encryption: ecr.RepositoryEncryption.AES_256,
+      imageScanOnPush: true,
+      imageTagMutability: ecr.TagMutability.IMMUTABLE,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      lifecycleRules: [
+        {
+          // Expire ONLY untagged images (orphaned manifest layers from replaced
+          // immutable tags). Tagged build images are never age- or count-expired,
+          // so a digest an active task-def revision pins is never GC'd. 14 days is
+          // ample slack for a tag to be superseded and fully unreferenced before
+          // its now-untagged layers are reclaimed; it is NOT a window the in-use
+          // path depends on (digest-pinned deploys + IMMUTABLE close that path).
+          rulePriority: 1,
+          description: 'Expire untagged (orphaned) images after 14 days',
+          tagStatus: ecr.TagStatus.UNTAGGED,
+          maxImageAge: cdk.Duration.days(14),
+        },
+      ],
+    });
 
     // -- Secrets --------------------------------------------------------------
     const omniApiKeySecret = secretsmanager.Secret.fromSecretNameV2(
@@ -364,6 +414,58 @@ export class ForgeOmniStack extends cdk.Stack {
       targetGroup: omniTargetGroup,
       scaleInCooldown: cdk.Duration.seconds(120),
       scaleOutCooldown: cdk.Duration.seconds(60),
+    });
+
+    // -- Backlog-driven autoscaling (RC2-B) -----------------------------------
+    // The render backlog -- NOT CPU or ALB request rate -- is the demand signal
+    // that went unconsumed during program 253f20a6: the omni-backlog-metric Lambda
+    // published backlog=5/running=0 for ~30 min and NOTHING acted on it. CPU/req
+    // scaling above cannot see queued-but-unstarted render jobs (an idle service
+    // with backlog>0 shows ~0% CPU and 0 requests), so on its own it would have
+    // left the fleet at the floor exactly as observed. This binds the EXISTING
+    // backlog series to a real consumer on the same scalable target.
+    const omniBacklogPerTask = new cloudwatch.Metric({
+      namespace: OMNI_BACKLOG_NAMESPACE,
+      metricName: OMNI_BACKLOG_PER_TASK_METRIC_NAME,
+      dimensionsMap: { [OMNI_BACKLOG_SERVICE_DIMENSION]: `omni-${env}` },
+      period: cdk.Duration.minutes(1),
+      statistic: 'Maximum',
+    });
+
+    scaling.scaleToTrackCustomMetric('OmniBacklogTargetTracking', {
+      metric: omniBacklogPerTask,
+      targetValue: OMNI_BACKLOG_PER_TASK_TARGET,
+      // Short scale-OUT cooldown so capacity lands inside the FIXED 900 s W6
+      // window; longer scale-IN to avoid thrash as a render drains.
+      scaleOutCooldown: cdk.Duration.seconds(60),
+      scaleInCooldown: cdk.Duration.seconds(300),
+    });
+
+    // Fast path: any backlog above the warm baseline must add tasks immediately,
+    // independent of the per-task ratio's averaging window. CHANGE_IN_CAPACITY
+    // step bands keyed on the raw `backlog` count add more tasks the deeper the
+    // backlog, so backlog=5/running=1 climbs toward the cap promptly inside W6.
+    // Exactly one no-change band (backlog 0..2, change 0) sits between the
+    // scale-in and scale-out alarms as CDK requires.
+    const omniBacklog = new cloudwatch.Metric({
+      namespace: OMNI_BACKLOG_NAMESPACE,
+      metricName: OMNI_BACKLOG_METRIC_NAME,
+      dimensionsMap: { [OMNI_BACKLOG_SERVICE_DIMENSION]: `omni-${env}` },
+      period: cdk.Duration.minutes(1),
+      statistic: 'Maximum',
+    });
+
+    scaling.scaleOnMetric('OmniBacklogStepScaling', {
+      metric: omniBacklog,
+      adjustmentType: appscaling.AdjustmentType.CHANGE_IN_CAPACITY,
+      cooldown: cdk.Duration.seconds(60),
+      evaluationPeriods: 1,
+      // Only scale-OUT bands are declared; CDK auto-fills the implicit no-change
+      // gap below `lower:3` (backlog 0..2 -> target-tracking owns that band).
+      scalingSteps: [
+        { lower: 3, upper: 5, change: +2 },
+        { lower: 5, change: +4 },  // deep backlog -> jump toward maxCapacity.
+      ],
     });
 
     // -- Outputs ---------------------------------------------------------------
