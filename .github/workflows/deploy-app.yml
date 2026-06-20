@@ -17,6 +17,10 @@ on:
         description: 'Image tag (commit SHA) to deploy — leave blank for latest'
         required: false
         type: string
+      omni_image_digest:
+        description: 'OMNI image digest to deploy (sha256:...). REQUIRED to roll OMNI. Leave blank to deploy app only.'
+        required: false
+        type: string
 
 concurrency:
   group: deploy-app-test
@@ -72,10 +76,13 @@ jobs:
           # and uses its own commit SHAs — not the forgenew SHA. Stamping the
           # forgenew SHA onto OMNI's task definition produces a non-existent
           # ECR reference that breaks OMNI on the next pull (restart, scale,
-          # AZ rebalance). The `Update OMNI ECS service` step below resolves
-          # OMNI's image from ECR's `latest` tag at deploy time instead.
+          # AZ rebalance). The `Update OMNI ECS service` step below now deploys
+          # OMNI by an explicit, verified @sha256 digest (workflow input
+          # `omni_image_digest`) — NEVER the mutable `:latest` tag (RC2-A). The
+          # OMNI build pipeline passes the digest it just pushed and verified.
           # See: incident on 2026-04-26 (OMNI restart blocked by stale image
-          # tag 4829cb96... which was a forgenew commit SHA).
+          # tag 4829cb96... which was a forgenew commit SHA) and program
+          # 253f20a6 (`:latest` digest overwritten then GC'd -> fleet bricked).
 
       # ── App service ─────────────────────────────────────────
       - name: Update app ECS task definition
@@ -189,38 +196,54 @@ jobs:
           echo "App deployment triggered"
 
       # ── OMNI service ────────────────────────────────────────
-      # OMNI is built by a separate pipeline (forge-omni repo) and tags its
-      # images with its own commit SHAs — never the forgenew SHA. This step
-      # resolves OMNI's image from ECR's `latest` tag, verifies the image
-      # actually exists, and only then updates the OMNI task definition.
-      # If `latest` is missing or unresolvable, the step skips with a warning
-      # rather than stamping a broken image reference.
+      # RC2-A/RC2-C: OMNI must be deployed by an IMMUTABLE @sha256 digest, never
+      # by the mutable `:latest` tag. The prior version resolved `forge-omni:latest`
+      # -> digest, which is the exact mechanism that bricked the fleet: the digest
+      # `:latest` pointed to was overwritten by a later (often EMPTY) push and then
+      # GC'd, leaving running tasks with CannotPullContainerError. This step now
+      # requires an explicit pushed digest (workflow input), verifies the pushed
+      # artifact is a real (non-empty) image, and pins the task def to that digest.
+      # If OMNI cannot be rolled with a verified immutable image, the step FAILS
+      # loudly — it does NOT swallow-to-pass with `exit 0`.
       - name: Update OMNI ECS service
+        if: ${{ github.event.inputs.omni_image_digest != '' }}
         env:
           CLUSTER: ${{ env.ECS_CLUSTER }}
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          OMNI_DIGEST_INPUT: ${{ github.event.inputs.omni_image_digest }}
+          MIN_IMAGE_BYTES: '524288000'   # 500 MB floor; real OMNI images are ~1.7 GB
         run: |
-          set -uo pipefail
+          set -euo pipefail
 
-          # 1. Resolve OMNI's `latest` tag to an immutable image digest in ECR.
-          # We deploy by digest (not tag) so the task definition pins to an
-          # exact image, immune to future `latest` reassignments mid-rollout.
-          OMNI_DIGEST=$(aws ecr describe-images \
+          # 1. The digest is supplied explicitly by the OMNI build pipeline (the
+          # digest it just pushed and verified). Validate its shape — no coercion.
+          OMNI_DIGEST="${OMNI_DIGEST_INPUT}"
+          if ! printf '%s' "${OMNI_DIGEST}" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::omni_image_digest='${OMNI_DIGEST}' is not a valid 'sha256:<64-hex>' digest. Pass the exact digest the build pushed (RC2-A)."
+            exit 1
+          fi
+
+          # 1b. Verify the digest exists in ECR and references a REAL image (not an
+          # empty/manifest-only push). This gates the deploy on a non-empty artifact.
+          SIZE=$(aws ecr describe-images \
             --repository-name forge-omni \
-            --image-ids imageTag=latest \
-            --query 'imageDetails[0].imageDigest' \
+            --image-ids imageDigest="${OMNI_DIGEST}" \
+            --query 'imageDetails[0].imageSizeInBytes' \
             --output text 2>/dev/null || echo "")
-
-          if [ -z "$OMNI_DIGEST" ] || [ "$OMNI_DIGEST" = "None" ]; then
-            echo "::warning::OMNI 'latest' tag not found in ECR — skipping OMNI update."
-            echo "Run the forge-omni build pipeline to push a new image, then re-run this workflow."
-            exit 0
+          if [ -z "${SIZE}" ] || [ "${SIZE}" = "None" ]; then
+            echo "::error::Digest ${OMNI_DIGEST} not found in forge-omni ECR repo (or has no layers). Refusing to deploy (RC2-A/RC2-C)."
+            exit 1
+          fi
+          if [ "${SIZE}" -lt "${MIN_IMAGE_BYTES}" ]; then
+            echo "::error::Image ${OMNI_DIGEST} is ${SIZE} bytes, below the ${MIN_IMAGE_BYTES}-byte floor for a real OMNI image (RC2-C empty image). Refusing to deploy."
+            exit 1
           fi
 
           OMNI_URI="${REGISTRY}/forge-omni@${OMNI_DIGEST}"
-          echo "Resolved OMNI image: ${OMNI_URI}"
+          echo "Deploying OMNI by verified digest: ${OMNI_URI} (${SIZE} bytes)"
 
-          # 2. Find the current OMNI task definition.
+          # 2. Find the current OMNI task definition. If the service does not exist
+          # yet, that is a real error when an OMNI roll was explicitly requested.
           CURRENT_TD=$(aws ecs describe-services \
             --cluster "${CLUSTER}" \
             --services "forge-omni" \
@@ -228,8 +251,8 @@ jobs:
             --output text 2>/dev/null) || true
 
           if [ -z "$CURRENT_TD" ] || [ "$CURRENT_TD" = "None" ]; then
-            echo "OMNI service not yet created by CDK — skipping"
-            exit 0
+            echo "::error::forge-omni service not found in cluster ${CLUSTER}; cannot roll OMNI. Deploy the CDK stack first."
+            exit 1
           fi
 
           aws ecs describe-task-definition \
@@ -250,7 +273,7 @@ jobs:
           echo "Current OMNI image: ${CURRENT_IMAGE}"
 
           if [ "$CURRENT_IMAGE" = "$OMNI_URI" ]; then
-            echo "OMNI already on latest digest — skipping update."
+            echo "OMNI task def already pinned to ${OMNI_DIGEST} — no churn needed."
             exit 0
           fi
 
@@ -346,7 +369,7 @@ jobs:
             echo "### Deployment Summary (test)"
             echo "- Service: \`${{ env.ECS_SERVICE }}\`"
             echo "- Image: \`${{ steps.resolve.outputs.image_uri }}\`"
-            echo "- OMNI: \`${{ steps.resolve.outputs.omni_uri }}\`"
+            echo "- OMNI digest: \`${{ github.event.inputs.omni_image_digest || '(not rolled this run)' }}\`"
             echo "- ALB: \`${ALB_DNS}\`"
             echo "- Domain: \`forge.qrucible.ai\`"
           } >> "$GITHUB_STEP_SUMMARY"

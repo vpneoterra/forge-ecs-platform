@@ -24,9 +24,12 @@ import * as cdk from 'aws-cdk-lib';
 import { Match, Template } from 'aws-cdk-lib/assertions';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import { ForgeAppStack } from '../lib/forge-app-stack';
+import { OMNI_IMAGE_PIN_CONTEXT } from './helpers/image-pin';
 
 function synth(forgeEnv: string): Template {
-  const app = new cdk.App();
+  // Pin the OMNI image to an immutable digest (RC2-A/RC2-C). resolveEcrImage
+  // requires this at synth time exactly as CI does at deploy time.
+  const app = new cdk.App({ context: OMNI_IMAGE_PIN_CONTEXT });
   const parent = new cdk.Stack(app, `Parent-${forgeEnv}`, {
     env: { account: '123456789012', region: 'us-east-1' },
   });

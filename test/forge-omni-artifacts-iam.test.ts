@@ -22,13 +22,14 @@ import { Match, Template } from 'aws-cdk-lib/assertions';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import { ForgeAppStack } from '../lib/forge-app-stack';
 import { ForgeOmniStack } from '../lib/forge-omni-stack';
+import { OMNI_IMAGE_PIN_CONTEXT } from './helpers/image-pin';
 
 const ACCOUNT = '123456789012';
 const REGION = 'us-east-1';
 const ARTIFACTS_BUCKET = `forge-omni-artifacts-${ACCOUNT}-${REGION}`;
 
 function synthApp(forgeEnv: string): Template {
-  const app = new cdk.App();
+  const app = new cdk.App({ context: OMNI_IMAGE_PIN_CONTEXT });
   const parent = new cdk.Stack(app, `Parent-${forgeEnv}`, {
     env: { account: ACCOUNT, region: REGION },
   });
@@ -52,7 +53,7 @@ function synthApp(forgeEnv: string): Template {
 }
 
 function synthOmni(forgeEnv: string): Template {
-  const app = new cdk.App();
+  const app = new cdk.App({ context: OMNI_IMAGE_PIN_CONTEXT });
   const parent = new cdk.Stack(app, `OmniParent-${forgeEnv}`, {
     env: { account: ACCOUNT, region: REGION },
   });

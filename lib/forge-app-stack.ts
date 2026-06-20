@@ -45,6 +45,8 @@ import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as appscaling from 'aws-cdk-lib/aws-applicationautoscaling';
 import * as efs from 'aws-cdk-lib/aws-efs';
 import * as datasync from 'aws-cdk-lib/aws-datasync';
 import * as s3 from 'aws-cdk-lib/aws-s3';
@@ -52,6 +54,13 @@ import { Construct } from 'constructs';
 import { importSecretByName, ecsSecretByName } from './secret-lookup';
 import { CAP_PICOGK } from './config/geometry-manifest';
 import { vpcSecondOctet } from './config/network-config';
+import {
+  OMNI_BACKLOG_NAMESPACE,
+  OMNI_BACKLOG_METRIC_NAME,
+  OMNI_BACKLOG_PER_TASK_METRIC_NAME,
+  OMNI_BACKLOG_PER_TASK_TARGET,
+  OMNI_BACKLOG_SERVICE_DIMENSION,
+} from './config/omni-backlog-metric';
 
 export interface ForgeAppStackProps extends cdk.StackProps {
   forgeEnv: string;
@@ -444,8 +453,12 @@ export class ForgeAppStack extends cdk.Stack {
     });
 
     // Immutable image pin via CDK context (-c forgeAppImageDigest / forgeAppImageTag).
+    // forge-app has its own (forgenew) build pipeline not yet wired through the
+    // digest-pinning helper, so it keeps the mutable :latest fallback. This is an
+    // explicit, scoped opt-out — it is NOT used for the OMNI render task defs,
+    // which must always pin an immutable reference (RC2-A/RC2-C).
     const container = taskDef.addContainer('forge-app', {
-      image: resolveEcrImage(this, ecrRepo, 'forgeApp'),
+      image: resolveEcrImage(this, ecrRepo, 'forgeApp', { requireImmutable: false }),
       essential: true,
       environment: {
         NODE_ENV: 'production',
@@ -749,8 +762,9 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
     // already-resolved ecs.Secret objects (dks-database-url, anthropic-api-key)
     // to avoid duplicate AwsCustomResource lookups.
     // Immutable image pin via CDK context (-c forgeDksImageDigest / forgeDksImageTag).
+    // Scoped :latest opt-out (own pipeline, not OMNI) — see forge-app note above.
     taskDef.addContainer('forge-dks', {
-      image: resolveEcrImage(this, dksEcrRepo, 'forgeDks'),
+      image: resolveEcrImage(this, dksEcrRepo, 'forgeDks', { requireImmutable: false }),
       essential: false,
       environment: {
         DKS_RUNLOG_S3_PREFIX: 'monitor-logs/',
@@ -1103,6 +1117,74 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       deregistrationDelay: cdk.Duration.seconds(30),
     });
 
+    // -- OMNI demand-driven autoscaling (RC2-B) -------------------------------
+    // RC2-B: the `omni-backlog-metric` Lambda correctly published backlog=5,
+    // running=0 for ~30 min during program 253f20a6, but NOTHING consumed it --
+    // the only scalers were fixed-cron (offhours/blue/green window), none keyed
+    // on backlog, none invoked in the program window. The render tier had zero
+    // demand elasticity. This wires the EXISTING backlog series to an actual
+    // consumer: a scalable target + a step-scaling policy that adds capacity the
+    // moment backlog>0 and running<backlog, fast enough to land RUNNING capacity
+    // inside the fixed 900 s W6 window.
+    //
+    // forge-omni is the single sustaining render worker (RC2-F): it ran
+    // desiredCount=1 with no scaling, so it could hold at most one render. Giving
+    // it a backlog-aware scalable target with a non-zero warm baseline (MinCapacity)
+    // and a short scale-out cooldown is the infra half of RC2-F that lives in this
+    // repo (the lease-heartbeat half lives in forgenew).
+    const omniScalableTarget = omniService.autoScaleTaskCount({
+      minCapacity: 1,   // warm baseline -- never zero; a queued program always has a worker.
+      maxCapacity: 6,   // covers the 5-concurrent-job peak observed in Solar Nomad + headroom.
+    });
+
+    // backlog_per_task series from the existing omni-backlog-metric Lambda,
+    // dimensioned to THIS service. Target-tracking drives DesiredCount toward
+    // backlog whenever running<backlog, then scales back in as it drains.
+    const omniBacklogPerTask = new cloudwatch.Metric({
+      namespace: OMNI_BACKLOG_NAMESPACE,
+      metricName: OMNI_BACKLOG_PER_TASK_METRIC_NAME,
+      dimensionsMap: { [OMNI_BACKLOG_SERVICE_DIMENSION]: 'forge-omni' },
+      period: cdk.Duration.minutes(1),
+      statistic: 'Maximum',
+    });
+
+    omniScalableTarget.scaleToTrackCustomMetric('OmniBacklogTargetTracking', {
+      metric: omniBacklogPerTask,
+      targetValue: OMNI_BACKLOG_PER_TASK_TARGET,
+      // Short scale-OUT cooldown so capacity arrives well inside the 900 s W6
+      // window (the W6 timeout is FIXED and must not be extended). Longer
+      // scale-IN cooldown to avoid thrashing as a render drains.
+      scaleOutCooldown: cdk.Duration.seconds(60),
+      scaleInCooldown: cdk.Duration.seconds(300),
+    });
+
+    // Step-scaling fast path on the raw `backlog` count: any backlog above the
+    // warm baseline must add tasks immediately, independent of the per-task
+    // ratio's averaging window. CHANGE_IN_CAPACITY bands add more tasks the
+    // deeper the backlog so capacity lands inside the FIXED 900 s W6 window.
+    // Exactly one no-change band (backlog 0..2) sits between the scale-in and
+    // scale-out alarms as CDK requires.
+    const omniBacklog = new cloudwatch.Metric({
+      namespace: OMNI_BACKLOG_NAMESPACE,
+      metricName: OMNI_BACKLOG_METRIC_NAME,
+      dimensionsMap: { [OMNI_BACKLOG_SERVICE_DIMENSION]: 'forge-omni' },
+      period: cdk.Duration.minutes(1),
+      statistic: 'Maximum',
+    });
+
+    omniScalableTarget.scaleOnMetric('OmniBacklogStepScaling', {
+      metric: omniBacklog,
+      adjustmentType: appscaling.AdjustmentType.CHANGE_IN_CAPACITY,
+      cooldown: cdk.Duration.seconds(60),
+      evaluationPeriods: 1,
+      // Only scale-OUT bands are declared; CDK auto-fills the implicit no-change
+      // gap below `lower:3` (backlog 0..2 -> target-tracking owns that band).
+      scalingSteps: [
+        { lower: 3, upper: 5, change: +2 },
+        { lower: 5, change: +4 },  // deep backlog -> jump toward MaxCapacity.
+      ],
+    });
+
     // -- DKS (Design Knowledge System) -- conditional on deployDks -------------
     if (props.deployDks) {
       // ECR repos
@@ -1279,8 +1361,9 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       });
 
       // Immutable image pin via CDK context (-c dksQueryImageDigest / dksQueryImageTag).
+      // Scoped :latest opt-out (own pipeline, not OMNI) — see forge-app note above.
       const dksQueryContainer = dksQueryTaskDef.addContainer('dks-query', {
-        image: resolveEcrImage(this, dksQueryEcrRepo, 'dksQuery'),
+        image: resolveEcrImage(this, dksQueryEcrRepo, 'dksQuery', { requireImmutable: false }),
         essential: true,
         environment: {
           LLM_BACKEND: 'claude',
@@ -1393,8 +1476,9 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       vertexSaSecret.grantRead(executionRole);
 
       // Immutable image pin via CDK context (-c dksIngestImageDigest / dksIngestImageTag).
+      // Scoped :latest opt-out (own pipeline, not OMNI) — see forge-app note above.
       const dksIngestContainer = dksIngestTaskDef.addContainer('dks-ingest', {
-        image: resolveEcrImage(this, dksIngestEcrRepo, 'dksIngest'),
+        image: resolveEcrImage(this, dksIngestEcrRepo, 'dksIngest', { requireImmutable: false }),
         essential: true,
         environment: {
           DKS_EMBEDDING_MODEL: 'all-MiniLM-L6-v2',

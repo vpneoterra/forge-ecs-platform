@@ -4,7 +4,8 @@ name: Build & Push OMNI2 Image
 # - Checks out vpneoterra/forgenew @ feat/omni2 (branch input overridable).
 # - Builds docker/omni2 on linux/amd64 (PicoGK 2.x native build host).
 # - Pushes to the ISOLATED forge-omni2 ECR repo. NEVER touches forge-omni.
-# Mirrors build-images.yml (buildx, ECR login, :latest + :date + :sha8).
+# Mirrors build-images.yml (buildx, ECR login). RC2-A: IMMUTABLE tags only
+# (:date + :sha8), NEVER :latest; deploy pins the pushed @sha256 digest.
 
 on:
   workflow_dispatch:
@@ -61,14 +62,15 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Ensure forge-omni2 ECR repo exists
+      - name: Ensure forge-omni2 ECR repo exists (IMMUTABLE tags -- RC2-A)
         run: |
+          # RC2-A: create IMMUTABLE so a tag cannot be silently overwritten.
           aws ecr describe-repositories --repository-names ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }} >/dev/null 2>&1 \
             || aws ecr create-repository \
                  --repository-name ${{ env.IMAGE_NAME }} \
                  --region ${{ env.AWS_REGION }} \
                  --image-scanning-configuration scanOnPush=true \
-                 --image-tag-mutability MUTABLE \
+                 --image-tag-mutability IMMUTABLE \
                  --tags Key=Project,Value=OMNI2 Key=ManagedBy,Value=CDK Key=Owner,Value=vpneoterra
           echo "forge-omni2 repo ready."
 
@@ -83,15 +85,17 @@ jobs:
           SHA8=$(git -C image-source rev-parse --short=8 HEAD)
           echo "git_sha=$SHA8" >> $GITHUB_OUTPUT
 
-      - name: Build and push OMNI2 (GATE)
+      - name: Build and push OMNI2 (GATE -- IMMUTABLE tags only, RC2-A)
+        id: push
         uses: docker/build-push-action@v5
         with:
           context: ./image-source/docker/omni2
           file: ./image-source/docker/omni2/Dockerfile
           platforms: linux/amd64
           push: true
+          # RC2-A: no `:latest`. Immutable, content-addressed tags only; deploy
+          # by the pushed @sha256 digest.
           tags: |
-            ${{ steps.meta.outputs.ecr_uri }}:latest
             ${{ steps.meta.outputs.ecr_uri }}:${{ steps.meta.outputs.build_date }}
             ${{ steps.meta.outputs.ecr_uri }}:${{ steps.meta.outputs.git_sha }}
           cache-from: type=registry,ref=${{ steps.meta.outputs.ecr_uri }}:cache
@@ -99,6 +103,33 @@ jobs:
           build-args: |
             BUILD_DATE=${{ steps.meta.outputs.build_date }}
             GIT_SHA=${{ steps.meta.outputs.git_sha }}
+
+      - name: Verify pushed image is real (not empty/layerless) -- RC2-C
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          MIN_IMAGE_BYTES: '524288000'   # 500 MB floor; real OMNI images are ~1.7 GB
+        run: |
+          set -euo pipefail
+          if [ -z "${DIGEST}" ]; then
+            echo "::error::No image digest produced -- refusing to proceed (RC2-C)."
+            exit 1
+          fi
+          SIZE=$(aws ecr describe-images \
+            --repository-name "${IMAGE_NAME}" \
+            --image-ids imageDigest="${DIGEST}" \
+            --region "${AWS_REGION}" \
+            --query 'imageDetails[0].imageSizeInBytes' \
+            --output text)
+          echo "Reported imageSizeInBytes=${SIZE} (floor=${MIN_IMAGE_BYTES})"
+          if [ "${SIZE}" = "None" ] || [ -z "${SIZE}" ]; then
+            echo "::error::ECR reports no size for ${DIGEST} -- layerless/empty push (RC2-C)."
+            exit 1
+          fi
+          if [ "${SIZE}" -lt "${MIN_IMAGE_BYTES}" ]; then
+            echo "::error::Pushed image ${SIZE} bytes < ${MIN_IMAGE_BYTES} floor (RC2-C empty image)."
+            exit 1
+          fi
+          echo "Pushed image size verification passed."
 
       - name: Build summary
         if: always()
@@ -108,7 +139,8 @@ jobs:
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| forgenew ref | ${{ github.event.inputs.forgenew_ref || 'feat/omni2' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| ECR repo | ${{ env.IMAGE_NAME }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Tags | latest, ${{ steps.meta.outputs.build_date }}, ${{ steps.meta.outputs.git_sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tags | ${{ steps.meta.outputs.build_date }}, ${{ steps.meta.outputs.git_sha }} (no :latest -- RC2-A) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Digest | ${{ steps.push.outputs.digest }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Result | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "GATE note: a green build proves PicoGK 2.x + ShapeKernel/LatticeLibrary compile and the native picogk.26.1.so links. Runtime picogkLoaded==true is still verified at container boot (Phase 5), not here." >> $GITHUB_STEP_SUMMARY
