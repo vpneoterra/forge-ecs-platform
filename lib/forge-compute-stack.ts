@@ -28,6 +28,7 @@ import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
 import { SOLVER_MANIFEST, ALWAYS_ON_TASKS, SQS_DRIVEN_TASKS, SolverTask } from './config/solver-manifest';
 import { PROVIDER_A, PROVIDER_B, PROVIDER_C } from './config/capacity-providers';
+import { extraDevopsSubnetIds } from './config/network-config';
 
 export interface ForgeComputeStackProps extends cdk.StackProps {
   forgeEnv: string;
@@ -559,6 +560,27 @@ export class ForgeComputeStack extends cdk.Stack {
     // so creating the A-record service no longer collides on name/physical id.
     const isDevops = task.name === 'forge-devops';
 
+    // forge-devops needs 3072 CPU and must be placeable in BOTH us-east-1a and
+    // us-east-1b. The CDK VPC is single-AZ for dev2 (maxAzs=1), so the default
+    // `subnetType` selector resolves to 1a-only and re-pins this service to 1a
+    // on every deploy -- leaving the task stuck in PROVISIONING (az=null) when
+    // 1a is full. Import the hand-created 1b subnet(s) by ID and add them to the
+    // service's subnet selection so deploys always include 1b. Other always-on
+    // services keep the plain single-AZ selector.
+    let devopsSubnetSelection: ec2.SubnetSelection | undefined;
+    if (isDevops) {
+      const ctxOverride = this.node.tryGetContext('devopsExtraSubnetIds') as string | undefined;
+      const extraSubnetIds = ctxOverride
+        ? ctxOverride.split(',').map((s) => s.trim()).filter(Boolean)
+        : extraDevopsSubnetIds(props.forgeEnv);
+      const extraSubnets = extraSubnetIds.map((id, i) =>
+        ec2.Subnet.fromSubnetId(this, `DevopsExtraSubnet${i}`, id),
+      );
+      devopsSubnetSelection = {
+        subnets: [...props.privateSubnets, ...extraSubnets],
+      };
+    }
+
     const service = new ecs.Ec2Service(this, `Svc${task.name.replace(/-/g, '')}`, {
       cluster: this.ecsCluster,
       taskDefinition: td,
@@ -576,7 +598,7 @@ export class ForgeComputeStack extends cdk.Stack {
         ecs.PlacementStrategy.packedByCpu(),
         ecs.PlacementStrategy.packedByMemory(),
       ],
-      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      vpcSubnets: devopsSubnetSelection ?? { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [props.ecsSecurityGroup],
       // SRV services use the implicit cloudMapOptions path. forge-devops is
       // associated below to its explicit A-record service instead.
