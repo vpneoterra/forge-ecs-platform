@@ -61,6 +61,10 @@ import {
   OMNI_BACKLOG_PER_TASK_TARGET,
   OMNI_BACKLOG_SERVICE_DIMENSION,
 } from './config/omni-backlog-metric';
+import {
+  OMNI_FACET2_SHARED_ENV,
+  applyOmniMeshContract,
+} from './config/omni-mesh-contract';
 
 export interface ForgeAppStackProps extends cdk.StackProps {
   forgeEnv: string;
@@ -1122,17 +1126,19 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       // omni-api is the only essential container.
       memoryLimitMiB: 15360,
       environment: {
+        // ── Shared OMNI FACET2 mesh contract (single source of truth) ────────
+        // FACET2_OMNI_GUARD, OMNI_MESH_ARTIFACTS_ROOT, and FluxTK__BaseUrl are
+        // spread from lib/config/omni-mesh-contract.ts so the green (this) and
+        // scalable-pool (lib/forge-omni-stack.ts) OMNI task defs CANNOT diverge
+        // on the FACET2 behavioural+mesh wiring (the divergence that caused
+        // run atlas-41ce3232-pressure-hull's 5/5 SHELL failures). Spread FIRST so
+        // no later key silently shadows a shared-contract key; a parity test
+        // (test/forge-omni-facet2-parity.test.ts) fails the build on drift.
+        ...OMNI_FACET2_SHARED_ENV,
         DISPLAY: ':99',
         DOTNET_ENVIRONMENT: 'Production',
         PORT: '5000',
         KNOWLEDGE_SERVICE_URL: 'http://dks-query.forge.local:8020',
-        // FluxTK conservation solver discovery. Cloud Map FQDN required because
-        // forge-fluxtk lives in `forge-geometry.local` namespace while OMNI lives
-        // in `forge.local` -- bare label `forge-fluxtk` would NXDOMAIN against the
-        // VPC DHCP search-domain `ec2.internal`. ASP.NET maps `FluxTK__BaseUrl`
-        // (double-underscore) -> configuration key `FluxTK:BaseUrl`.
-        // RCA: FluxTK_ServiceDiscovery_RCA.md (2026-05-28).
-        FluxTK__BaseUrl: 'http://forge-fluxtk.forge-geometry.local:8040',
         // FORGE Node enrichment bridge (server/omni-enrichment-bridge.js) mounted
         // at /api/omni-enriched in server.js. Was defaulting to localhost:3000
         // which (a) doesn't exist in the OMNI task and (b) had a wrong path prefix.
@@ -1161,15 +1167,14 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         // renders/* write on (OmniArtifactsRendersWrite) is the SAME identifier,
         // so reuse omniArtifactsBucket rather than re-deriving the name.
         // OMNI_MESH_ARTIFACTS_ROOT is the mount point of the SHARED mesh-blob-store
-        // EFS (fs-0e25dddff6e362811), the same store the FACET2 service writes its
-        // OCCT/build123d authored meshes to. It is NOT a container-local dir:
-        // MeshArtifactIngestor.Resolve() resolves each part's mesh_ref (delivered
-        // by maestro, RELATIVE to this root) against this path to read the authored
-        // mesh. Without the EFS volume mounted here (added below) this resolves to an
-        // empty local dir and every FACET2-authored part falls to "mesh not found"
-        // → voxel fallback. The mount at /var/facet2/mesh wires it to the real store.
+        // EFS, the same store the FACET2 service writes its OCCT/build123d authored
+        // meshes to. It is NOT a container-local dir: MeshArtifactIngestor.Resolve()
+        // resolves each part's mesh_ref (delivered by maestro, RELATIVE to this root)
+        // against this path to read the authored mesh. Without the EFS volume mounted
+        // here (applyOmniMeshContract below) this resolves to an empty local dir and
+        // every FACET2-authored part falls to "mesh not found" → voxel fallback. The
+        // value is set via the shared OMNI_FACET2_SHARED_ENV spread above.
         OMNI_ARTIFACT_BUCKET: omniArtifactsBucket,
-        OMNI_MESH_ARTIFACTS_ROOT: '/var/facet2/mesh',
         // [RC-2] Activate the in-process RenderMetricsPublisher. It is GATED OFF
         // unless OMNI_METRICS=on (RenderMetricsPublisher.cs:92) — unset, the
         // service is inert and the authoritative OMNI/Render BacklogPerTask /
@@ -1280,66 +1285,22 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
     // Mount the pre-existing standalone mesh-blob-store EFS that the FACET2
     // service writes its authored OCCT/build123d meshes to, so OMNI's
     // MeshArtifactIngestor.Resolve() can read them at OMNI_MESH_ARTIFACTS_ROOT
-    // (/var/facet2/mesh, set above). Before this, OMNI's task def carried that
-    // env but no volume, so authored meshes were invisible and FACET2-certified
-    // parts fell to voxel fallback (program 73a44b93).
+    // (/var/facet2/mesh). Before this (program 73a44b93), OMNI's task def carried
+    // that env but no volume, so authored meshes were invisible and FACET2-
+    // certified parts fell to voxel fallback.
     //
-    // The fileSystemId + accessPointId are passed as LITERALS (not an
-    // efs.FileSystem construct) on purpose: this EFS is owned out-of-band (it is
-    // declared on the FACET2 task def, not by any CDK stack here). Constructing a
-    // new efs.FileSystem would attempt to create/manage a duplicate and orphan
-    // FACET2's data. The access point (fsap-0676f4a4aeb6825a9), transitEncryption,
-    // and iam settings mirror the values the FACET2 task def already mounts with.
+    // The volume (literal fs/access-point ids, NOT an efs.FileSystem construct so
+    // no duplicate FS is created), the read-only mount, and the read-only
+    // elasticfilesystem:ClientMount task-role grant are ALL produced by
+    // applyOmniMeshContract — the SAME helper the scalable-pool task def
+    // (lib/forge-omni-stack.ts) calls — so green and pool cannot diverge.
     //
-    // No SG mutation is needed: the EFS mount-target SG
-    // (ForgeNetwork-dev2-EfsSg) already allows NFS:2049 ingress from the shared
-    // ECS task SG (sg-0c84f80...) that this OmniService runs with — the same SG
-    // FACET2 uses to write. Mounted read-only: OMNI only reads authored meshes;
-    // FACET2 is the sole writer (RW on its own task def). maestro (forge-app) is
-    // intentionally NOT mounted — its authoring pass is HTTP-only and never
-    // touches the store.
-    omniTaskDef.addVolume({
-      name: 'mesh-blob-store',
-      efsVolumeConfiguration: {
-        // rootDirectory omitted (defaults to '/'): when an access point is set,
-        // ECS requires rootDirectory be unset or '/' — the access point itself
-        // scopes the path. Mirrors the DKS volume pattern in this stack.
-        fileSystemId: 'fs-0e25dddff6e362811',
-        transitEncryption: 'ENABLED',
-        authorizationConfig: {
-          accessPointId: 'fsap-0676f4a4aeb6825a9',
-          iam: 'ENABLED',
-        },
-      },
-    });
-
-    omniContainer.addMountPoints({
-      sourceVolume: 'mesh-blob-store',
-      containerPath: '/var/facet2/mesh',
-      readOnly: true,
-    });
-
-    // IAM-authorized mount requires the task role to hold elasticfilesystem:
-    // ClientMount on the mesh FS (authorizationConfig.iam==='ENABLED' above). The
-    // shared taskRole already carries an identical statement for the DKS EFS (via
-    // dksEfs.grantReadWrite); this adds the read-only equivalent for the mesh
-    // store, scoped to its access point and gated on AccessedViaMountTarget. No
-    // ClientWrite — OMNI mounts read-only; FACET2 remains the sole writer. The
-    // grant is on the SAME taskRole both OMNI and forge-app use, but only OMNI
-    // mounts the volume, so only OMNI tasks exercise it.
-    taskRole.addToPolicy(new iam.PolicyStatement({
-      effect: iam.Effect.ALLOW,
-      actions: ['elasticfilesystem:ClientMount'],
-      resources: [
-        `arn:aws:elasticfilesystem:${this.region}:${this.account}:file-system/fs-0e25dddff6e362811`,
-      ],
-      conditions: {
-        StringEquals: {
-          'elasticfilesystem:AccessPointArn':
-            `arn:aws:elasticfilesystem:${this.region}:${this.account}:access-point/fsap-0676f4a4aeb6825a9`,
-        },
-      },
-    }));
+    // No SG mutation is needed: the EFS mount-target SG already allows NFS:2049
+    // from the shared ECS task SG this OmniService runs with (the same SG FACET2
+    // writes with). Mounted read-only: OMNI only reads; FACET2 is the sole writer.
+    // maestro (forge-app) is intentionally NOT mounted — its authoring pass is
+    // HTTP-only and never touches the store.
+    applyOmniMeshContract(this, omniTaskDef, omniContainer, taskRole);
 
     const omniService = new ecs.FargateService(this, 'OmniService', {
       cluster: this.ecsCluster,
