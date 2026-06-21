@@ -42,6 +42,10 @@ import {
   OMNI_BACKLOG_PER_TASK_TARGET,
   OMNI_BACKLOG_SERVICE_DIMENSION,
 } from './config/omni-backlog-metric';
+import {
+  OMNI_FACET2_SHARED_ENV,
+  applyOmniMeshContract,
+} from './config/omni-mesh-contract';
 
 export interface ForgeOmniStackProps extends cdk.StackProps {
   forgeEnv: string;
@@ -265,15 +269,27 @@ export class ForgeOmniStack extends cdk.Stack {
       // omni-api is the only essential container in this task.
       memoryLimitMiB: 15360,
       environment: {
+        // ── Shared OMNI FACET2 mesh contract (single source of truth) ────────
+        // FACET2_OMNI_GUARD=true, OMNI_MESH_ARTIFACTS_ROOT=/var/facet2/mesh, and
+        // FluxTK__BaseUrl are spread from lib/config/omni-mesh-contract.ts — the
+        // SAME source the green OMNI task def (lib/forge-app-stack.ts) consumes.
+        //
+        // Before this, the scalable-pool task def (omni:25) had NONE of this
+        // wiring: FACET2_OMNI_GUARD and OMNI_MESH_ARTIFACTS_ROOT were UNSET and
+        // the mesh EFS was unmounted, so on run atlas-41ce3232-pressure-hull the
+        // pool could not read FACET2-authored meshes AND did not enforce the
+        // kernel guard — class=SHELL parts fell into the voxel path and failed
+        // with EmptyMeshException (5/5 SHELL failures). Spread FIRST so no later
+        // key shadows a shared-contract key; a parity test
+        // (test/forge-omni-facet2-parity.test.ts) fails the build on any drift
+        // between this task def and green.
+        ...OMNI_FACET2_SHARED_ENV,
         DISPLAY: ':99',
         DOTNET_ENVIRONMENT: 'Production',
         PORT: '5000',
         OMNI_DOMAIN: props.domainName,
-        // FluxTK + enrichment bridge service discovery. Both targets live in
-        // private Cloud Map zones already attached to this VPC -- no extra
-        // DNS work needed here. Keep these in sync with forge-app-stack.ts.
-        // RCA: FluxTK_ServiceDiscovery_RCA.md (2026-05-28).
-        FluxTK__BaseUrl: 'http://forge-fluxtk.forge-geometry.local:8040',
+        // Enrichment bridge service discovery. Lives in a private Cloud Map zone
+        // already attached to this VPC -- no extra DNS work needed here.
         ENRICHMENT_BRIDGE_URL:
           'http://forge-app-test.forge.local:3000/api/omni-enriched',
         // KEYSTONE provider selection -- HuggingFace path (NOT Claude/Anthropic).
@@ -297,6 +313,20 @@ export class ForgeOmniStack extends cdk.Stack {
     });
 
     container.addPortMappings({ containerPort: 5000 });
+
+    // -- Shared OMNI FACET2 mesh wiring (single source of truth) --------------
+    // Mounts the pre-existing FACET2 mesh-blob-store EFS read-only at
+    // OMNI_MESH_ARTIFACTS_ROOT and grants the matching read-only ClientMount,
+    // using the SAME helper green (lib/forge-app-stack.ts) calls. Before this,
+    // the scalable-pool task def (omni:25) had no mesh mount, so OMNI could not
+    // read FACET2-authored meshes on run atlas-41ce3232-pressure-hull.
+    //
+    // No SG change is needed: this service runs under the shared ECS task SG
+    // (props.ecsSecurityGroup, same as green/FACET2) and the EFS mount-target SG
+    // already permits NFS:2049 self-referentially. If this service is ever moved
+    // to a different SG the mount will fail at runtime — that must be fixed by
+    // adding the 2049 ingress, never by skipping this wiring.
+    applyOmniMeshContract(this, taskDef, container, taskRole);
 
     // -- ALB requires 2 AZs -- ensure we have enough public subnets -----------
     let albSubnets: ec2.ISubnet[] = [...props.publicSubnets];
