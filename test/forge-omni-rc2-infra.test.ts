@@ -171,7 +171,7 @@ function assertLifecycleHasNoImageCountSweep(
  * warm MinCapacity (so capacity is already present inside the 900s W6 window and
  * never floored to 0 while backlog>0).
  */
-function assertWarmScalableTarget(template: Template): void {
+function assertWarmScalableTarget(template: Template, expectedMax: number): void {
   const targets = template.findResources(
     'AWS::ApplicationAutoScaling::ScalableTarget',
   );
@@ -180,9 +180,13 @@ function assertWarmScalableTarget(template: Template): void {
   );
   expect(omniTargets.length).toBeGreaterThan(0);
 
+  // Min is the warm floor (never 0); Max is asserted EXACTLY against each
+  // stack's live contract. The standalone pool runs min=1/max=4 (the standing
+  // capacity rule, reconciled to the live omni:25 target); the green
+  // ForgeAppStack anchor runs max=6 (its observed 5-concurrent peak + headroom).
   for (const t of omniTargets) {
-    expect(Number(t.Properties.MinCapacity)).toBeGreaterThanOrEqual(1);
-    expect(Number(t.Properties.MaxCapacity)).toBeGreaterThanOrEqual(5);
+    expect(Number(t.Properties.MinCapacity)).toBe(1);
+    expect(Number(t.Properties.MaxCapacity)).toBe(expectedMax);
   }
 }
 
@@ -218,8 +222,8 @@ describe('ForgeOmniStack (standalone) — RC2 infra contracts', () => {
     assertLifecycleHasNoImageCountSweep(template, 'forge-omni-dev2');
   });
 
-  test('RC2-B: warm scalable target on ecs:service:DesiredCount (Min>=1, Max>=5)', () => {
-    assertWarmScalableTarget(template);
+  test('RC2-B: warm scalable target on ecs:service:DesiredCount (Min=1, Max=4)', () => {
+    assertWarmScalableTarget(template, 4);
   });
 
   test('RC2-B: a scaling policy consumes the omni-backlog-metric (backlog_per_task)', () => {
@@ -234,8 +238,8 @@ describe('ForgeAppStack embedded forge-omni service — RC2 infra contracts', ()
     assertImageIsDigestPinnedNeverLatest(template);
   });
 
-  test('RC2-B: warm scalable target on ecs:service:DesiredCount (Min>=1, Max>=5)', () => {
-    assertWarmScalableTarget(template);
+  test('RC2-B: warm scalable target on ecs:service:DesiredCount (Min=1, Max=6)', () => {
+    assertWarmScalableTarget(template, 6);
   });
 
   test('RC2-B: a scaling policy consumes the omni-backlog-metric (backlog_per_task)', () => {
