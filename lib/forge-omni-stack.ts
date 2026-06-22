@@ -157,10 +157,22 @@ export class ForgeOmniStack extends cdk.Stack {
       this, 'SecretKeystoneHfEndpoint', 'forge/test/keystone-hf-endpoint',
     );
 
+    // JOBS_DB_CONNECTION_STRING is HARD-REQUIRED: Program.cs throws at startup in
+    // Production without it and omni-api crash-loops (see lib/forge-app-stack.ts,
+    // the green stack). The live pool task def (omni:25) carries it; the pool
+    // source had dropped it. Import by the FULL ARN -- the random `-jzahFB`
+    // suffix matters, so use fromSecretCompleteArn (NOT fromSecretNameV2, which
+    // would resolve a wildcard and fail to match the exact versioned secret).
+    const jobsDbConnSecret = secretsmanager.Secret.fromSecretCompleteArn(
+      this, 'SecretJobsDbConnectionString',
+      'arn:aws:secretsmanager:us-east-1:266087050444:secret:forge/dev2/jobs-db-connection-string-jzahFB',
+    );
+
     const secrets: Record<string, ecs.Secret> = {
       API_KEY: ecs.Secret.fromSecretsManager(omniApiKeySecret),
       KEYSTONE_HF_TOKEN: ecs.Secret.fromSecretsManager(keystoneHfTokenSecret),
       KEYSTONE_HF_ENDPOINT: ecs.Secret.fromSecretsManager(keystoneHfEndpointSecret),
+      JOBS_DB_CONNECTION_STRING: ecs.Secret.fromSecretsManager(jobsDbConnSecret),
     };
 
     // -- CloudWatch Log Group ------------------------------------------------
@@ -297,6 +309,19 @@ export class ForgeOmniStack extends cdk.Stack {
         // so the live task definition reflects intent and a future rollback to
         // 'anthropic' is a one-line CDK edit. Keep in sync with forge-app-stack.ts.
         KEYSTONE_PROVIDER: 'huggingface',
+        // ── Live-contract env (reconciled to running omni:25) ────────────────
+        // These five keys are present on the CFN-managed live pool task def but
+        // had drifted out of this source, so a #134 synth would have REMOVED
+        // them. Re-added with the exact verified live literals. The green stack
+        // (lib/forge-app-stack.ts) derives the artifact bucket/CDN from its own
+        // constructs, which are not reachable from this standalone pool stack;
+        // the literals below ARE the verified live values, so they cannot drift
+        // silently and a future diff catches any change.
+        AWS_REGION: 'us-east-1',
+        OMNI_ARTIFACT_BUCKET: 'forge-omni-artifacts-266087050444-us-east-1',
+        OMNI_ARTIFACT_CDN_URL: 'https://d30ndqyd7vr2af.cloudfront.net',
+        KNOWLEDGE_SERVICE_URL: 'http://dks-query.forge.local:8020',
+        VOXEL_MEM_CEILING_BYTES: '10000000000',
       },
       secrets,
       logging: ecs.LogDrivers.awsLogs({
@@ -431,7 +456,7 @@ export class ForgeOmniStack extends cdk.Stack {
     // -- Service auto scaling --------------------------------------------------
     // omni does high-load 3D asset generation; scale OUT on CPU and ALB
     // request rate, back IN when idle. desiredCount:1 is the floor.
-    const scaling = service.autoScaleTaskCount({ minCapacity: 1, maxCapacity: 6 });
+    const scaling = service.autoScaleTaskCount({ minCapacity: 1, maxCapacity: 4 });
 
     scaling.scaleOnCpuUtilization('OmniCpuScaling', {
       targetUtilizationPercent: 65,
