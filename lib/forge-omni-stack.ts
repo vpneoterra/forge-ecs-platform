@@ -46,6 +46,7 @@ import {
   OMNI_FACET2_SHARED_ENV,
   applyOmniMeshContract,
 } from './config/omni-mesh-contract';
+import { applyOmniRenderMetrics } from './config/omni-metrics-contract';
 
 export interface ForgeOmniStackProps extends cdk.StackProps {
   forgeEnv: string;
@@ -352,6 +353,20 @@ export class ForgeOmniStack extends cdk.Stack {
     // to a different SG the mount will fail at runtime — that must be fixed by
     // adding the 2049 ingress, never by skipping this wiring.
     applyOmniMeshContract(this, taskDef, container, taskRole);
+
+    // -- Shared OMNI/Render metrics-publishing contract (single source of truth) --
+    // [RC-1] Enable the in-process RenderMetricsPublisher (OMNI_METRICS=on) AND
+    // grant the namespace-scoped cloudwatch:PutMetricData this task role needs to
+    // emit the OMNI/Render BacklogPerTask / QueueDepth series the backlog-driven
+    // autoscaling policies below CONSUME. Before this, the pool wired the consumers
+    // (scaleToTrackCustomMetric / scaleOnMetric) but never the producer: OMNI_METRICS
+    // was unset (publisher inert) and the task role had no CloudWatch grant (every
+    // publish AccessDenied, then swallowed), so the scalable target sat on
+    // INSUFFICIENT_DATA and held at minCapacity:1 regardless of real backlog (W6
+    // timed out). Applied via the SAME helper green (lib/forge-app-stack.ts) calls
+    // so green and pool cannot diverge on the producer contract; a parity test
+    // (test/forge-omni-metrics-parity.test.ts) fails the build on drift.
+    applyOmniRenderMetrics(this, container, taskRole);
 
     // -- ALB requires 2 AZs -- ensure we have enough public subnets -----------
     let albSubnets: ec2.ISubnet[] = [...props.publicSubnets];

@@ -65,6 +65,7 @@ import {
   OMNI_FACET2_SHARED_ENV,
   applyOmniMeshContract,
 } from './config/omni-mesh-contract';
+import { applyOmniRenderMetrics } from './config/omni-metrics-contract';
 
 export interface ForgeAppStackProps extends cdk.StackProps {
   forgeEnv: string;
@@ -468,24 +469,12 @@ export class ForgeAppStack extends cdk.Stack {
     }));
 
     // -- CloudWatch: OMNI/Render backlog metrics ------------------------------
-    // [RC-2] The in-process RenderMetricsPublisher (enabled via OMNI_METRICS=on
-    // on the omni-api container) calls PutMetricData to emit the authoritative
-    // OMNI/Render BacklogPerTask / QueueDepth series that the OmniService
-    // autoscaling policies consume. The task role had NO cloudwatch grant, so
-    // every PutMetricData returned AccessDenied; the publisher swallows the
-    // exception (RenderMetricsPublisher.cs:195 "metric publication failed") and
-    // emits nothing, leaving the scalable target on INSUFFICIENT_DATA forever.
-    // PutMetricData does not support resource-level ARNs (Resource must be '*'),
-    // so least privilege is enforced with a cloudwatch:namespace condition
-    // pinning the grant to OMNI/Render only.
-    taskRole.addToPolicy(new iam.PolicyStatement({
-      sid: 'OmniRenderMetricsPublish',
-      actions: ['cloudwatch:PutMetricData'],
-      resources: ['*'],
-      conditions: {
-        StringEquals: { 'cloudwatch:namespace': 'OMNI/Render' },
-      },
-    }));
+    // [RC-1] The OMNI/Render metrics-publishing contract (OMNI_METRICS=on +
+    // namespace-scoped cloudwatch:PutMetricData grant) is now single-sourced in
+    // lib/config/omni-metrics-contract.ts and applied to the omni-api container +
+    // task role below via applyOmniRenderMetrics — the SAME helper the scalable-
+    // pool task def (lib/forge-omni-stack.ts) calls — so green and pool cannot
+    // diverge on the producer of the series their autoscaling policies consume.
 
     // -- Fargate Task Definition ----------------------------------------------
     // Sized to match the live forge-app-test:1444 task def (cpu 1024 / mem
@@ -1175,18 +1164,15 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         // every FACET2-authored part falls to "mesh not found" → voxel fallback. The
         // value is set via the shared OMNI_FACET2_SHARED_ENV spread above.
         OMNI_ARTIFACT_BUCKET: omniArtifactsBucket,
-        // [RC-2] Activate the in-process RenderMetricsPublisher. It is GATED OFF
-        // unless OMNI_METRICS=on (RenderMetricsPublisher.cs:92) — unset, the
-        // service is inert and the authoritative OMNI/Render BacklogPerTask /
-        // QueueDepth series the OmniService autoscaling policies above consume is
-        // NEVER published, so the scalable target sits on INSUFFICIENT_DATA and
-        // forge-omni can never scale out on backlog (the dead-signal failure the
-        // decommissioned omni-backlog-metric Lambda also produced). OMNI_SERVICE_
-        // NAME pins the published ServiceName dimension to 'forge-omni' so it
-        // binds to the policies' Dimensions (RenderMetricsPublisher.cs:103-109);
-        // the FargateService.serviceName below is the SAME literal, so reuse it
-        // rather than hardcoding a second copy.
-        OMNI_METRICS: 'on',
+        // [RC-1] OMNI_METRICS=on (which activates the in-process
+        // RenderMetricsPublisher) is set via applyOmniRenderMetrics below — the
+        // shared producer contract both OMNI task defs apply — so it cannot drift
+        // between green and the scalable pool. OMNI_SERVICE_NAME pins the published
+        // ServiceName dimension to 'forge-omni' so it binds to the policies'
+        // Dimensions (RenderMetricsPublisher.cs:103-109); the FargateService.
+        // serviceName below is the SAME literal, so reuse it rather than hardcoding
+        // a second copy. (Service name is per-stack — green is 'forge-omni', the
+        // pool is 'omni-<env>' — so it is NOT part of the shared contract.)
         OMNI_SERVICE_NAME: 'forge-omni',
         // [RC1.3 ef589069 2026-06-20] Compose/assembly memory ceiling.
         // LapidaryFlags.ComposeMemCeiling() parses this as RAW BYTES (bare
@@ -1301,6 +1287,12 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
     // maestro (forge-app) is intentionally NOT mounted — its authoring pass is
     // HTTP-only and never touches the store.
     applyOmniMeshContract(this, omniTaskDef, omniContainer, taskRole);
+
+    // [RC-1] Enable + grant the OMNI/Render metrics publisher (OMNI_METRICS=on +
+    // namespace-scoped cloudwatch:PutMetricData) via the shared single-sourced
+    // helper, so the producer of the BacklogPerTask / QueueDepth series the
+    // autoscaling policies below consume can never diverge from the scalable pool.
+    applyOmniRenderMetrics(this, omniContainer, taskRole);
 
     const omniService = new ecs.FargateService(this, 'OmniService', {
       cluster: this.ecsCluster,
