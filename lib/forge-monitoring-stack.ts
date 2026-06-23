@@ -29,6 +29,11 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import { Construct } from 'constructs';
+import {
+  OMNI_BACKLOG_NAMESPACE,
+  OMNI_BACKLOG_METRIC_NAME,
+  OMNI_BACKLOG_SERVICE_DIMENSION,
+} from './config/omni-backlog-metric';
 
 export interface ForgeMonitoringStackProps extends cdk.StackProps {
   forgeEnv: string;
@@ -105,6 +110,41 @@ export class ForgeMonitoringStack extends cdk.Stack {
     });
 
     fivexxAlarm.addAlarmAction(new cloudwatchActions.SnsAction(alertTopic));
+
+    // ── B2. OMNI/Render backlog-producer LIVENESS alarm ───────────────────────
+    // [RC-3] The OMNI scalable target keys on the OMNI/Render QueueDepth series
+    // published by the render workers' RenderMetricsPublisher (see
+    // config/omni-backlog-metric.ts). If that producer dies — crash, OMNI_METRICS
+    // unset, or a missing PutMetricData grant — the metric simply goes MISSING and
+    // autoscaling silently freezes at the floor while backlog grows; nothing pages.
+    // A plain threshold alarm can't catch this because QueueDepth is always >= 0 and
+    // never crosses an upper bound when it disappears. So this is a LIVENESS alarm:
+    // LESS_THAN_THRESHOLD 0 means present data (>= 0) NEVER breaches, while
+    // treatMissingData=BREACHING turns a stalled/dead producer into a page. Wired to
+    // the same forge-deploy-alerts topic the 5xx alarm uses.
+    const omniQueueDepthMetric = new cloudwatch.Metric({
+      namespace: OMNI_BACKLOG_NAMESPACE,
+      metricName: OMNI_BACKLOG_METRIC_NAME,
+      dimensionsMap: { [OMNI_BACKLOG_SERVICE_DIMENSION]: 'forge-omni' },
+      statistic: 'Maximum',
+      period: cdk.Duration.minutes(1),
+    });
+
+    const omniBacklogLivenessAlarm = new cloudwatch.Alarm(this, 'OmniBacklogLivenessAlarm', {
+      alarmName: scoped('forge-omni-backlog-producer-dead'),
+      alarmDescription:
+        'OMNI/Render QueueDepth (ServiceName=forge-omni) has stopped reporting — the ' +
+        'render backlog producer (RenderMetricsPublisher) is dead, so autoscaling is ' +
+        'flying blind. Present data never trips this; MISSING data pages.',
+      metric: omniQueueDepthMetric,
+      threshold: 0,
+      comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+      evaluationPeriods: 3,
+      datapointsToAlarm: 3,
+      treatMissingData: cloudwatch.TreatMissingData.BREACHING,
+    });
+
+    omniBacklogLivenessAlarm.addAlarmAction(new cloudwatchActions.SnsAction(alertTopic));
 
     // ── C. EventBridge ECS Task State Change → Lambda → SNS ──────────────────
     // Lambda handler: alerts on unexpected task stops (OOM kills, crashes, etc.)
