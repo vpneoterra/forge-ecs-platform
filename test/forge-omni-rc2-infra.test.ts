@@ -16,10 +16,11 @@
  *          digest an active task-def/running service still references.
  *   RC2-B  The OMNI render service registers an Application Auto Scaling scalable
  *          target on ecs:service:DesiredCount with a non-zero warm MinCapacity,
- *          and a scaling policy that CONSUMES the existing omni-backlog-metric
- *          series (namespace FORGE/Platform, metric backlog_per_task) -- the
- *          metric that already reported backlog=5/running=0 accurately but which
- *          nothing consumed.
+ *          and a scaling policy that CONSUMES the authoritative OMNI/Render
+ *          backlog series (namespace OMNI/Render, metric BacklogPerTask, published
+ *          by the render workers' RenderMetricsPublisher from omni.render_jobs
+ *          ground truth) -- the series that reflects real queue pressure, replacing
+ *          the dead FORGE/Platform backlog_per_task signal nothing could consume.
  *
  * Coverage spans BOTH OMNI render task definitions:
  *   - the standalone ForgeOmniStack service (image dim Service=omni-<env>), and
@@ -191,9 +192,10 @@ function assertWarmScalableTarget(template: Template, expectedMax: number): void
 }
 
 /**
- * RC2-B: a scaling policy must CONSUME the existing omni-backlog-metric series --
- * a target-tracking policy whose customized metric is FORGE/Platform
- * backlog_per_task.
+ * RC2-B: a scaling policy must CONSUME the authoritative OMNI render backlog
+ * series -- a target-tracking policy whose customized metric is OMNI/Render
+ * BacklogPerTask (published by RenderMetricsPublisher), replacing the dead
+ * FORGE/Platform backlog_per_task signal.
  */
 function assertBacklogMetricConsumed(template: Template): void {
   template.hasResourceProperties('AWS::ApplicationAutoScaling::ScalingPolicy', {
@@ -226,7 +228,7 @@ describe('ForgeOmniStack (standalone) — RC2 infra contracts', () => {
     assertWarmScalableTarget(template, 4);
   });
 
-  test('RC2-B: a scaling policy consumes the omni-backlog-metric (backlog_per_task)', () => {
+  test('RC2-B: a scaling policy consumes the OMNI/Render backlog series (BacklogPerTask)', () => {
     assertBacklogMetricConsumed(template);
   });
 });
@@ -242,7 +244,7 @@ describe('ForgeAppStack embedded forge-omni service — RC2 infra contracts', ()
     assertWarmScalableTarget(template, 6);
   });
 
-  test('RC2-B: a scaling policy consumes the omni-backlog-metric (backlog_per_task)', () => {
+  test('RC2-B: a scaling policy consumes the OMNI/Render backlog series (BacklogPerTask)', () => {
     assertBacklogMetricConsumed(template);
   });
 });

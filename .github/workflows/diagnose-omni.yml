@@ -6,10 +6,11 @@ on:
       environment:
         description: 'Target environment'
         required: true
-        default: 'dev'
+        default: 'dev2'
         type: choice
         options:
           - dev
+          - dev2
           - prod
       minutes:
         description: 'How many recent minutes of OMNI logs to capture'
@@ -26,7 +27,6 @@ env:
   AWS_REGION: us-east-1
   ECS_CLUSTER: forge-app-${{ github.event.inputs.environment }}
   OMNI_SERVICE: forge-omni
-  OMNI_LOG_GROUP: /forge/ecs/forge-omni
   OMNI_STREAM_PREFIX: omni/omni-api
 
 jobs:
@@ -60,6 +60,17 @@ jobs:
           if ! [[ "${LOG_LIMIT}" =~ ^[0-9]+$ ]] || [ "${LOG_LIMIT}" -lt 1 ]; then
             echo "::error::log_limit must be a positive integer"
             exit 1
+          fi
+
+          # Derive the OMNI log group from the SAME scoped() rule the CDK uses
+          # (lib/forge-app-stack.ts:1092): legacy 'dev' keeps the flat name,
+          # every other env appends -${env}. Computed from the environment input,
+          # never hardcoded, so this tooling reads the group that actually exists.
+          ENVIRONMENT="${{ github.event.inputs.environment }}"
+          if [ "${ENVIRONMENT}" = "dev" ]; then
+            OMNI_LOG_GROUP="/forge/ecs/forge-omni"
+          else
+            OMNI_LOG_GROUP="/forge/ecs/forge-omni-${ENVIRONMENT}"
           fi
 
           START_MS=$(( ($(date +%s) - MINUTES * 60) * 1000 ))
@@ -182,6 +193,19 @@ jobs:
               > "omni-diagnostics/target-health-${safe}.json" || true
             cat "omni-diagnostics/target-health-${safe}.json"
           done
+
+          echo ""
+          echo "=== Verifying OMNI log group exists ==="
+          # FAIL LOUDLY if the resolved group is missing — a blind diagnostic that
+          # reports success on empty output is the exact RC-2 defect. No swallow.
+          GROUP_COUNT=$(aws logs describe-log-groups \
+            --log-group-name-prefix "${OMNI_LOG_GROUP}" \
+            --query "logGroups[?logGroupName=='${OMNI_LOG_GROUP}'] | length(@)" \
+            --output text)
+          if [ "${GROUP_COUNT}" != "1" ]; then
+            echo "::error::OMNI log group ${OMNI_LOG_GROUP} does not exist for environment ${ENVIRONMENT} (resolved via the CDK scoped() rule). Refusing to report a blind/empty diagnostic."
+            exit 1
+          fi
 
           echo ""
           echo "=== Recent OMNI log streams ==="

@@ -3,6 +3,15 @@ name: Scale OMNI Service
 on:
   workflow_dispatch:
     inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev2'
+        type: choice
+        options:
+          - dev
+          - dev2
+          - prod
       desired_count:
         description: 'Desired task count'
         required: true
@@ -10,11 +19,28 @@ on:
 
 env:
   AWS_REGION: us-east-1
+  OMNI_SERVICE: forge-omni
 
 jobs:
   scale:
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve OMNI target (cluster + scoped log group)
+        run: |
+          set -euo pipefail
+          # Derive cluster + log group from the SAME scoped() rule the CDK uses
+          # (lib/forge-app-stack.ts:1092): legacy 'dev' keeps the flat name, every
+          # other env appends -${env}. Computed from the environment input, never
+          # hardcoded, so this workflow operates on the env that actually runs.
+          ENVIRONMENT="${{ github.event.inputs.environment }}"
+          if [ "${ENVIRONMENT}" = "dev" ]; then
+            OMNI_LOG_GROUP="/forge/ecs/forge-omni"
+          else
+            OMNI_LOG_GROUP="/forge/ecs/forge-omni-${ENVIRONMENT}"
+          fi
+          echo "ECS_CLUSTER=forge-app-${ENVIRONMENT}" >> "$GITHUB_ENV"
+          echo "OMNI_LOG_GROUP=${OMNI_LOG_GROUP}" >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -24,16 +50,16 @@ jobs:
 
       - name: Scale OMNI service
         run: |
-          echo "=== Current state ==="
-          aws ecs describe-services --cluster forge-app-dev --services forge-omni \
+          echo "=== Current state (cluster=${ECS_CLUSTER}) ==="
+          aws ecs describe-services --cluster "${ECS_CLUSTER}" --services "${OMNI_SERVICE}" \
             --query 'services[0].{status:status,desired:desiredCount,running:runningCount,pending:pendingCount}' \
             --output table
 
           echo ""
           echo "=== Scaling to ${{ github.event.inputs.desired_count }} ==="
           aws ecs update-service \
-            --cluster forge-app-dev \
-            --service forge-omni \
+            --cluster "${ECS_CLUSTER}" \
+            --service "${OMNI_SERVICE}" \
             --desired-count ${{ github.event.inputs.desired_count }} \
             --query 'service.{status:status,desiredCount:desiredCount}' \
             --output table
@@ -43,9 +69,9 @@ jobs:
         run: |
           echo "=== Waiting for task to start (max 5 min) ==="
           for i in $(seq 1 30); do
-            RUNNING=$(aws ecs describe-services --cluster forge-app-dev --services forge-omni \
+            RUNNING=$(aws ecs describe-services --cluster "${ECS_CLUSTER}" --services "${OMNI_SERVICE}" \
               --query 'services[0].runningCount' --output text 2>/dev/null || echo "0")
-            PENDING=$(aws ecs describe-services --cluster forge-app-dev --services forge-omni \
+            PENDING=$(aws ecs describe-services --cluster "${ECS_CLUSTER}" --services "${OMNI_SERVICE}" \
               --query 'services[0].pendingCount' --output text 2>/dev/null || echo "0")
             echo "Attempt $i/30: running=$RUNNING pending=$PENDING"
             if [ "$RUNNING" -ge 1 ] 2>/dev/null; then
@@ -57,10 +83,10 @@ jobs:
 
           echo ""
           echo "=== Task details ==="
-          TASK_ARN=$(aws ecs list-tasks --cluster forge-app-dev --service-name forge-omni \
+          TASK_ARN=$(aws ecs list-tasks --cluster "${ECS_CLUSTER}" --service-name "${OMNI_SERVICE}" \
             --query 'taskArns[0]' --output text 2>/dev/null || echo "NONE")
           if [ "$TASK_ARN" != "NONE" ] && [ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ]; then
-            aws ecs describe-tasks --cluster forge-app-dev --tasks "$TASK_ARN" \
+            aws ecs describe-tasks --cluster "${ECS_CLUSTER}" --tasks "$TASK_ARN" \
               --query 'tasks[0].{lastStatus:lastStatus,stoppedReason:stoppedReason,stopCode:stopCode,containers:containers[*].{name:name,lastStatus:lastStatus,exitCode:exitCode,reason:reason}}' \
               --output json
           else
@@ -70,28 +96,39 @@ jobs:
           # Check stopped tasks for error details
           echo ""
           echo "=== Recent stopped tasks ==="
-          STOPPED=$(aws ecs list-tasks --cluster forge-app-dev --service-name forge-omni \
+          STOPPED=$(aws ecs list-tasks --cluster "${ECS_CLUSTER}" --service-name "${OMNI_SERVICE}" \
             --desired-status STOPPED --query 'taskArns[0]' --output text 2>/dev/null || echo "NONE")
           if [ "$STOPPED" != "NONE" ] && [ -n "$STOPPED" ] && [ "$STOPPED" != "None" ]; then
-            aws ecs describe-tasks --cluster forge-app-dev --tasks "$STOPPED" \
+            aws ecs describe-tasks --cluster "${ECS_CLUSTER}" --tasks "$STOPPED" \
               --query 'tasks[0].{lastStatus:lastStatus,stoppedReason:stoppedReason,stopCode:stopCode,containers:containers[*].{name:name,exitCode:exitCode,reason:reason}}' \
               --output json
           fi
 
           echo ""
-          echo "=== Recent OMNI logs ==="
+          echo "=== Recent OMNI logs (group=${OMNI_LOG_GROUP}) ==="
+          # FAIL LOUDLY if the resolved group is missing — the prior hardcoded
+          # literal existed in NO stack, so this step always produced empty output.
+          # No swallow: a missing group means the deployment/config is wrong.
+          GROUP_COUNT=$(aws logs describe-log-groups \
+            --log-group-name-prefix "${OMNI_LOG_GROUP}" \
+            --query "logGroups[?logGroupName=='${OMNI_LOG_GROUP}'] | length(@)" \
+            --output text)
+          if [ "${GROUP_COUNT}" != "1" ]; then
+            echo "::error::OMNI log group ${OMNI_LOG_GROUP} does not exist for environment ${{ github.event.inputs.environment }} (resolved via the CDK scoped() rule). Refusing to report empty logs."
+            exit 1
+          fi
           LOG_STREAM=$(aws logs describe-log-streams \
-            --log-group-name /forge/dev/omni \
+            --log-group-name "${OMNI_LOG_GROUP}" \
             --order-by LastEventTime --descending --limit 1 \
-            --query 'logStreams[0].logStreamName' --output text 2>/dev/null || echo "none")
-          if [ "$LOG_STREAM" != "none" ] && [ "$LOG_STREAM" != "None" ]; then
+            --query 'logStreams[0].logStreamName' --output text)
+          if [ "$LOG_STREAM" != "None" ] && [ -n "$LOG_STREAM" ]; then
             aws logs get-log-events \
-              --log-group-name /forge/dev/omni \
+              --log-group-name "${OMNI_LOG_GROUP}" \
               --log-stream-name "$LOG_STREAM" \
               --limit 50 \
-              --query 'events[*].message' --output text 2>/dev/null || echo "No logs"
+              --query 'events[*].message' --output text
           else
-            echo "No log streams found"
+            echo "Log group exists but has no streams yet"
           fi
 
       - name: Health check
