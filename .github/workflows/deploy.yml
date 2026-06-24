@@ -96,6 +96,24 @@ on:
         required: false
         default: ''
         type: string
+      # ── forge-omni image pin ────────────────────────────────────────────
+      # The forge-omni render service (ForgeApp-<env> uses ctxPrefix 'forgeOmni';
+      # the standalone ForgeOmni stack uses ctxPrefix 'omni') is resolved via
+      # resolveEcrImage with requireImmutable=true, so synth FAILS unless an
+      # immutable digest/tag is pinned here (RC2-A/RC2-C, program 253f20a6 — never
+      # ':latest'). The OMNI build pipeline (build-omni-standalone.yml) pushes an
+      # immutable build image to the 'forge-omni' ECR repo and prints its
+      # '@sha256:<digest>'; pass that digest here to roll OMNI onto this deploy.
+      forgeOmniImageDigest:
+        description: "forge-omni image digest to pin (e.g. 'sha256:abc...'). REQUIRED to deploy the OMNI render service. Leave blank only to pin by tag instead."
+        required: false
+        default: ''
+        type: string
+      forgeOmniImageTag:
+        description: "forge-omni immutable build tag (used only when forgeOmniImageDigest is empty; e.g. a build-SHA/timestamp tag). NEVER 'latest'."
+        required: false
+        default: ''
+        type: string
 
 env:
   AWS_REGION: us-east-1
@@ -255,6 +273,10 @@ jobs:
             -c lucidActiveMode=${{ github.event.inputs.lucidActiveMode || 'code' }} \
             -c lucidImageTag=${{ github.event.inputs.lucidImageTag || 'latest' }} \
             -c lucidImageDigest=${{ github.event.inputs.lucidImageDigest || '' }} \
+            -c forgeOmniImageDigest=${{ github.event.inputs.forgeOmniImageDigest || '' }} \
+            -c forgeOmniImageTag=${{ github.event.inputs.forgeOmniImageTag || '' }} \
+            -c omniImageDigest=${{ github.event.inputs.forgeOmniImageDigest || '' }} \
+            -c omniImageTag=${{ github.event.inputs.forgeOmniImageTag || '' }} \
             -c appDomain=forge.qrucible.ai \
             -c skipRds=true \
             -c alertEmail=${{ github.event.inputs.alertEmail || 'ops@forge.local' }}
@@ -274,6 +296,10 @@ jobs:
             -c lucidActiveMode=${{ github.event.inputs.lucidActiveMode || 'code' }} \
             -c lucidImageTag=${{ github.event.inputs.lucidImageTag || 'latest' }} \
             -c lucidImageDigest=${{ github.event.inputs.lucidImageDigest || '' }} \
+            -c forgeOmniImageDigest=${{ github.event.inputs.forgeOmniImageDigest || '' }} \
+            -c forgeOmniImageTag=${{ github.event.inputs.forgeOmniImageTag || '' }} \
+            -c omniImageDigest=${{ github.event.inputs.forgeOmniImageDigest || '' }} \
+            -c omniImageTag=${{ github.event.inputs.forgeOmniImageTag || '' }} \
             -c appDomain=forge.qrucible.ai \
             -c skipRds=true \
             -c alertEmail=${{ github.event.inputs.alertEmail || 'ops@forge.local' }}
