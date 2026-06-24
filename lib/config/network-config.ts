@@ -22,17 +22,18 @@ export function vpcCidr(forgeEnv: string): string {
  * modeled by the CDK VPC construct, and that always-on EC2 services must be
  * allowed to place into.
  *
- * Why this exists: ForgeNetworkStack builds the dev/dev2 VPC with `maxAzs = 1`
- * (single-AZ for cost), so CDK only knows about the us-east-1a PrivateSubnet1.
- * A second private subnet in us-east-1b (PrivateSubnet2B, 10.1.2.0/24) plus its
- * EFS mount target were added to the live dev2 VPC by hand to give forge-devops
- * (3072 CPU) a second placement host when 1a is full. Because CDK doesn't model
- * it, every `cdk deploy` would otherwise re-pin forge-devops to 1a-only and the
- * task gets stuck in PROVISIONING (az=null) whenever 1a lacks capacity.
+ * Why this exists: the hand-created us-east-1b subnet PrivateSubnet2B
+ * (subnet-05242c7a4d15294ba, 10.1.2.0/24) plus its EFS mount target were added to
+ * the live dev2 VPC by hand to give forge-devops (3072 CPU) an extra placement
+ * host. CDK does not model this specific hand-created subnet, so without pinning it
+ * here every `cdk deploy` would re-pin forge-devops to the CDK-modeled subnets only
+ * and the task can get stuck in PROVISIONING (az=null) when its AZ lacks capacity.
  *
- * Pinning the subnet by ID here (rather than flipping maxAzs to 2) avoids CDK
- * trying to create brand-new subnets / reshuffle CIDRs in the legacy live VPC.
- * Override per-deploy with `-c devopsExtraSubnetIds=subnet-aaa,subnet-bbb`.
+ * NOTE: dev2 (green) IS modeled dual-AZ by CDK (ForgeNetworkStack maxAzs=2), so its
+ * CDK PrivateSubnet1/PrivateSubnet2 are first-class and their exports are stable.
+ * This pin is purely ADDITIVE — it does not replace the CDK subnets; it only lets
+ * forge-devops also use the extra hand-created 1b subnet. Override per-deploy with
+ * `-c devopsExtraSubnetIds=subnet-aaa,subnet-bbb`.
  */
 export function extraDevopsSubnetIds(forgeEnv: string): string[] {
   switch (forgeEnv) {
