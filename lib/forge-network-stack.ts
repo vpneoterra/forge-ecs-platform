@@ -30,8 +30,21 @@ export class ForgeNetworkStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: ForgeNetworkStackProps) {
     super(scope, id, props);
 
-    const isProd = props.forgeEnv === 'prod';
-    const maxAzs = isProd ? 2 : 1;
+    // The managed ec2.Vpc construct is SINGLE-AZ for dev and dev2; only prod is
+    // dual-AZ. This matches what is actually deployed:
+    //   'dev'  -> 1 AZ: legacy 10.0.0.0/16 VPC was deployed single-AZ.
+    //   'dev2' -> 1 AZ for the ForgeVpc construct (live ForgeNetwork-dev2 has exactly
+    //             one auto private subnet, ForgeVpcPrivateSubnet1 = 10.1.1.0/24 in
+    //             us-east-1a). dev2's SECOND private subnet is NOT a 2nd construct AZ:
+    //             it is an explicitly-declared subnet (PrivateSubnet2B, below) added on
+    //             top of the single-AZ VPC. Driving dev2 to maxAzs=2 makes CDK's IP
+    //             allocator renumber Private1 to 10.1.2.0/24 (requires replacement of
+    //             the subnet carrying the running forge-omni task) and synthesize a new
+    //             ForgeVpcPrivateSubnet2 while destroying the live PrivateSubnet2B --
+    //             an outage. So dev2 stays single-AZ here and re-declares the live 2B
+    //             subnet verbatim below.
+    //   'prod' -> 2 AZs.
+    const maxAzs = props.forgeEnv === 'prod' ? 2 : 1;
 
     // ── VPC ─────────────────────────────────────────────────────────────────
     // NAT is handled by a NAT instance below, so we disable CDK's managed NAT.
@@ -136,12 +149,75 @@ export class ForgeNetworkStack extends cdk.Stack {
       });
     }
 
+    // ── dev2 (GREEN): explicit 2nd-AZ private subnet (us-east-1b) ─────────────
+    // The live ForgeNetwork-dev2 manages a second private subnet
+    // (subnet-05242c7a4d15294ba, 10.1.2.0/24, us-east-1b) declared explicitly on top
+    // of the single-AZ ForgeVpc so the GREEN kernel (forge-devops Ec2Service and the
+    // ForgeCompute-dev2 ASG) can place tasks in 1b. It was deployed from an
+    // out-of-band tree and never committed, so source drifted from live. Because the
+    // committed stack omitted it, any deploy pulling ForgeNetwork-dev2 into its
+    // closure (e.g. `cdk deploy ForgeApp-dev2`) would try to DELETE this in-use subnet
+    // and the in-use cross-stack export below -> CloudFormation refuses ->
+    // ForgeNetwork-dev2 UPDATE_ROLLBACK -> the deploy aborts and forge-omni never rolls
+    // (run 27872944123). Re-declaring it here with the EXACT deployed logical IDs and
+    // properties makes synth == live so CloudFormation sees no change. dev2 only.
+    let privateSubnet2BRt: ec2.CfnRouteTable | undefined;
+    if (props.forgeEnv === 'dev2') {
+      const privateSubnet2B = new ec2.CfnSubnet(this, 'PrivateSubnet2B', {
+        vpcId: this.vpc.vpcId,
+        cidrBlock: '10.1.2.0/24',
+        availabilityZone: 'us-east-1b',
+        mapPublicIpOnLaunch: false,
+        tags: [{ key: 'Name', value: 'ForgeNetwork-dev2/ForgeVpc/PrivateSubnet2B' }],
+      });
+
+      privateSubnet2BRt = new ec2.CfnRouteTable(this, 'PrivateSubnet2BRt', {
+        vpcId: this.vpc.vpcId,
+        tags: [{ key: 'Name', value: 'ForgeNetwork-dev2/ForgeVpc/PrivateSubnet2B' }],
+      });
+
+      new ec2.CfnSubnetRouteTableAssociation(this, 'PrivateSubnet2BRtAssoc', {
+        routeTableId: privateSubnet2BRt.ref,
+        subnetId: privateSubnet2B.ref,
+      });
+
+      new ec2.CfnRoute(this, 'PrivateSubnet2BNatRoute', {
+        routeTableId: privateSubnet2BRt.ref,
+        destinationCidrBlock: '0.0.0.0/0',
+        instanceId: natInstance.ref,
+      });
+
+      // ForgeCompute-dev2's ASG places instances in 1b by importing the auto-share
+      // export Ref(PrivateSubnet2B). Re-emit that SAME in-use export (CDK reproduces
+      // logical id `ExportsOutputRefPrivateSubnet2B0A657E94`) so deploying
+      // ForgeApp-dev2 -- which depends on ForgeNetwork but NOT ForgeCompute -- never
+      // attempts to delete an export ForgeCompute-dev2 still consumes. This is the
+      // documented pattern for retaining a cross-stack export still in use.
+      this.exportValue(privateSubnet2B.ref);
+
+      new cdk.CfnOutput(this, 'PrivateSubnet2BId', {
+        value: privateSubnet2B.ref,
+        description: '2nd-AZ private subnet ID (GREEN kernel multi-AZ)',
+        exportName: 'ForgePrivateSubnet2Id-dev2',
+      });
+    }
+
     // ── VPC Endpoints ────────────────────────────────────────────────────────
     // S3 Gateway endpoint (free -- no data transfer charges through NAT)
-    this.vpc.addGatewayEndpoint('S3Endpoint', {
+    const s3Endpoint = this.vpc.addGatewayEndpoint('S3Endpoint', {
       service: ec2.GatewayVpcEndpointAwsService.S3,
       subnets: [{ subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS }],
     });
+    // dev2's explicit 2B route table is invisible to the PRIVATE_WITH_EGRESS subnet
+    // selector (it belongs to the hand-declared PrivateSubnet2B, not a ForgeVpc auto
+    // subnet), but the live S3 endpoint routes it too. Attach it so synth == live.
+    if (privateSubnet2BRt) {
+      const cfnS3Endpoint = s3Endpoint.node.defaultChild as ec2.CfnVPCEndpoint;
+      cfnS3Endpoint.routeTableIds = [
+        ...(cfnS3Endpoint.routeTableIds ?? []),
+        privateSubnet2BRt.ref,
+      ];
+    }
 
     // ECR Interface endpoints (required for private subnet image pulls)
     // Cost: ~$7.30/month each but saves more in NAT data transfer for large images
