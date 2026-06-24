@@ -175,3 +175,30 @@ jobs:
           echo "| Image | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| All 3 geometry images | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+
+      # [RC-C] A failed geometry-image build means the FluxTK/SDF/BREP solver images
+      # are stale or missing — the run-e26fb9d9 condition where the geometry tier could
+      # not produce manifold geometry (FluxTK Not Solved, assembly_blocked_no_geometry).
+      # Page on it via the SAME forge-deploy-alerts SNS topic the OMNI backlog liveness
+      # alarm (#137 RC-3) uses, so a broken geometry image alerts instead of silently
+      # leaving FluxTK unsolved. Fires ONLY on a non-success build result.
+      - name: Configure AWS credentials
+        if: needs.build.result != 'success'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Alert on geometry build failure (RC-C — forge-deploy-alerts)
+        if: needs.build.result != 'success'
+        run: |
+          set -euo pipefail
+          TOPIC_ARN="${{ secrets.SNS_TOPIC_ARN || 'arn:aws:sns:us-east-1:266087050444:forge-deploy-alerts' }}"
+          aws sns publish \
+            --topic-arn "${TOPIC_ARN}" \
+            --subject "FORGE geometry image build FAILED (${{ needs.build.result }})" \
+            --message "Build Geometry Container Images result=${{ needs.build.result }} on ref ${GITHUB_REF_NAME:-?} (run ${GITHUB_RUN_ID}). The geometry solver images (forge-brep / forge-neural-sdf / forge-fluxtk / forge-picogk) may be stale or missing, so the geometry tier (FluxTK/SDF/BREP) cannot produce manifold geometry — this surfaces downstream as 'FluxTK Not Solved' / assembly_blocked_no_geometry. Investigate: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --no-cli-pager
+          echo "::error::Geometry image build failed (${{ needs.build.result }}) — paged forge-deploy-alerts. Geometry solver images are stale/missing (RC-C)."
+          exit 1

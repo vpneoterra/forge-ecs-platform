@@ -451,6 +451,82 @@ jobs:
           fi
           echo "✅ OMNI has ${HEALTHY} healthy target(s) — bomgen-dependent smoke check may proceed"
 
+      # ── FluxTK / geometry solver readiness gate (RC-C) ───────
+      # On run e26fb9d9 the geometry tier could not produce manifold geometry (FluxTK
+      # Not Solved, assembly_blocked_no_geometry) while the geometry-image build was
+      # failing. This gate refuses to certify a "ready" pipeline on a DEAD solver: if
+      # FluxTK is ENABLED (the forge-fluxtk ECS service exists with desiredCount>=1)
+      # but has ZERO running tasks (e.g. a failed forge-brep/forge-neural-sdf image
+      # build left no placeable image), fail loudly.
+      #
+      # Boundary (honest): FluxTK is Cloud-Map-internal only
+      # (forge-fluxtk.forge-geometry.local:8040) with no public/ALB ingress, so an HTTP
+      # /health solver probe is not reachable from this runner — that variant is a
+      # route-elsewhere (forgenew/app) follow-up. We gate on the reachable AWS-API
+      # signal (running-task count), mirroring the OMNI target gate above. A DORMANT
+      # solver (desiredCount=0, the manifest default) or an undeployed geometry stack
+      # is a deliberate runbook state and is NOT gated — no fabricated failure.
+      - name: Verify FluxTK/geometry solver readiness (RC-C)
+        if: success()
+        env:
+          CLUSTER: ${{ env.ECS_CLUSTER }}
+        run: |
+          set -euo pipefail
+          # Derive the env + geometry cluster/service from the SAME scoped() rule the
+          # CDK uses (legacy 'dev' keeps flat names; other envs append -${env}).
+          ENVIRONMENT="${CLUSTER#forge-app-}"
+          GEOMETRY_CLUSTER="forge-geometry-${ENVIRONMENT}"
+          if [ "${ENVIRONMENT}" = "dev" ]; then
+            FLUXTK_SERVICE="forge-fluxtk"
+          else
+            FLUXTK_SERVICE="forge-fluxtk-${ENVIRONMENT}"
+          fi
+
+          # The geometry platform is a CONDITIONAL stack (deployGeometry=true).
+          # describe-clusters returns an empty list (not an error) when it is absent.
+          CLUSTER_COUNT=$(aws ecs describe-clusters \
+            --clusters "${GEOMETRY_CLUSTER}" \
+            --query "length(clusters[?status=='ACTIVE'])" \
+            --output text)
+          if [ "${CLUSTER_COUNT}" != "1" ]; then
+            echo "Geometry platform cluster ${GEOMETRY_CLUSTER} is not deployed (conditional stack). FluxTK readiness gate not applicable."
+            exit 0
+          fi
+
+          # describe-services returns an empty list (not an error) for an absent service.
+          SVC_COUNT=$(aws ecs describe-services \
+            --cluster "${GEOMETRY_CLUSTER}" \
+            --services "${FLUXTK_SERVICE}" \
+            --query "length(services[?status=='ACTIVE'])" \
+            --output text)
+          if [ "${SVC_COUNT}" != "1" ]; then
+            echo "FluxTK service ${FLUXTK_SERVICE} is not active in ${GEOMETRY_CLUSTER} (geometry deploys OFF per the capability manifest). Not gating."
+            exit 0
+          fi
+
+          DESIRED=$(aws ecs describe-services \
+            --cluster "${GEOMETRY_CLUSTER}" --services "${FLUXTK_SERVICE}" \
+            --query 'services[0].desiredCount' --output text)
+          RUNNING=$(aws ecs describe-services \
+            --cluster "${GEOMETRY_CLUSTER}" --services "${FLUXTK_SERVICE}" \
+            --query 'services[0].runningCount' --output text)
+          echo "FluxTK ${FLUXTK_SERVICE}: desiredCount=${DESIRED} runningCount=${RUNNING}"
+
+          if [ "${DESIRED}" -lt 1 ] 2>/dev/null; then
+            echo "FluxTK is dormant (desiredCount=0) — operator has not activated the solver. Not gating (dormant is a deliberate runbook state, not a dead solver)."
+            exit 0
+          fi
+
+          if [ "${RUNNING}" -lt 1 ] 2>/dev/null; then
+            echo "::error::FluxTK solver ${FLUXTK_SERVICE} is ENABLED (desiredCount=${DESIRED}) but has ZERO running tasks — the geometry solver tier is dead (commonly a failed Build Geometry Container Images run leaving no placeable forge-brep/forge-neural-sdf/forge-fluxtk image). Refusing to certify a 'ready' pipeline on a dead solver (RC-C)."
+            echo "Recent ${FLUXTK_SERVICE} service events:"
+            aws ecs describe-services \
+              --cluster "${GEOMETRY_CLUSTER}" --services "${FLUXTK_SERVICE}" \
+              --query 'services[0].events[:5].message' --output table
+            exit 1
+          fi
+          echo "✅ FluxTK solver healthy: ${RUNNING}/${DESIRED} running"
+
       - name: Post-deploy smoke tests
         if: success()
         run: |
