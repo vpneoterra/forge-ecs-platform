@@ -79,6 +79,20 @@ export class ForgeOmniStack extends cdk.Stack {
 
     const env = props.forgeEnv;
 
+    // [RC-B] Single source of the OMNI identity for this stack. The render workers'
+    // RenderMetricsPublisher tags every OMNI/Render datapoint's ServiceName dimension
+    // with the OMNI_SERVICE_NAME env value (RenderMetricsPublisher.cs:103-109). This
+    // ONE literal feeds (a) the omni-api container's OMNI_SERVICE_NAME (the producer
+    // identity), (b) the FargateService serviceName, and (c) the ServiceName dimension
+    // BOTH backlog scaling policies CONSUME. Before this, the container never set
+    // OMNI_SERVICE_NAME while the policies read `omni-${env}`, so the publisher emitted
+    // under a different/default identity and the consumer series received zero
+    // datapoints — the scalable target sat on INSUFFICIENT_DATA at the floor regardless
+    // of real backlog (RC-1/#137 enabled the producer but not its IDENTITY). Reused
+    // everywhere below so producer and consumer cannot drift; a parity test
+    // (test/forge-omni-metrics-parity.test.ts) fails the build on any divergence.
+    const omniServiceName = `omni-${env}`;
+
     // -- Route 53 Hosted Zone (lookup existing) --------------------------------
     const hostedZone = route53.HostedZone.fromLookup(this, 'HostedZone', {
       domainName: props.hostedZoneDomain,
@@ -310,6 +324,11 @@ export class ForgeOmniStack extends cdk.Stack {
         // so the live task definition reflects intent and a future rollback to
         // 'anthropic' is a one-line CDK edit. Keep in sync with forge-app-stack.ts.
         KEYSTONE_PROVIDER: 'huggingface',
+        // [RC-B] Producer identity for the OMNI/Render metrics. Single-sourced from
+        // omniServiceName so the published ServiceName dimension is exactly the value
+        // the backlog scaling policies below consume (`omni-${env}`); mirrors how the
+        // green task def pins OMNI_SERVICE_NAME='forge-omni' (lib/forge-app-stack.ts).
+        OMNI_SERVICE_NAME: omniServiceName,
         // ── Live-contract env (reconciled to running omni:25) ────────────────
         // These five keys are present on the CFN-managed live pool task def but
         // had drifted out of this source, so a #134 synth would have REMOVED
@@ -439,7 +458,7 @@ export class ForgeOmniStack extends cdk.Stack {
       cluster: this.ecsCluster,
       taskDefinition: taskDef,
       desiredCount: 1,
-      serviceName: `omni-${env}`,
+      serviceName: omniServiceName,
       enableExecuteCommand: true,
       circuitBreaker: { rollback: true },
       assignPublicIp: false,
@@ -450,7 +469,7 @@ export class ForgeOmniStack extends cdk.Stack {
       ],
     });
 
-    this.serviceName = `omni-${env}`;
+    this.serviceName = omniServiceName;
 
     // Register with ALB target group
     const omniTargetGroup = httpsListener.addTargets('OmniTarget', {
@@ -497,7 +516,7 @@ export class ForgeOmniStack extends cdk.Stack {
     const omniBacklogPerTask = new cloudwatch.Metric({
       namespace: OMNI_BACKLOG_NAMESPACE,
       metricName: OMNI_BACKLOG_PER_TASK_METRIC_NAME,
-      dimensionsMap: { [OMNI_BACKLOG_SERVICE_DIMENSION]: `omni-${env}` },
+      dimensionsMap: { [OMNI_BACKLOG_SERVICE_DIMENSION]: omniServiceName },
       period: cdk.Duration.minutes(1),
       statistic: 'Maximum',
     });
@@ -520,7 +539,7 @@ export class ForgeOmniStack extends cdk.Stack {
     const omniBacklog = new cloudwatch.Metric({
       namespace: OMNI_BACKLOG_NAMESPACE,
       metricName: OMNI_BACKLOG_METRIC_NAME,
-      dimensionsMap: { [OMNI_BACKLOG_SERVICE_DIMENSION]: `omni-${env}` },
+      dimensionsMap: { [OMNI_BACKLOG_SERVICE_DIMENSION]: omniServiceName },
       period: cdk.Duration.minutes(1),
       statistic: 'Maximum',
     });
