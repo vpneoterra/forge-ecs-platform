@@ -30,8 +30,19 @@ export class ForgeNetworkStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: ForgeNetworkStackProps) {
     super(scope, id, props);
 
-    const isProd = props.forgeEnv === 'prod';
-    const maxAzs = isProd ? 2 : 1;
+    // AZ count is env-specific, NOT a plain isProd flag.
+    //   'dev'  -> 1 AZ: the legacy 10.0.0.0/16 VPC was deployed single-AZ and must
+    //            stay that way (adding a 2nd AZ would churn the legacy live VPC).
+    //   'dev2' (green) + 'prod' -> 2 AZs.
+    // dev2 MUST be 2 AZs: its live ForgeNetwork-dev2 was deployed dual-AZ (commit
+    // 6afe523) and ForgeCompute-dev2 imports the auto-generated PrivateSubnet2 export
+    // (ForgeNetwork-dev2:ExportsOutputRefPrivateSubnet2B0A657E94) for task placement.
+    // Synthesizing only 1 AZ makes CloudFormation try to delete that in-use export,
+    // which it refuses -> ForgeNetwork-dev2 UPDATE_ROLLBACK -> the whole
+    // `cdk deploy ForgeApp-dev2` aborts and forge-omni never rolls. Keeping dev2 at
+    // 2 AZs reproduces the identical subnet logical IDs/export so no delete is
+    // attempted. See test/forge-network-subnet-export.test.ts.
+    const maxAzs = props.forgeEnv === 'dev' ? 1 : 2;
 
     // ── VPC ─────────────────────────────────────────────────────────────────
     // NAT is handled by a NAT instance below, so we disable CDK's managed NAT.
