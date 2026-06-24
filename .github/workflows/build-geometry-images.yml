@@ -41,30 +41,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Every entry's dockerfile MUST exist in vpneoterra/forgenew AND the
+        # capability MUST be consumed by lib/forge-geometry-stack.ts. The phantom
+        # forge-brep / forge-sdf-gpu / forge-neural-sdf entries were removed because
+        # forgenew has no docker/brep, docker/sdf-gpu, or docker/neural-sdf directory
+        # — they never built (buildx lstat failures) and, under fail-fast:false, only
+        # read as routine noise. forge-fluxtk (CAP_FLUXTK in geometry-manifest.ts) is
+        # the real solver image present in forgenew and is now built here. The
+        # pre-build existence check below guards against future matrix drift.
         image:
-          - name: forge-brep
-            repo: forge-brep
+          - name: forge-fluxtk
+            repo: forge-fluxtk
             source_repo: forgenew
-            dockerfile: docker/brep/Dockerfile
+            dockerfile: docker/fluxtk/Dockerfile
             platforms: linux/amd64
-            ecr_name: forge-brep
-
-          # forge-sdf-gpu uses a CUDA multi-stage build and should be built on a
-          # machine with the CUDA toolkit installed, or via docker buildx with an
-          # appropriate CUDA-capable builder. The linux/amd64 platform is required.
-          - name: forge-sdf-gpu
-            repo: forge-sdf-gpu
-            source_repo: forgenew
-            dockerfile: docker/sdf-gpu/Dockerfile
-            platforms: linux/amd64
-            ecr_name: forge-sdf-gpu
-
-          - name: forge-neural-sdf
-            repo: forge-neural-sdf
-            source_repo: forgenew
-            dockerfile: docker/neural-sdf/Dockerfile
-            platforms: linux/amd64
-            ecr_name: forge-neural-sdf
+            ecr_name: forge-fluxtk
 
           - name: forge-picogk
             repo: forge-picogk
@@ -112,6 +103,23 @@ jobs:
           ref: ${{ github.event.inputs.source_ref }}
           token: ${{ secrets.GH_PAT }}
           path: image-source
+
+      # Fail fast and loudly if a matrix entry points at a Dockerfile that does not
+      # exist in the checked-out source repo. This converts buildx's late, opaque
+      # `lstat ... no such file or directory` into an explicit, named error and
+      # prevents the matrix from silently drifting out of sync with forgenew again.
+      # This is a correctness gate — it MUST fail the job, never swallow.
+      - name: Verify Dockerfile exists in source repo
+        if: steps.filter.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          DF="image-source/${{ matrix.image.dockerfile }}"
+          REF="${{ github.event.inputs.source_ref }}"
+          if [ ! -f "$DF" ]; then
+            echo "::error::Dockerfile ${{ matrix.image.dockerfile }} not found in forgenew@${REF:-default} — matrix entry ${{ matrix.image.name }} is stale"
+            exit 1
+          fi
+          echo "Found ${{ matrix.image.dockerfile }} for ${{ matrix.image.name }}"
 
       - name: Set image metadata
         if: steps.filter.outputs.should_build == 'true'
@@ -174,7 +182,7 @@ jobs:
           echo "## Geometry Image Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "| Image | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| All 3 geometry images | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Geometry images (forge-fluxtk, forge-picogk) | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
 
       # [RC-C] A failed geometry-image build means the FluxTK/SDF/BREP solver images
       # are stale or missing — the run-e26fb9d9 condition where the geometry tier could
