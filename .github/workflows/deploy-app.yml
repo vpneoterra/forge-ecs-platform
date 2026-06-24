@@ -405,6 +405,52 @@ jobs:
             --no-cli-pager || echo "Alarm creation failed (non-fatal)"
           echo "✅ CloudWatch 5xx alarm configured"
 
+      # ── OMNI target-health gate (RC-A) ───────────────────────
+      # The /api/bomgen/health smoke check below is transitively OMNI-dependent: the
+      # forge-app->OMNI bridge (parseOmniBase(), server/omni-cem-bridge.js) resolves
+      # OMNI via OMNI_API_URL (forge-app-stack.ts:563-571), so when OMNI is unreachable
+      # bomgen returns ENOTFOUND and the whole deploy fails as an INDIRECT symptom with
+      # no OMNI-specific signal — exactly the slow-to-triage "forge-omni OFFLINE"
+      # condition of run e26fb9d9. This gate makes "OMNI has zero healthy targets" a
+      # NAMED, leading, build-failing error that runs BEFORE the bomgen-dependent check.
+      # It does NOT soften anything: zero healthy OMNI targets is a real deploy failure.
+      - name: Verify OMNI target health (RC-A — bomgen smoke depends on OMNI)
+        if: success()
+        env:
+          CLUSTER: ${{ env.ECS_CLUSTER }}
+          OMNI_SERVICE: forge-omni
+        run: |
+          set -euo pipefail
+          echo "Resolving OMNI ALB target group from service ${OMNI_SERVICE} in ${CLUSTER}..."
+          TG_ARN=$(aws ecs describe-services \
+            --cluster "${CLUSTER}" \
+            --services "${OMNI_SERVICE}" \
+            --query 'services[0].loadBalancers[0].targetGroupArn' \
+            --output text)
+          if [ -z "${TG_ARN}" ] || [ "${TG_ARN}" = "None" ]; then
+            echo "::error::OMNI service ${OMNI_SERVICE} in cluster ${CLUSTER} has no ALB target group (service missing or not ALB-attached). The bomgen-dependent smoke check cannot pass while OMNI is unreachable. Deploy the OMNI/app CDK stack first (RC-A)."
+            exit 1
+          fi
+          echo "OMNI target group: ${TG_ARN}"
+
+          # Count targets the ALB considers healthy on the OmniTarget /api/health check.
+          HEALTHY=$(aws elbv2 describe-target-health \
+            --target-group-arn "${TG_ARN}" \
+            --query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" \
+            --output text)
+          echo "Healthy OMNI targets (/api/health): ${HEALTHY}"
+
+          if [ "${HEALTHY}" -lt 1 ] 2>/dev/null; then
+            echo "::error::OMNI has ZERO healthy targets in ${TG_ARN}. forge-omni is OFFLINE — the render tier is not serving, so /api/bomgen/health will fail and the whole pipeline (queue -> geometry -> assembly -> DQI) is starved. Refusing to certify the deploy (RC-A)."
+            echo "Current OMNI target states:"
+            aws elbv2 describe-target-health \
+              --target-group-arn "${TG_ARN}" \
+              --query 'TargetHealthDescriptions[*].{target:Target.Id,port:Target.Port,state:TargetHealth.State,reason:TargetHealth.Reason,desc:TargetHealth.Description}' \
+              --output table
+            exit 1
+          fi
+          echo "✅ OMNI has ${HEALTHY} healthy target(s) — bomgen-dependent smoke check may proceed"
+
       - name: Post-deploy smoke tests
         if: success()
         run: |
@@ -415,6 +461,19 @@ jobs:
           # Health check
           echo -n "  /health ... "
           if curl -sf "$DOMAIN/health" | jq -e '.status' > /dev/null 2>&1; then
+            echo "✅"
+          else
+            echo "❌"
+            FAILED=$((FAILED + 1))
+          fi
+
+          # OMNI render-tier health (RC-A) — CRITICAL, same contract as /health.
+          # /api/bomgen/health below is transitively OMNI-dependent, so probe OMNI
+          # directly first: a NAMED leading failure instead of an indirect bomgen
+          # symptom. On run e26fb9d9 forge-omni was OFFLINE and this would have named
+          # it immediately. Counted in FAILED — OMNI down is a real deploy failure.
+          echo -n "  omni.qrucible.ai/api/health ... "
+          if curl -sf "https://omni.qrucible.ai/api/health" | jq -e '.status' > /dev/null 2>&1; then
             echo "✅"
           else
             echo "❌"
@@ -468,7 +527,7 @@ jobs:
 
           echo ""
           if [ $FAILED -gt 0 ]; then
-            echo "❌ $FAILED critical smoke test(s) failed (health / bomgen / monitor-hub)"
+            echo "❌ $FAILED critical smoke test(s) failed (health / omni / bomgen / monitor-hub)"
             echo "   Non-blocking endpoints (project-config/test, traces, knowledge) are excluded from this count."
             exit 1
           fi
