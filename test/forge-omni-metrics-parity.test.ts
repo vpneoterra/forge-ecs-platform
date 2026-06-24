@@ -33,7 +33,12 @@ import { Template } from 'aws-cdk-lib/assertions';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import { ForgeAppStack } from '../lib/forge-app-stack';
 import { ForgeOmniStack } from '../lib/forge-omni-stack';
-import { OMNI_BACKLOG_NAMESPACE } from '../lib/config/omni-backlog-metric';
+import {
+  OMNI_BACKLOG_NAMESPACE,
+  OMNI_BACKLOG_METRIC_NAME,
+  OMNI_BACKLOG_PER_TASK_METRIC_NAME,
+  OMNI_BACKLOG_SERVICE_DIMENSION,
+} from '../lib/config/omni-backlog-metric';
 import { OMNI_IMAGE_PIN_CONTEXT } from './helpers/image-pin';
 
 const ACCOUNT = '123456789012';
@@ -122,6 +127,55 @@ function putMetricDataStatements(template: Template): any[] {
   });
 }
 
+/**
+ * The ServiceName dimension value the TARGET-TRACKING policy (OmniBacklogTargetTracking,
+ * BacklogPerTask) consumes — read straight off the synthesized ScalingPolicy's
+ * CustomizedMetricSpecification.
+ */
+function targetTrackingServiceName(template: Template): string {
+  const policies = template.findResources('AWS::ApplicationAutoScaling::ScalingPolicy');
+  for (const p of Object.values(policies) as any[]) {
+    const spec =
+      p.Properties?.TargetTrackingScalingPolicyConfiguration?.CustomizedMetricSpecification;
+    if (
+      spec &&
+      spec.Namespace === OMNI_BACKLOG_NAMESPACE &&
+      spec.MetricName === OMNI_BACKLOG_PER_TASK_METRIC_NAME
+    ) {
+      const dim = (spec.Dimensions as any[]).find(
+        (d) => d.Name === OMNI_BACKLOG_SERVICE_DIMENSION,
+      );
+      if (dim) return dim.Value as string;
+    }
+  }
+  throw new Error(
+    'target-tracking BacklogPerTask ServiceName dimension not found in synthesized template',
+  );
+}
+
+/**
+ * The ServiceName dimension value(s) the STEP-SCALING policy (OmniBacklogStepScaling,
+ * QueueDepth) consumes — scaleOnMetric emits the metric identity on the CloudWatch
+ * alarms it creates, so read it from every OMNI/Render QueueDepth alarm.
+ */
+function stepScalingServiceNames(template: Template): string[] {
+  const alarms = template.findResources('AWS::CloudWatch::Alarm');
+  const vals: string[] = [];
+  for (const a of Object.values(alarms) as any[]) {
+    const props = a.Properties;
+    if (
+      props.Namespace === OMNI_BACKLOG_NAMESPACE &&
+      props.MetricName === OMNI_BACKLOG_METRIC_NAME
+    ) {
+      const dim = ((props.Dimensions || []) as any[]).find(
+        (d) => d.Name === OMNI_BACKLOG_SERVICE_DIMENSION,
+      );
+      if (dim) vals.push(dim.Value as string);
+    }
+  }
+  return vals;
+}
+
 describe('OMNI/Render metrics producer parity — green vs scalable-pool task defs', () => {
   const greenTemplate = synthApp('dev2');
   const poolTemplate = synthOmni('dev2');
@@ -150,4 +204,47 @@ describe('OMNI/Render metrics producer parity — green vs scalable-pool task de
       }
     }
   });
+});
+
+/**
+ * RC-B — producer↔consumer IDENTITY binding.
+ *
+ * RC-1 (#137) ensured the publisher RUNS and is ALLOWED to publish (OMNI_METRICS=on +
+ * PutMetricData grant). But the publisher tags every datapoint's ServiceName dimension
+ * with the OMNI_SERVICE_NAME env value (RenderMetricsPublisher.cs:103-109). The pool
+ * stack never set OMNI_SERVICE_NAME, so it published under the default/wrong identity
+ * while its scaling policies consumed ServiceName=omni-<env> — a series that received
+ * ZERO datapoints, stranding the scalable target on INSUFFICIENT_DATA at the floor.
+ *
+ * This guard fails the build unless, PER STACK, the omni-api container's
+ * OMNI_SERVICE_NAME exactly equals the ServiceName dimension BOTH backlog scaling
+ * policies (target-tracking + step-scaling) read. Green (forge-omni) already aligns;
+ * the pre-fix pool (env unset) fails here.
+ */
+describe('RC-B — OMNI_SERVICE_NAME (producer) == ServiceName dimension (consumer), per stack', () => {
+  const cases: Array<{ label: string; template: Template }> = [
+    { label: 'green (ForgeAppStack, forge-omni)', template: synthApp('dev2') },
+    { label: 'scalable pool (ForgeOmniStack, omni-<env>)', template: synthOmni('dev2') },
+  ];
+
+  test.each(cases)(
+    'producer identity binds to both scaling consumers — $label',
+    ({ template }) => {
+      const container = omniApiContainer(template);
+      const published = envValue(container, 'OMNI_SERVICE_NAME');
+
+      // The publisher cannot bind to the consumer series at all if this is unset.
+      expect(published).toBeDefined();
+
+      // Target-tracking (BacklogPerTask) consumes exactly the published identity.
+      expect(targetTrackingServiceName(template)).toBe(published);
+
+      // Step-scaling (QueueDepth) consumes exactly the published identity.
+      const stepNames = stepScalingServiceNames(template);
+      expect(stepNames.length).toBeGreaterThan(0);
+      for (const name of stepNames) {
+        expect(name).toBe(published);
+      }
+    },
+  );
 });

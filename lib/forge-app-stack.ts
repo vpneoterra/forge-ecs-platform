@@ -1100,6 +1100,18 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
 
     omniEcrRepo.grantPull(executionRole);
 
+    // [RC-B] Single source of the GREEN OMNI identity. The render workers'
+    // RenderMetricsPublisher tags every OMNI/Render datapoint's ServiceName dimension
+    // with the OMNI_SERVICE_NAME env value (RenderMetricsPublisher.cs:103-109). This
+    // ONE literal feeds (a) the omni-api container's OMNI_SERVICE_NAME (producer
+    // identity), (b) the FargateService serviceName, and (c) the ServiceName dimension
+    // BOTH backlog scaling policies CONSUME — so producer and consumer cannot drift.
+    // Green's service name is the flat 'forge-omni' (NOT env-scoped — green is the
+    // single canonical render service); the scalable pool uses 'omni-<env>'
+    // (lib/forge-omni-stack.ts). A parity test (test/forge-omni-metrics-parity.test.ts)
+    // fails the build if this value ever diverges from the consumed dimension.
+    const omniServiceName = 'forge-omni';
+
     // Immutable image pin via CDK context (-c forgeOmniImageDigest / forgeOmniImageTag).
     const omniContainer = omniTaskDef.addContainer('omni-api', {
       image: resolveEcrImage(this, omniEcrRepo, 'forgeOmni'),
@@ -1173,7 +1185,7 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
         // serviceName below is the SAME literal, so reuse it rather than hardcoding
         // a second copy. (Service name is per-stack — green is 'forge-omni', the
         // pool is 'omni-<env>' — so it is NOT part of the shared contract.)
-        OMNI_SERVICE_NAME: 'forge-omni',
+        OMNI_SERVICE_NAME: omniServiceName,
         // [RC1.3 ef589069 2026-06-20] Compose/assembly memory ceiling.
         // LapidaryFlags.ComposeMemCeiling() parses this as RAW BYTES (bare
         // base-10 digits, no suffix/multiplier — see LapidaryFlags.cs
@@ -1298,7 +1310,7 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
       cluster: this.ecsCluster,
       taskDefinition: omniTaskDef,
       desiredCount: 1,
-      serviceName: 'forge-omni',
+      serviceName: omniServiceName,
       enableExecuteCommand: true,
       circuitBreaker: { rollback: true },
       assignPublicIp: false,
@@ -1366,7 +1378,7 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
     const omniBacklogPerTask = new cloudwatch.Metric({
       namespace: OMNI_BACKLOG_NAMESPACE,
       metricName: OMNI_BACKLOG_PER_TASK_METRIC_NAME,
-      dimensionsMap: { [OMNI_BACKLOG_SERVICE_DIMENSION]: 'forge-omni' },
+      dimensionsMap: { [OMNI_BACKLOG_SERVICE_DIMENSION]: omniServiceName },
       period: cdk.Duration.minutes(1),
       statistic: 'Maximum',
     });
@@ -1391,7 +1403,7 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
     const omniBacklog = new cloudwatch.Metric({
       namespace: OMNI_BACKLOG_NAMESPACE,
       metricName: OMNI_BACKLOG_METRIC_NAME,
-      dimensionsMap: { [OMNI_BACKLOG_SERVICE_DIMENSION]: 'forge-omni' },
+      dimensionsMap: { [OMNI_BACKLOG_SERVICE_DIMENSION]: omniServiceName },
       period: cdk.Duration.minutes(1),
       statistic: 'Maximum',
     });

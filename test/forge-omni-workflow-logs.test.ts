@@ -47,6 +47,40 @@ describe('RC-2 — diagnose-omni.yml derives the scoped OMNI log group', () => {
   });
 });
 
+describe('RC-A — deploy-app.yml gives OMNI a first-class, build-failing health signal', () => {
+  const wf = readWorkflow('deploy-app.yml');
+
+  test('probes omni.qrucible.ai/api/health as a CRITICAL smoke check (increments FAILED)', () => {
+    // The probe must exist...
+    expect(wf).toMatch(/omni\.qrucible\.ai\/api\/health/);
+    // ...require JSON .status (same contract as /health)...
+    // ...and be wired into the critical FAILED counter, NOT the non-blocking set,
+    // so OMNI being down fails the deploy as a NAMED leading signal.
+    expect(wf).toMatch(
+      /omni\.qrucible\.ai\/api\/health[\s\S]{0,240}jq -e '\.status'[\s\S]{0,160}FAILED=\$\(\(FAILED \+ 1\)\)/,
+    );
+  });
+
+  test('the critical-failure summary names omni alongside health/bomgen/monitor-hub', () => {
+    // Keeps OMNI in the explicit critical set the operator sees on failure.
+    expect(wf).toMatch(/critical smoke test\(s\) failed[\s\S]{0,80}omni/i);
+  });
+
+  test('has an OMNI target-health gate that exit 1s on zero healthy targets', () => {
+    // The gate resolves the OMNI ALB target group and counts healthy targets...
+    expect(wf).toMatch(/describe-target-health/);
+    expect(wf).toMatch(/State=='healthy'|State==`healthy`/);
+    // ...emits an OMNI-specific ::error:: and exits non-zero when none are healthy
+    // (the bomgen-dependent smoke check cannot pass while OMNI is OFFLINE).
+    expect(wf).toMatch(/::error::[^\n]*OMNI[\s\S]{0,400}exit 1/i);
+  });
+
+  test('the OMNI gate is NOT swallowed (no || true / || echo on the health count)', () => {
+    // RC-A forbids softening: a zero-healthy result must fail, never be masked.
+    expect(wf).not.toMatch(/describe-target-health[\s\S]{0,300}\|\|\s*(true|echo)/);
+  });
+});
+
 describe('RC-2 — scale-omni.yml derives the scoped OMNI log group + cluster', () => {
   const wf = readWorkflow('scale-omni.yml');
 
