@@ -527,6 +527,13 @@ jobs:
           fi
           echo "✅ FluxTK solver healthy: ${RUNNING}/${DESIRED} running"
 
+      # NON-FATAL: this step probes the GREEN production domain (forge.qrucible.ai),
+      # but this workflow deploys the TEST/blue env. GREEN is parked overnight per the
+      # park/unpark runbook, so these public-domain probes legitimately fail when GREEN
+      # is down. A test-env deploy must NOT be gated on GREEN prod being unparked, so a
+      # FAILED count here emits a ::warning:: and exits 0 instead of failing the job.
+      # The in-cluster verify steps above (OMNI target health, FluxTK readiness,
+      # rollback check) remain FATAL — only this public-domain smoke is non-fatal.
       - name: Post-deploy smoke tests
         if: success()
         run: |
@@ -603,8 +610,10 @@ jobs:
 
           echo ""
           if [ $FAILED -gt 0 ]; then
-            echo "❌ $FAILED critical smoke test(s) failed (health / omni / bomgen / monitor-hub)"
+            # NON-FATAL: GREEN prod domain probes can fail because GREEN is parked
+            # overnight; a test-env deploy must not be gated on GREEN being unparked.
+            echo "::warning::$FAILED public-domain smoke test(s) failed (health / omni / bomgen / monitor-hub) — likely GREEN production is parked. Not failing the test-env deploy (in-cluster verify steps above are authoritative)."
             echo "   Non-blocking endpoints (project-config/test, traces, knowledge) are excluded from this count."
-            exit 1
+            exit 0
           fi
           echo "✅ All critical smoke tests passed"

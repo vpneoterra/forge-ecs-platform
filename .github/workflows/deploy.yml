@@ -114,6 +114,18 @@ on:
         required: false
         default: ''
         type: string
+      # resolveEcrImage(forgeLightweight) in lib/image-ref.ts requires an immutable
+      # digest/tag; without these inputs synth FAILS. Pass a digest (or tag) here to pin it.
+      forgeLightweightImageDigest:
+        description: "forge-lightweight image digest to pin, e.g. sha256:...; leave blank to pin by tag"
+        required: false
+        default: ''
+        type: string
+      forgeLightweightImageTag:
+        description: "forge-lightweight immutable build tag; used when digest empty"
+        required: false
+        default: ''
+        type: string
 
 env:
   AWS_REGION: us-east-1
@@ -277,6 +289,8 @@ jobs:
             -c forgeOmniImageTag=${{ github.event.inputs.forgeOmniImageTag || '' }} \
             -c omniImageDigest=${{ github.event.inputs.forgeOmniImageDigest || '' }} \
             -c omniImageTag=${{ github.event.inputs.forgeOmniImageTag || '' }} \
+            -c forgeLightweightImageDigest=${{ github.event.inputs.forgeLightweightImageDigest || '' }} \
+            -c forgeLightweightImageTag=${{ github.event.inputs.forgeLightweightImageTag || '' }} \
             -c appDomain=forge.qrucible.ai \
             -c skipRds=true \
             -c alertEmail=${{ github.event.inputs.alertEmail || 'ops@forge.local' }}
@@ -300,6 +314,8 @@ jobs:
             -c forgeOmniImageTag=${{ github.event.inputs.forgeOmniImageTag || '' }} \
             -c omniImageDigest=${{ github.event.inputs.forgeOmniImageDigest || '' }} \
             -c omniImageTag=${{ github.event.inputs.forgeOmniImageTag || '' }} \
+            -c forgeLightweightImageDigest=${{ github.event.inputs.forgeLightweightImageDigest || '' }} \
+            -c forgeLightweightImageTag=${{ github.event.inputs.forgeLightweightImageTag || '' }} \
             -c appDomain=forge.qrucible.ai \
             -c skipRds=true \
             -c alertEmail=${{ github.event.inputs.alertEmail || 'ops@forge.local' }}

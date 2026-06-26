@@ -47,7 +47,9 @@ jobs:
       id-token: write
       contents: read
     outputs:
-      image_digest: ${{ steps.push.outputs.digest }}
+      # Idempotent re-run: if the SHA tag already exists in ECR we skip the build/push
+      # and surface the EXISTING digest (steps.tagcheck) so the roll-to-digest job still works.
+      image_digest: ${{ steps.push.outputs.digest || steps.tagcheck.outputs.digest }}
       ecr_uri:      ${{ steps.meta.outputs.ecr_uri }}
       sha8:         ${{ steps.meta.outputs.sha8 }}
       build_date:   ${{ steps.meta.outputs.build_date }}
@@ -131,8 +133,33 @@ jobs:
           echo "sha8=${SHA8}" >> $GITHUB_OUTPUT
           echo "git_sha=${SHA8}" >> $GITHUB_OUTPUT
 
+      # IDEMPOTENT GUARD: the SHA tag is IMMUTABLE, so re-running on an unchanged commit
+      # would re-push an existing tag and fail with 'tag already exists ... cannot be
+      # overwritten'. Check whether the :sha8 tag is already in ECR; if so, treat it as
+      # SUCCESS (set exists=true + surface the existing digest) and skip the build/push.
+      - name: Check if SHA tag already exists in ECR (idempotent re-run guard)
+        id: tagcheck
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          set -euo pipefail
+          SHA8="${{ steps.meta.outputs.git_sha }}"
+          if EXISTING=$(aws ecr describe-images \
+              --repository-name "${ECR_REPO}" \
+              --image-ids imageTag="${SHA8}" \
+              --region "${AWS_REGION}" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text 2>/dev/null) && [ -n "${EXISTING}" ] && [ "${EXISTING}" != "None" ]; then
+            echo "::notice::forge-omni:${SHA8} already exists in ECR (digest ${EXISTING}). Skipping build/push (idempotent); roll-to-digest will use the existing digest."
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "digest=${EXISTING}" >> $GITHUB_OUTPUT
+          else
+            echo "forge-omni:${SHA8} not found in ECR — proceeding to build and push."
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Build and push Standalone OMNI image (IMMUTABLE tags only -- RC2-A)
         id: push
+        if: github.event.inputs.dry_run == 'true' || steps.tagcheck.outputs.exists != 'true'
         uses: docker/build-push-action@v5
         with:
           context:    ./image-source/docker/omni
@@ -154,7 +181,7 @@ jobs:
             GIT_SHA=${{ steps.meta.outputs.git_sha }}
 
       - name: Verify pushed image is real (not empty/layerless) -- RC2-C
-        if: github.event.inputs.dry_run != 'true'
+        if: github.event.inputs.dry_run != 'true' && steps.tagcheck.outputs.exists != 'true'
         env:
           ECR_URI: ${{ steps.meta.outputs.ecr_uri }}
           DIGEST:  ${{ steps.push.outputs.digest }}
@@ -189,7 +216,7 @@ jobs:
           echo "Pushed image size verification passed."
 
       - name: Print pushed image digest
-        if: github.event.inputs.dry_run != 'true'
+        if: github.event.inputs.dry_run != 'true' && steps.tagcheck.outputs.exists != 'true'
         run: |
           echo "================================================="
           echo "PUSHED IMAGE DIGEST (used by the deploy job below):"

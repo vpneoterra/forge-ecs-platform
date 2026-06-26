@@ -189,8 +189,29 @@ jobs:
             echo "file=./image-source/${{ matrix.image.dockerfile }}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Build and push
+      # Pre-build existence guard (modeled on build-geometry-images.yml). Several
+      # source repos (forge-cluster-a-geometry/forge-lightweight, -c-observability/
+      # forge-monitoring, -b-hpc/forge-hpc, -d-fem/forge-fem-cfd) have NO root
+      # Dockerfile yet, so buildx fails with 'open Dockerfile: no such file' (exit 1).
+      # Instead of failing the whole workflow, mark THIS matrix entry SKIPPED with a
+      # ::warning:: so the images that CAN build (forge-devops, lucid, dks-query) go
+      # GREEN, while the missing-Dockerfile entries are clearly flagged (not hidden).
+      # Matrix entries are kept so they auto-recover once the upstream Dockerfile lands.
+      - name: Verify Dockerfile exists in source
+        id: dfcheck
         if: steps.filter.outputs.should_build == 'true'
+        run: |
+          DF="${{ steps.ctx.outputs.file }}"
+          if [ ! -f "$DF" ]; then
+            echo "::warning::Dockerfile ${DF#./image-source/} not found in source repo ${{ matrix.image.repo }} — SKIPPING build for ${{ matrix.image.name }} (upstream repo has no Dockerfile yet). This entry will build automatically once the Dockerfile lands."
+            echo "build_ok=false" >> $GITHUB_OUTPUT
+          else
+            echo "Found $DF for ${{ matrix.image.name }}"
+            echo "build_ok=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and push
+        if: steps.filter.outputs.should_build == 'true' && steps.dfcheck.outputs.build_ok == 'true'
         uses: docker/build-push-action@v5
         with:
           context: ${{ steps.ctx.outputs.context }}
@@ -208,7 +229,7 @@ jobs:
             GIT_SHA=${{ steps.meta.outputs.git_sha }}
 
       - name: Image vulnerability scan summary
-        if: steps.filter.outputs.should_build == 'true'
+        if: steps.filter.outputs.should_build == 'true' && steps.dfcheck.outputs.build_ok == 'true'
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           echo "Checking ECR scan results for ${{ steps.meta.outputs.repo_name }}..."
