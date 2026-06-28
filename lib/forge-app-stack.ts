@@ -106,6 +106,8 @@ export interface ForgeAppStackProps extends cdk.StackProps {
    * HTTPS listener without a separate certificate.
    */
   lucidDomainName?: string;
+  /** When set, the shared ALB cert gains a SAN for the Meta-Forge (Omnigent) host. */
+  metaForgeDomainName?: string;
   /**
    * Whether this stack OWNS the production forge.qrucible.ai Route 53 alias.
    * Only one env may own it at a time (CloudFormation cannot CREATE a record
@@ -942,6 +944,9 @@ RODIN_MONTHLY_CREDIT_BUDGET: '1000',
     const certSans: string[] = [props.omniDomainName];
     if (props.lucidDomainName) {
       certSans.push(props.lucidDomainName);
+    }
+    if (props.metaForgeDomainName) {
+      certSans.push(props.metaForgeDomainName);
     }
     const certificate = new acm.Certificate(this, 'ForgeAppCert', {
       domainName: props.domainName,
