@@ -55,6 +55,7 @@ import { ForgeDataStack } from '../lib/forge-data-stack';
 import { ForgeComputeStack } from '../lib/forge-compute-stack';
 import { ForgeAppStack } from '../lib/forge-app-stack';
 import { ForgeLucidStack } from '../lib/forge-lucid-stack';
+import { ForgeMetaForgeStack } from '../lib/forge-metaforge-stack';
 import { ForgeOmniStack } from '../lib/forge-omni-stack';
 import { ForgeGemmaStack } from '../lib/forge-gemma-stack';
 import { ForgeOrchestrationStack } from '../lib/forge-orchestration-stack';
@@ -97,6 +98,12 @@ const deployLucid =
   (app.node.tryGetContext('deployLucid') as string | undefined) === 'true';
 const lucidDomain =
   (app.node.tryGetContext('lucidDomain') as string | undefined) ?? 'api-lucid.qrucible.ai';
+const deployMetaForge =
+  (app.node.tryGetContext('deployMetaForge') as string | undefined) === 'true';
+const metaForgeDomain =
+  (app.node.tryGetContext('metaForgeDomain') as string | undefined) ?? 'metaforge.qrucible.ai';
+const metaForgeAuthProvider =
+  (app.node.tryGetContext('metaForgeAuthProvider') as string | undefined) ?? 'accounts';
 const deployTestingHarness =
   (app.node.tryGetContext('deployTestingHarness') as string | undefined) === 'true';
 // Auto-pause Lambda defaults on. Set -c enableHarnessAutoPause=false to
@@ -180,6 +187,7 @@ if (deployApp) {
     // ALB cert covers api-lucid.qrucible.ai before ForgeLucidStack
     // attaches its target group.
     lucidDomainName: deployLucid ? lucidDomain : undefined,
+    metaForgeDomainName: deployMetaForge ? metaForgeDomain : undefined,
     tags: sharedTags,
   });
   appStack.addDependency(networkStack);
@@ -205,6 +213,28 @@ if (deployApp) {
       tags: sharedTags,
     });
     lucidStack.addDependency(appStack);
+  }
+
+  // -- Meta-Forge (Omnigent server) on the shared ALB ----------------------
+  if (deployMetaForge) {
+    const metaForgeStack = new ForgeMetaForgeStack(app, `ForgeMetaForge-${env}`, {
+      env: awsEnv,
+      description: 'Meta-Forge (Omnigent server, vpneoterra fork) -- Fargate on shared ALB, EFS /data',
+      forgeEnv: env,
+      vpc: networkStack.vpc,
+      ecsSecurityGroup: networkStack.ecsSecurityGroup,
+      privateSubnets: networkStack.privateSubnets,
+      ecsCluster: appStack.ecsCluster,
+      alb: appStack.alb,
+      httpsListener: appStack.httpsListener,
+      cloudMapNamespace: appStack.cloudMapNamespace,
+      domainName: metaForgeDomain,
+      hostedZoneDomain: metaForgeDomain.split('.').slice(-2).join('.'),
+      listenerRulePriority: 30,
+      authProvider: metaForgeAuthProvider,
+      tags: sharedTags,
+    });
+    metaForgeStack.addDependency(appStack);
   }
 
   // -- Monitoring Stack (observability for the app stack) --------------------
